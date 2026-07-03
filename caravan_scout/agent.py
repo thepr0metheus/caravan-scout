@@ -208,6 +208,44 @@ class RouteAgent(RegistryMixin, OpenclawMixin, HeartbeatMixin, ModelsMixin, Cell
         tmp.write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self.state_path)
 
+    def set_controller_url(self, raw_url: str) -> dict[str, Any]:
+        """Pairing endpoint: persist controllerUrl into config.json (preserving
+        the user's file as-is otherwise) and try one heartbeat right away so
+        the pairing page can show success/failure without waiting a cycle."""
+        url = str(raw_url or "").strip().rstrip("/")
+        if url and "://" not in url:
+            url = "http://" + url
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        if not url or parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise AppError("controller url must look like http://host:8090")
+        # Rewrite the raw config file (not self.config — that holds merged
+        # defaults which don't belong in the user's file).
+        raw: dict[str, Any] = {}
+        if self.config_path.exists():
+            try:
+                loaded = json.loads(self.config_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    raw = loaded
+            except Exception:
+                raw = {}
+        raw["controllerUrl"] = url
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.config_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(self.config_path)
+        with self.lock:
+            self.config["controllerUrl"] = url
+        try:
+            result = self.heartbeat_once()
+            status = {"state": "ok", "lastAt": int(time.time()), "result": result}
+        except Exception as exc:
+            status = {"state": "error", "lastAt": int(time.time()), "error": str(exc)}
+        with self.lock:
+            self.state["heartbeat"] = status
+            self.save_state()
+        return {"ok": True, "controllerUrl": url, "heartbeat": status}
+
     def validate_assignments(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         assignments = payload.get("assignments")
         if not isinstance(assignments, list):

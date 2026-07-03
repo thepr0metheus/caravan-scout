@@ -48,6 +48,16 @@ def make_handler(agent: RouteAgent):
 
         def do_GET(self) -> None:
             try:
+                if self.path in ("/", "/index.html"):
+                    from caravan_scout.webui import pair_page_bytes
+                    data = pair_page_bytes()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "no-cache")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
                 if self.path == "/api/health":
                     self.send_json({"ok": True, "service": "caravan-scout", "time": int(time.time())})
                     return
@@ -85,6 +95,10 @@ def make_handler(agent: RouteAgent):
                     return
                 if self.path == "/api/heartbeat":
                     self.send_json(agent.heartbeat_once())
+                    return
+                if self.path == "/api/controller-url":
+                    body = self.read_body()
+                    self.send_json(agent.set_controller_url(str(body.get("url") or "")))
                     return
                 if self.path == "/api/llama-node/start":
                     result = agent.llama_node_start(self.read_body())

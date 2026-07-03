@@ -65,6 +65,21 @@ cd ~/projects/caravan-scout
 The host appears on the controller's Topology board within one heartbeat
 (≤ 60 s). Flags: `--admin-url <url>`, `--skip-llama`, `--llama-tag <tag>`.
 
+## Pairing with a controller (no config editing)
+
+If you skipped `--admin-url` (or want to re-point the host later), open the
+agent's built-in page from any browser:
+
+```
+http://<this-host-ip>:8092/
+```
+
+It shows what the agent detected on this machine (GPUs, local agents, running
+cells) and has a single **Pair** field — paste the controller address
+(`http://<controller-ip>:8090`), press Pair, and the host saves it to
+`config.json`, sends a heartbeat immediately and reports whether the
+controller answered. No file editing, no restart.
+
 Manual start:
 
 ```sh

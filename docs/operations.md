@@ -53,6 +53,10 @@ The essentials: `hostId`, `controllerUrl`, `agents` (or `registryUrl` to derive
 them from the fleet registry), `llamaServerBin`, `modelsBasePath`,
 `applyCommand`.
 
+`controllerUrl` can also be set from a browser: open `http://<host>:8092/`
+and use the Pair form — it rewrites `config.json` atomically and fires an
+immediate heartbeat (no restart needed).
+
 Runtime files (never in git): `state.json` (assignments, apply/heartbeat
 status), `llama-node-configs/`, `var/server-cells/<port>/`, the model cache
 (`~/llama-model-cache` by default).
