@@ -116,6 +116,8 @@ agent's built-in page from any browser:
 http://<this-host-ip>:8092/
 ```
 
+![Pairing page](docs/screenshots/pairing.png)
+
 It shows what the agent detected on this machine (GPUs, local agents, running
 cells) and has a single **Pair** field — paste the controller address
 (`http://<controller-ip>:8090`), press Pair, and the host saves it to
