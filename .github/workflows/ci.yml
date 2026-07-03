@@ -1,0 +1,32 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: py_compile
+        run: python3 -m py_compile $(git ls-files '*.py')
+
+      - name: boot smoke (agent serves)
+        run: |
+          set -e
+          mkdir -p /tmp/ci
+          printf '{"hostId":"ci","listenHost":"127.0.0.1","listenPort":18092,"controllerUrl":""}\n' > /tmp/ci/config.json
+          python3 -m caravan_scout.app --config /tmp/ci/config.json --state /tmp/ci/state.json &
+          for i in $(seq 1 20); do
+            curl -sf -o /dev/null http://127.0.0.1:18092/api/health && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:18092/api/health
+          curl -sf -o /dev/null http://127.0.0.1:18092/api/state
+          curl -sf -o /dev/null http://127.0.0.1:18092/
+          echo "smoke OK"
