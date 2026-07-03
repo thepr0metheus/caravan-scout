@@ -197,9 +197,11 @@ journalctl --user -u caravan-scout.service -f
 launchctl kickstart -k gui/$UID/com.caravan-scout
 ```
 
-⚠️ Restarting the agent kills the server cells it runs (they are child
-processes). Restart the cells from the controller's board afterwards — their
-configs are saved. Details: [docs/operations.md](docs/operations.md).
+Cells **survive agent restarts**: the units keep child processes alive
+(`KillMode=process` / `AbandonProcessGroup`) and the fresh agent re-adopts
+them from its registry (`state.json`) — same pid, same uptime, inference
+uninterrupted. Orphans that match the llama-server binary but are not in the
+registry are reaped. Details: [docs/operations.md](docs/operations.md).
 
 ## Deployment rule
 

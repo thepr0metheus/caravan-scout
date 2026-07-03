@@ -178,13 +178,90 @@ class CellsMixin:
 
     # ── llama-node config backups ──────────────────────────────────────────
 
-    def reap_stray_llama_servers(self) -> None:
+    # ── cell registry (state.json) — survives agent restarts so cells can be
+    #    re-adopted instead of reaped ─────────────────────────────────────────
+
+    def _register_cell(self, port: int, kind: str, pid: int, marker: str,
+                       cfg: dict, log_path, cache_models: bool) -> None:
+        with self.lock:
+            cells = self.state.setdefault("cells", {})
+            cells[str(int(port))] = {
+                "port": int(port), "kind": kind, "pid": int(pid),
+                "marker": str(marker or "")[:200],
+                "cfg": {k: v for k, v in (cfg or {}).items() if k != "cmd"},
+                "log": str(log_path or ""),
+                "cacheModels": bool(cache_models),
+                "startedAt": int(time.time()),
+            }
+            self.save_state()
+
+    def _unregister_cell(self, port: int) -> None:
+        with self.lock:
+            cells = self.state.get("cells") or {}
+            if cells.pop(str(int(port)), None) is not None:
+                self.save_state()
+
+    @staticmethod
+    def _marker_matches(marker: str, cmdline: str) -> bool:
+        """The exec'd argv[0] may be a resolved binary path (python3 → .../MacOS/Python),
+        so besides the exact substring also accept the marker's argument tail."""
+        if not marker or not cmdline:
+            return False
+        if marker in cmdline:
+            return True
+        tail = " ".join(marker.split()[1:])
+        return bool(tail) and tail in cmdline
+
+    @staticmethod
+    def _pid_cmdline(pid: int) -> str:
+        try:
+            out = subprocess.run(["ps", "-p", str(int(pid)), "-o", "command="],
+                                 capture_output=True, text=True, timeout=5)
+            return out.stdout.strip()
+        except Exception:
+            return ""
+
+    def adopt_or_reap_strays(self) -> None:
+        """Re-attach cells that survived the agent restart, then reap only the
+        truly orphaned llama-server processes.
+
+        The registry (state.json "cells") records every started cell with its
+        pid + a cmdline marker. On startup: pid alive AND its command line still
+        contains the marker → adopt into a fresh slot (same pid, same uptime —
+        deploys stop killing inference). Anything matching llamaServerBin that
+        was NOT adopted is a real stray and gets reaped as before."""
+        adopted_pids = set()
+        for key, rec in list((self.state.get("cells") or {}).items()):
+            try:
+                port = int(rec.get("port") or key)
+                pid = int(rec.get("pid") or 0)
+            except (TypeError, ValueError):
+                continue
+            marker = str(rec.get("marker") or "")
+            cmdline = self._pid_cmdline(pid) if pid > 1 else ""
+            if not self._marker_matches(marker, cmdline):
+                self._unregister_cell(port)
+                continue
+            slot = self._slot(port)
+            log = rec.get("log") or ""
+            slot.node.adopt(pid, dict(rec.get("cfg") or {}),
+                            log_path=Path(log) if log else None,
+                            started_at=int(rec.get("startedAt") or 0))
+            slot.cache_models = bool(rec.get("cacheModels"))
+            self._set_llama_startup(port, phase="running", error="")
+            adopted_pids.add(pid)
+            print(f"[llama-node] adopted running cell :{port} (pid {pid})")
+        self.reap_stray_llama_servers(keep_pids=adopted_pids)
+
+    def reap_stray_llama_servers(self, keep_pids=None) -> None:
         """Kill any llama-server left from a previous agent run.
 
-        systemd KillMode lets the Popen child escape the unit's cgroup, so after
-        a restart the fresh agent has no handle to it — a stray process would
-        hold the GPU and block the inference port (and a new start would spawn a
-        duplicate). Match on the configured binary path and terminate."""
+        With KillMode=process / AbandonProcessGroup the children survive the
+        unit restart on purpose — adopt_or_reap_strays() re-attaches the ones
+        recorded in the registry and passes their pids in `keep_pids`; whatever
+        llama-server remains unmatched is a genuine orphan holding the GPU and
+        the port, and is terminated here."""
+        keep = {int(p) for p in (keep_pids or set())}
         bin_path = str(self.config.get("llamaServerBin") or "").strip()
         if not bin_path:
             return
@@ -192,7 +269,8 @@ class CellsMixin:
             out = subprocess.run(["pgrep", "-f", bin_path],
                                  capture_output=True, text=True, timeout=5)
             pids = [int(p) for p in out.stdout.split()
-                    if p.strip().isdigit() and int(p) != os.getpid()]
+                    if p.strip().isdigit() and int(p) != os.getpid()
+                    and int(p) not in keep]
         except Exception:
             return
         if not pids:
@@ -210,10 +288,11 @@ class CellsMixin:
                 os.kill(pid, signal.SIGKILL)
             except Exception:
                 pass
-        try:
-            self._purge_model_cache()
-        except Exception:
-            pass
+        if not keep:
+            try:
+                self._purge_model_cache()
+            except Exception:
+                pass
 
     def save_llama_node_config(self, model_path: str, port: int,
                                gpu_layers: int, ctx_size: int) -> None:
@@ -409,6 +488,12 @@ class CellsMixin:
         result = slot.node.start_command(shell_line, cfg, log_path=log_path)
         self._set_llama_startup(port, phase="running" if result.get("ok") else "error",
                                 error="" if result.get("ok") else (result.get("error") or "start failed"))
+        if result.get("ok"):
+            # Marker for re-adoption: the exec'd command line with $PORT expanded
+            # (the shell resolves it before exec, so ps shows the resolved form).
+            marker = command.replace("$PORT", str(port)).replace("~/", "")[:120]
+            self._register_cell(port, "command", result.get("pid") or 0, marker,
+                                cfg, log_path, slot.cache_models)
         return result
 
     @staticmethod
@@ -493,6 +578,8 @@ class CellsMixin:
 
         if result.get("ok"):
             self._set_llama_startup(port, phase="running", error="")
+            self._register_cell(port, "llama", result.get("pid") or 0, bin_path,
+                                cfg, log_path, cache_models)
             # Manual snapshots only — no auto-save of launch params on start.
             # Caching on ⇒ keep only the active model (don't accumulate on disk).
             # Caching off ⇒ files get purged on stop anyway, no cleanup needed here.

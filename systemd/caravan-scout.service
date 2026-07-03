@@ -9,6 +9,10 @@ WorkingDirectory=%h/projects/caravan-scout
 ExecStart=/usr/bin/python3 -m caravan_scout.app --config %h/projects/caravan-scout/config.json --state %h/projects/caravan-scout/state.json
 Restart=always
 RestartSec=3
+# Cells (llama-server / command children) must SURVIVE agent restarts —
+# the fresh agent re-adopts them from its registry instead of relaunching.
+KillMode=process
+TimeoutStopSec=15
 
 [Install]
 WantedBy=default.target

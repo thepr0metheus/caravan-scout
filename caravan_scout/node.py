@@ -28,6 +28,7 @@ class LlamaNode:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._proc: subprocess.Popen | None = None
+        self._adopted_pid: int | None = None  # re-attached process (not our child)
         self._cfg: dict[str, Any] = {}
         self._started_at: int = 0
         self._last_error: str = ""
@@ -112,7 +113,39 @@ class LlamaNode:
         except Exception:
             pass
 
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except Exception:
+            return False
+
     # ── public API ──────────────────────────────────────────────────────────
+
+    def adopt(self, pid: int, cfg: dict[str, Any], log_path: Path | None = None,
+              started_at: int = 0) -> dict[str, Any]:
+        """Re-attach to a server that survived an agent restart (KillMode=process /
+        AbandonProcessGroup). The process is NOT our child, so it is managed by
+        pid: liveness via kill(pid, 0), stop via SIGTERM→SIGKILL."""
+        with self._lock:
+            self._proc = None
+            self._adopted_pid = int(pid)
+            self._cfg = dict(cfg or {})
+            self._started_at = int(started_at) or int(time.time())
+            self._last_error = ""
+            self._log_path = log_path
+            self._exit_info = None
+            return {"ok": True, "pid": int(pid), "adopted": True}
+
+    def _running_locked(self) -> bool:
+        if self._proc and self._proc.poll() is None:
+            return True
+        return bool(self._adopted_pid and self._pid_alive(self._adopted_pid))
 
     def start(self, bin_path: str, args: list[str], cfg: dict[str, Any],
               log_path: Path | None = None) -> dict[str, Any]:
@@ -120,9 +153,10 @@ class LlamaNode:
         (already includes --model/--host/--port). `cfg` is metadata surfaced by
         status() (modelPath, port, gpuLayers, ctxSize)."""
         with self._lock:
-            if self._proc and self._proc.poll() is None:
+            if self._running_locked():
                 return {"ok": False, "error": "llama-server is already running",
                         "port": self._cfg.get("port")}
+            self._adopted_pid = None
             bp = Path(bin_path).expanduser()
             if not bp.exists():
                 return {"ok": False,
@@ -159,9 +193,10 @@ class LlamaNode:
         PID is the server itself, not bash. Managed exactly like a llama-server
         process so status()/stop() keep working unchanged."""
         with self._lock:
-            if self._proc and self._proc.poll() is None:
+            if self._running_locked():
                 return {"ok": False, "error": "a process is already running",
                         "port": self._cfg.get("port")}
+            self._adopted_pid = None
             cmd = ["bash", "-lc", shell_command]
             if log_path:
                 self._rotate_log(log_path)
@@ -191,6 +226,22 @@ class LlamaNode:
             # reporting phase="error" and the cell can't be removed from the UI.
             self._last_error = ""
             self._exit_info = {}
+            if self._adopted_pid:
+                pid = self._adopted_pid
+                self._adopted_pid = None
+                self._cfg = {}
+                self._started_at = 0
+                if self._pid_alive(pid):
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                        deadline = time.time() + 10
+                        while time.time() < deadline and self._pid_alive(pid):
+                            time.sleep(0.3)
+                        if self._pid_alive(pid):
+                            os.kill(pid, signal.SIGKILL)
+                    except Exception as exc:
+                        return {"ok": False, "error": str(exc)}
+                return {"ok": True, "adopted": True}
             if not self._proc or self._proc.poll() is not None:
                 self._proc = None
                 self._cfg = {}
@@ -212,6 +263,21 @@ class LlamaNode:
 
     def status(self) -> dict[str, Any]:
         with self._lock:
+            if self._adopted_pid:
+                if self._pid_alive(self._adopted_pid):
+                    return {
+                        "running": True,
+                        "pid": self._adopted_pid,
+                        "adopted": True,
+                        "startedAt": self._started_at,
+                        "uptimeSec": int(time.time()) - self._started_at,
+                        **{k: v for k, v in self._cfg.items() if k != "cmd"},
+                    }
+                # Died while adopted: no exit code is observable (not our child).
+                err = self._read_log_error(self._log_path)
+                self._exit_info = {"exitCode": None, "lastError": err, "crashed": True}
+                self._adopted_pid = None
+                return {"running": False, **self._exit_info}
             if not self._proc:
                 st: dict[str, Any] = {"running": False}
                 if self._exit_info:

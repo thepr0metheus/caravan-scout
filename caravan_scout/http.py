@@ -144,6 +144,7 @@ def make_handler(agent: RouteAgent):
                         if not _sl.cache_models:
                             _purge_any = True
                         agent._drop_slot(pp)   # a stopped slot disappears from the fleet view
+                        agent._unregister_cell(pp)
                     # Purge once, after the stopped slots are dropped, via the SAFE
                     # variant so a model still served by another running slot isn't
                     # evicted (stopping whisper must not delete the translator gguf).

@@ -24,7 +24,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     agent = RouteAgent(Path(args.config).expanduser(), Path(args.state).expanduser())
-    agent.reap_stray_llama_servers()
+    agent.adopt_or_reap_strays()
     heartbeat = threading.Thread(target=agent.heartbeat_loop, daemon=True)
     heartbeat.start()
 

@@ -63,6 +63,14 @@ status), `llama-node-configs/`, `var/server-cells/<port>/`, the model cache
 
 ## Known quirks
 
+- **Agent restarts do not interrupt cells.** systemd (`KillMode=process`) and
+  launchd (`AbandonProcessGroup`) leave the llama-server / command children
+  running when the agent stops; the fresh agent re-adopts them from the
+  `cells` registry in `state.json` (pid + cmdline-marker match) and reaps only
+  unmatched llama-server orphans. Adopted processes are managed by pid
+  (liveness `kill(pid,0)`, stop SIGTERM→SIGKILL) — the one thing lost across
+  the adopt boundary is the exit code of a crash that happens while adopted.
+
 - **Cell crash root causes live on the client**, in
   `<modelsBasePath>/llama-server.log` — rotated on every start (15 kept). All
   slots share that file; command cells log to `command-cell.log` next to it.
