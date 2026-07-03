@@ -12,6 +12,38 @@ OpenClaw agents at their assigned proxy ports.
 Dependency-light on purpose: Python standard library only, one JSON config,
 a small HTTP API on `:8092`.
 
+## Why put a scout on every box
+
+The controller can only route to what it can see. The scout is how a machine
+becomes visible — and it earns its keep on any box that has either
+**hardware** or **agents**:
+
+- **A machine with a GPU** (even a modest one) becomes a place where the
+  fleet can run models: reserve a cell on the board, pick a model, press
+  Start — the scout downloads the GGUF from the controller's cache, launches
+  `llama-server`, reports load progress and slot activity back to the board.
+  An old 12 GB card serving a small model at night is real capacity the
+  router can use.
+- **A machine with AI agents** (OpenClaw, Hermes, anything with an
+  OpenAI-style `baseUrl`) gets its agents onto the topology: the scout
+  detects them (host processes, docker, VMs), and `apply-routes.py` re-points
+  each agent at its personal proxy port on the controller — after which all
+  the queueing/scheduling/spill rules apply to that agent's traffic with no
+  further changes on the machine, ever.
+- Both kinds of hosts report GPUs, VRAM, running compute apps and heartbeat
+  health, so the board shows the whole fleet's real state in one place.
+
+Why it's safe to adopt: standard library Python only, one JSON config, one
+small HTTP surface on `:8092`, systemd/launchd units, and the
+[pairing page](#pairing-with-a-controller-no-config-editing) means setup is
+"install, open a browser, paste the controller address".
+
+The bigger picture — hybrid local/cloud routing, queues, schedules, spend
+accounting — is the controller's story: see
+[LAMA CARAVAN → Why](https://github.com/thepr0metheus/lama-caravan#why-lama-caravan)
+and the worked example
+[a day with the caravan](https://github.com/thepr0metheus/lama-caravan/blob/main/docs/day-with-the-caravan.md).
+
 ## Documentation
 
 | Doc | Covers |
