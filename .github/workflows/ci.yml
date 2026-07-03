@@ -23,7 +23,7 @@ jobs:
           printf '{"hostId":"ci","listenHost":"127.0.0.1","listenPort":18092,"controllerUrl":""}\n' > /tmp/ci/config.json
           python3 -m caravan_scout.app --config /tmp/ci/config.json --state /tmp/ci/state.json &
           for i in $(seq 1 20); do
-            curl -sf -o /dev/null http://127.0.0.1:18092/api/health && break
+            if curl -sf -o /dev/null http://127.0.0.1:18092/api/health; then break; fi
             sleep 1
           done
           curl -sf http://127.0.0.1:18092/api/health
