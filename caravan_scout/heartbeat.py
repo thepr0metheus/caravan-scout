@@ -16,6 +16,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from caravan_scout import __version__ as APP_VERSION
 from caravan_scout.errors import AppError
 from caravan_scout.hw import host_cpu_ram
 
@@ -84,7 +85,7 @@ class HeartbeatMixin:
         with self.lock:
             return {
                 "service": "caravan-scout",
-                "version": "0.1.0",
+                "version": APP_VERSION,
                 "llamaBinaryVersion": self._llama_binary_version(),
                 "llamaBinaryMtime": self._llama_binary_mtime(),
                 "host": {
@@ -133,7 +134,7 @@ class HeartbeatMixin:
         request = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **self.controller_headers()},
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=timeout) as response:

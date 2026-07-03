@@ -44,6 +44,16 @@ accounting — is the controller's story: see
 and the worked example
 [a day with the caravan](https://github.com/thepr0metheus/lama-caravan/blob/main/docs/day-with-the-caravan.md).
 
+## Requirements
+
+| Component | Requirement |
+|---|---|
+| OS | Linux with systemd --user, or macOS (launchd) |
+| Python | **3.10+**, standard library only — no pip packages |
+| For llama cells | a `llama-server` binary on this host (`scripts/install.sh` can build it; CUDA optional) |
+| For GPU info | NVIDIA driver + `nvidia-smi` (optional — CPU-only hosts are fine) |
+| Network | reach the controller's `:8090`; the agent listens on `:8092` |
+
 ## Documentation
 
 | Doc | Covers |
@@ -111,6 +121,11 @@ cells) and has a single **Pair** field — paste the controller address
 (`http://<controller-ip>:8090`), press Pair, and the host saves it to
 `config.json`, sends a heartbeat immediately and reports whether the
 controller answered. No file editing, no restart.
+
+If the controller has sign-in enabled, paste its **fleet token** into the
+second field (the admin shows it in System → Security); it is stored as
+`controllerToken` and from then on both directions of scout ⇄ controller
+traffic authenticate with it.
 
 Manual start:
 

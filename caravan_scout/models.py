@@ -77,7 +77,7 @@ class ModelsMixin:
         last_exc: Exception = RuntimeError("no attempts made")
         for attempt, _ in enumerate((*_RETRY_DELAYS, None)):
             try:
-                req = urllib.request.Request(url)
+                req = urllib.request.Request(url, headers=self.controller_headers())
                 with urllib.request.urlopen(req, timeout=3600) as resp, open(tmp, "wb") as fh:
                     total = int(resp.headers.get("Content-Length") or 0)
                     if report:

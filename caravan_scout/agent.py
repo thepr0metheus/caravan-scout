@@ -208,7 +208,14 @@ class RouteAgent(RegistryMixin, OpenclawMixin, HeartbeatMixin, ModelsMixin, Cell
         tmp.write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self.state_path)
 
-    def set_controller_url(self, raw_url: str) -> dict[str, Any]:
+    def controller_token(self) -> str:
+        return str(self.config.get("controllerToken") or "").strip()
+
+    def controller_headers(self) -> dict[str, str]:
+        token = self.controller_token()
+        return {"X-Caravan-Token": token} if token else {}
+
+    def set_controller_url(self, raw_url: str, raw_token: str = "") -> dict[str, Any]:
         """Pairing endpoint: persist controllerUrl into config.json (preserving
         the user's file as-is otherwise) and try one heartbeat right away so
         the pairing page can show success/failure without waiting a cycle."""
@@ -230,12 +237,17 @@ class RouteAgent(RegistryMixin, OpenclawMixin, HeartbeatMixin, ModelsMixin, Cell
             except Exception:
                 raw = {}
         raw["controllerUrl"] = url
+        token = str(raw_token or "").strip()
+        if token:
+            raw["controllerToken"] = token
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.config_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         tmp.replace(self.config_path)
         with self.lock:
             self.config["controllerUrl"] = url
+            if token:
+                self.config["controllerToken"] = token
         try:
             result = self.heartbeat_once()
             status = {"state": "ok", "lastAt": int(time.time()), "result": result}

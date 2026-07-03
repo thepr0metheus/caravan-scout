@@ -1,3 +1,3 @@
-"""LLM Easy Route Agent."""
+"""Caravan Scout — client-side agent of the LAMA CARAVAN fleet."""
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"

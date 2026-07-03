@@ -74,13 +74,17 @@ PAIR_PAGE = """<!doctype html>
              autocomplete="off" spellcheck="false">
       <button type="submit" id="pairBtn">Pair</button>
     </form>
+    <input type="password" id="tokenInput" placeholder="fleet token — only if the controller requires sign-in"
+           autocomplete="off" spellcheck="false" style="margin-top:8px;width:100%">
     <p class="hint">Enter the address of the machine running the LAMA CARAVAN
       admin (default port <b>8090</b>). This host will start sending heartbeats
-      and appear on its topology board within a minute.</p>
+      and appear on its topology board within a minute. If the controller has
+      accounts enabled, paste its <b>fleet token</b> too (shown in the admin's
+      System → Security panel).</p>
     <p class="msg" id="msg"></p>
   </div>
 
-  <p class="foot">caravan-scout · HTTP API on this port — see
+  <p class="foot"><span id="ver">caravan-scout</span> · HTTP API on this port — see
     <a href="https://github.com/thepr0metheus/caravan-scout" target="_blank"
        rel="noopener">docs</a></p>
 </div>
@@ -93,6 +97,7 @@ PAIR_PAGE = """<!doctype html>
   function render(st) {
     var host = st.host || {};
     $("hostId").textContent = host.id || "?";
+    if (st.version) $("ver").textContent = "caravan-scout v" + st.version;
     $("hostAddr").textContent = (host.hostname || "?") + " / " + (host.ip || "?");
     $("platform").textContent = st.platform || "?";
     var gpus = st.gpus || [];
@@ -144,7 +149,7 @@ PAIR_PAGE = """<!doctype html>
     fetch("/api/controller-url", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url: url })
+      body: JSON.stringify({ url: url, token: $("tokenInput").value.trim() })
     }).then(function (r) { return r.json(); }).then(function (res) {
       $("pairBtn").disabled = false;
       if (res.ok) {

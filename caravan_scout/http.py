@@ -16,6 +16,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from caravan_scout import __version__ as APP_VERSION
 from caravan_scout.errors import AppError
 
 
@@ -25,7 +26,7 @@ def json_bytes(payload: Any) -> bytes:
 
 def make_handler(agent: RouteAgent):
     class Handler(BaseHTTPRequestHandler):
-        server_version = "caravan-scout/0.1"
+        server_version = f"caravan-scout/{APP_VERSION}"
 
         def log_message(self, fmt: str, *args: Any) -> None:
             print(f"{self.address_string()} - {fmt % args}")
@@ -46,6 +47,22 @@ def make_handler(agent: RouteAgent):
                 raise AppError("body must be a JSON object")
             return payload
 
+        def _token_ok(self, body: dict[str, Any] | None = None) -> bool:
+            """When a controllerToken is configured, every API call must carry
+            it (controller does via X-Caravan-Token; the pairing form may put
+            it into the body instead). No token configured = open (LAN mode)."""
+            expected = agent.controller_token()
+            if not expected:
+                return True
+            import hmac as _hmac
+            got = self.headers.get("X-Caravan-Token") or ""
+            if not got and isinstance(body, dict):
+                got = str(body.get("token") or "")
+            if _hmac.compare_digest(got, expected):
+                return True
+            self.send_json({"error": "fleet token required (X-Caravan-Token)"}, 401)
+            return False
+
         def do_GET(self) -> None:
             try:
                 if self.path in ("/", "/index.html"):
@@ -59,7 +76,10 @@ def make_handler(agent: RouteAgent):
                     self.wfile.write(data)
                     return
                 if self.path == "/api/health":
-                    self.send_json({"ok": True, "service": "caravan-scout", "time": int(time.time())})
+                    self.send_json({"ok": True, "service": "caravan-scout", "version": APP_VERSION,
+                                    "tokenRequired": bool(agent.controller_token()), "time": int(time.time())})
+                    return
+                if not self._token_ok():
                     return
                 if self.path == "/api/state":
                     self.send_json(agent.public_state())
@@ -90,15 +110,20 @@ def make_handler(agent: RouteAgent):
 
         def do_POST(self) -> None:
             try:
+                body_probe = None
+                if self.path == "/api/controller-url":
+                    body_probe = self.read_body()
+                if not self._token_ok(body_probe):
+                    return
+                if self.path == "/api/controller-url":
+                    self.send_json(agent.set_controller_url(
+                        str(body_probe.get("url") or ""), str(body_probe.get("token") or "")))
+                    return
                 if self.path == "/api/routing/apply":
                     self.send_json(agent.apply_assignments(self.read_body()))
                     return
                 if self.path == "/api/heartbeat":
                     self.send_json(agent.heartbeat_once())
-                    return
-                if self.path == "/api/controller-url":
-                    body = self.read_body()
-                    self.send_json(agent.set_controller_url(str(body.get("url") or "")))
                     return
                 if self.path == "/api/llama-node/start":
                     result = agent.llama_node_start(self.read_body())
