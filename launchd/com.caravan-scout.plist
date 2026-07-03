@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.caravan-scout</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/user/projects/caravan-scout</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>-m</string>
+    <string>caravan_scout.app</string>
+    <string>--config</string>
+    <string>/Users/user/projects/caravan-scout/config.json</string>
+    <string>--state</string>
+    <string>/Users/user/projects/caravan-scout/state.json</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/user/projects/caravan-scout/caravan-scout.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/user/projects/caravan-scout/caravan-scout.err.log</string>
+</dict>
+</plist>

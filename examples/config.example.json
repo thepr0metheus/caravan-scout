@@ -1,0 +1,25 @@
+{
+  "hostId": "host-a",
+  "displayName": "host-a",
+  "listenHost": "0.0.0.0",
+  "listenPort": 8092,
+  "controllerUrl": "http://<controller-ip>:8090",
+  "heartbeatIntervalSeconds": 60,
+  "registryUrl": "",
+  "agents": [
+    {
+      "id": "openclaw",
+      "name": "OpenClaw",
+      "kind": "openclaw",
+      "scope": "host",
+      "runtime": "host",
+      "port": 18791,
+      "endpoint": "http://127.0.0.1:18791"
+    }
+  ],
+  "llamaServerBin": "",
+  "modelsBasePath": "",
+  "llamaNodeDefaultPort": 8180,
+  "cleanOldModels": false,
+  "applyCommand": ""
+}
