@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.0.1 — 2026-07-08
+
+- Fix: a cell whose launch command exec's into another program (e.g.
+  `run_whisper.sh` → `exec python whisper_server.py`) is now re-adopted
+  across an agent restart instead of being dropped. The exec rewrites the
+  process argv, so the recorded launch marker no longer appears in `ps`;
+  adoption now falls back to identity by PORT — whoever is healthily
+  serving the cell's port (`/health` 2xx) is adopted as the cell. This
+  also recovers when a failed restart left a stale pid in the registry.
+  Symptom fixed: the cell showed CONFIGURED while its healthy server was
+  still running, and a START retry hit `[Errno 98] Address already in use`.
+
+## 2026-07-04
+
+### 📝 Обновление changelog
+
+**Зачем:** Запись в changelog за 2026-07-04 — изменений в Caravan Scout не зафиксировано.
+**Что:** Создана ветка , внесена пустая запись в changelog, ветка слита в master.
+**Коммиты:** —
+
+
 ## 1.0.0 — 2026-07-03
 
 First public release (formerly `llm-easy-route-agent`).

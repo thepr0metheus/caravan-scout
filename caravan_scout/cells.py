@@ -221,6 +221,39 @@ class CellsMixin:
         except Exception:
             return ""
 
+    @staticmethod
+    def _port_listener_pid(port: int) -> int:
+        """PID LISTENING on <port> (any local address), via `ss`; 0 if none. Lets us
+        re-identify a cell by its port when the launch marker no longer matches: a
+        wrapper that exec's into another program (run_whisper.sh → exec python)
+        rewrites argv, so the marker is gone from ps though the port is still served."""
+        want = str(int(port))
+        try:
+            out = subprocess.run(["ss", "-ltnpH"], capture_output=True,
+                                 text=True, timeout=5).stdout
+        except Exception:
+            return 0
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) < 4 or parts[3].rsplit(":", 1)[-1] != want:
+                continue  # parts[3] is the Local Address:Port column
+            m = re.search(r"pid=(\d+)", line)
+            if m:
+                return int(m.group(1))
+        return 0
+
+    @staticmethod
+    def _port_health_ok(port: int, timeout: float = 2.0) -> bool:
+        """True if the server on <port> answers GET /health with 2xx. llama-server and
+        the whisper cell both expose /health; this confirms a real, healthy cell is
+        serving the port before we adopt whatever pid owns it."""
+        try:
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{int(port)}/health", timeout=timeout) as resp:
+                return 200 <= int(getattr(resp, "status", 200) or 200) < 300
+        except Exception:
+            return False
+
     def adopt_or_reap_strays(self) -> None:
         """Re-attach cells that survived the agent restart, then reap only the
         truly orphaned llama-server processes.
@@ -228,20 +261,35 @@ class CellsMixin:
         The registry (state.json "cells") records every started cell with its
         pid + a cmdline marker. On startup: pid alive AND its command line still
         contains the marker → adopt into a fresh slot (same pid, same uptime —
-        deploys stop killing inference). Anything matching llamaServerBin that
-        was NOT adopted is a real stray and gets reaped as before."""
+        deploys stop killing inference). When the marker no longer matches — an
+        exec-chained command cell rewrote its argv, or a failed restart clobbered
+        the recorded pid — fall back to identity by PORT: adopt whoever is healthily
+        serving the cell's port. Anything matching llamaServerBin that was NOT
+        adopted is a real stray and gets reaped as before."""
         adopted_pids = set()
         for key, rec in list((self.state.get("cells") or {}).items()):
             try:
                 port = int(rec.get("port") or key)
-                pid = int(rec.get("pid") or 0)
+                rec_pid = int(rec.get("pid") or 0)
             except (TypeError, ValueError):
                 continue
             marker = str(rec.get("marker") or "")
-            cmdline = self._pid_cmdline(pid) if pid > 1 else ""
-            if not self._marker_matches(marker, cmdline):
-                self._unregister_cell(port)
-                continue
+            cmdline = self._pid_cmdline(rec_pid) if rec_pid > 1 else ""
+            if rec_pid > 1 and self._marker_matches(marker, cmdline):
+                pid = rec_pid
+            else:
+                # Marker gone (an exec-chained wrapper like run_whisper.sh → exec
+                # python rewrote argv) or the recorded pid was clobbered by a failed
+                # restart. Identify the cell by its real contract instead: whoever
+                # is healthily serving the cell's PORT right now IS the cell.
+                pid = self._port_listener_pid(port)
+                if not (pid and self._port_health_ok(port)):
+                    self._unregister_cell(port)
+                    continue
+                if pid != rec_pid:            # re-discovered by port → keep registry honest
+                    with self.lock:
+                        rec["pid"] = pid
+                        self.save_state()
             slot = self._slot(port)
             log = rec.get("log") or ""
             slot.node.adopt(pid, dict(rec.get("cfg") or {}),
