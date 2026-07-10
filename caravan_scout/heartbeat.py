@@ -88,6 +88,7 @@ class HeartbeatMixin:
                 "version": APP_VERSION,
                 "llamaBinaryVersion": self._llama_binary_version(),
                 "llamaBinaryMtime": self._llama_binary_mtime(),
+                "llamaUpdate": self.llama_update_status_slim(),
                 "host": {
                     "id": self.config.get("hostId"),
                     "name": self.config.get("displayName"),

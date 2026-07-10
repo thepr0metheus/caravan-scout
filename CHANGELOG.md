@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.0 — 2026-07-10
+
+- One-click llama.cpp updates from the controller: `POST
+  /api/llama-node/update {tag?}` runs `scripts/update-llama.sh` (a synced
+  copy of the controller's install script: release-tag/commit `checkout
+  -f`, stale-build-dir guard, probe-gated Blackwell workaround, cmake
+  build) as a background job; `GET /api/llama-node/update-status` streams
+  the log tail, and a slim status rides every heartbeat so the fleet
+  board can show build progress. Running cells keep the old binary until
+  restarted — never automatic. An empty tag resolves the latest upstream
+  release; passing the controller's commit converges the client onto the
+  controller's exact build.
+
 ## 1.0.1 — 2026-07-08
 
 - Fix: a cell whose launch command exec's into another program (e.g.

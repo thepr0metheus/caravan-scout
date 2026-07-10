@@ -20,7 +20,83 @@ from caravan_scout.paths import LLAMA_PATH_PLACEHOLDER_MMPROJ, LLAMA_PATH_PLACEH
 from caravan_scout.errors import AppError
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
 class CellsMixin:
+    # ── llama.cpp update job ──────────────────────────────────────────────────
+    # Runs scripts/update-llama.sh (a synced copy of the controller's
+    # install-llama.sh: release-tag/commit checkout -f, stale-build-dir guard,
+    # probe-gated Blackwell workaround, cmake build) as a background thread and
+    # streams its output into a ring buffer. Running cells keep the OLD binary
+    # (they hold its inode) until restarted — deliberately never automatic.
+    # The slim status rides every heartbeat so the controller UI can show
+    # "building…" without extra calls.
+
+    def _llama_update_job(self) -> dict:
+        job = getattr(self, "_llama_update_state", None)
+        if job is None:
+            job = {"running": False, "startedAt": 0, "tag": "", "lines": [],
+                   "done": False, "rc": None, "error": ""}
+            self._llama_update_state = job
+            self._llama_update_lock = threading.Lock()
+        return job
+
+    def llama_update_status(self) -> dict:
+        job = self._llama_update_job()
+        with self._llama_update_lock:
+            snap = {k: v for k, v in job.items() if k != "lines"}
+            snap["lines"] = list(job["lines"])[-200:]
+            return snap
+
+    def llama_update_status_slim(self) -> dict:
+        job = self._llama_update_job()
+        with self._llama_update_lock:
+            return {"running": job["running"], "done": job["done"], "rc": job["rc"],
+                    "startedAt": job["startedAt"], "tag": job["tag"],
+                    "lastLine": (job["lines"][-1] if job["lines"] else "")}
+
+    def llama_update_start(self, body: dict) -> dict:
+        """POST /api/llama-node/update {tag?} — empty tag = latest release; a
+        commit sha works too (checkout -f accepts either), which is how the
+        controller converges a client onto its own build."""
+        job = self._llama_update_job()
+        script = Path(__file__).resolve().parent.parent / "scripts" / "update-llama.sh"
+        if not script.exists():
+            raise AppError(f"update script not found: {script}", 500)
+        tag = str((body or {}).get("tag") or "").strip()
+        cmd = ["bash", str(script), "--force", "--no-restart"]
+        if tag:
+            cmd += ["--llama-tag", tag]
+        with self._llama_update_lock:
+            if job["running"]:
+                raise AppError("a llama.cpp update is already running", 409)
+            job.update({"running": True, "startedAt": int(time.time()), "tag": tag,
+                        "lines": [], "done": False, "rc": None, "error": ""})
+        env = dict(os.environ)
+        env["PATH"] = "/usr/local/cuda/bin:" + env.get("PATH", "/usr/bin:/bin")
+
+        def _run():
+            rc, error = -1, ""
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, text=True, env=env)
+                for line in proc.stdout:
+                    clean = _ANSI_RE.sub("", line.rstrip())
+                    with self._llama_update_lock:
+                        job["lines"].append(clean)
+                        if len(job["lines"]) > 500:
+                            del job["lines"][:100]
+                rc = proc.wait()
+            except Exception as exc:
+                error = str(exc)
+            finally:
+                with self._llama_update_lock:
+                    job.update({"running": False, "done": True, "rc": rc, "error": error})
+
+        threading.Thread(target=_run, daemon=True, name="llama-update").start()
+        return self.llama_update_status()
+
     def _server_cell_dir(self, port: int) -> Path:
         return SERVER_CELLS_DIR / str(int(port))
 

@@ -99,6 +99,9 @@ def make_handler(agent: RouteAgent):
                 if self.path == "/api/llama-node/configs":
                     self.send_json({"ok": True, "configs": agent.list_llama_node_configs()})
                     return
+                if self.path == "/api/llama-node/update-status":
+                    self.send_json(agent.llama_update_status())
+                    return
                 if self.path == "/api/llama-node/list-cache":
                     self.send_json({"ok": True, "models": agent.list_cached_models()})
                     return
@@ -155,6 +158,9 @@ def make_handler(agent: RouteAgent):
                             pass
                     self.send_json(_results[0] if len(_results) == 1
                                    else {"ok": True, "results": _results})
+                    return
+                if self.path == "/api/llama-node/update":
+                    self.send_json(agent.llama_update_start(self.read_body()))
                     return
                 if self.path == "/api/llama-node/purge-cache":
                     self.send_json({"ok": True, **agent.purge_model_cache_safe()})
