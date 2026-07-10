@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.1 — 2026-07-10
+
+- Client build archives keep 2 snapshots by default (current + one-step
+  undo) — client snapshots are large and a client rollback is never
+  urgent (running cells keep their binary through any rebuild).
+  `llamaBuildsKeep` in config.json overrides.
+
 ## 1.2.0 — 2026-07-10
 
 - Build archive + restore: every successful update snapshots the built

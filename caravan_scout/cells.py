@@ -100,6 +100,12 @@ class CellsMixin:
                         "lines": [], "done": False, "rc": None, "error": ""})
         env = dict(os.environ)
         env["PATH"] = "/usr/local/cuda/bin:" + env.get("PATH", "/usr/bin:/bin")
+        # Clients keep a SHORT archive (default 2: current + one-step undo) —
+        # client snapshots are big and a client rollback is never urgent: cells
+        # keep serving their old binary through any rebuild. config.json
+        # `llamaBuildsKeep` overrides.
+        env.setdefault("LLAMA_BUILDS_KEEP",
+                       str(int(self.config.get("llamaBuildsKeep") or 2)))
 
         def _run():
             rc, error = -1, ""
