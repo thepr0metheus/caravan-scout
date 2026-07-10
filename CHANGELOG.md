@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.0 — 2026-07-10
+
+- Build archive + restore: every successful update snapshots the built
+  llama.cpp (last 5 kept) and `GET /api/llama-node/builds` /
+  `POST /api/llama-node/restore {id}` list and restore them — same
+  background job and heartbeat status as updates. Restore re-checks the
+  clone out at the archived commit; running cells keep their binary
+  until restarted.
+
 ## 1.1.0 — 2026-07-10
 
 - One-click llama.cpp updates from the controller: `POST

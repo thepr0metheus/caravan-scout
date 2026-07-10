@@ -56,18 +56,43 @@ class CellsMixin:
                     "startedAt": job["startedAt"], "tag": job["tag"],
                     "lastLine": (job["lines"][-1] if job["lines"] else "")}
 
+    def llama_builds_list(self) -> dict:
+        """Archived build snapshots on THIS host (newest first) — the update
+        script writes one per successful build and prunes to 5 by default."""
+        root = Path(os.environ.get("LLAMA_BUILDS_DIR")
+                    or Path.home() / ".local" / "share" / "lama-caravan" / "llama-builds")
+        rows = []
+        if root.is_dir():
+            for entry in sorted(root.iterdir(), reverse=True):
+                meta = entry / "meta.json"
+                if not meta.is_file():
+                    continue
+                try:
+                    row = json.loads(meta.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                row["id"] = entry.name
+                rows.append(row)
+        return {"ok": True, "builds": rows}
+
     def llama_update_start(self, body: dict) -> dict:
         """POST /api/llama-node/update {tag?} — empty tag = latest release; a
         commit sha works too (checkout -f accepts either), which is how the
-        controller converges a client onto its own build."""
+        controller converges a client onto its own build. With {restoreId} the
+        same job restores an archived build instead of building."""
         job = self._llama_update_job()
         script = Path(__file__).resolve().parent.parent / "scripts" / "update-llama.sh"
         if not script.exists():
             raise AppError(f"update script not found: {script}", 500)
         tag = str((body or {}).get("tag") or "").strip()
-        cmd = ["bash", str(script), "--force", "--no-restart"]
-        if tag:
-            cmd += ["--llama-tag", tag]
+        restore_id = str((body or {}).get("restoreId") or "").strip()
+        if restore_id:
+            cmd = ["bash", str(script), "--restore", restore_id]
+            tag = f"restore:{restore_id}"
+        else:
+            cmd = ["bash", str(script), "--force", "--no-restart"]
+            if tag:
+                cmd += ["--llama-tag", tag]
         with self._llama_update_lock:
             if job["running"]:
                 raise AppError("a llama.cpp update is already running", 409)
