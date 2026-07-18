@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.5 — 2026-07-18
+
+- The bundled command-cell servers live here and only here. `tts/` and
+  `whisper/` also existed in the controller repo, and the two copies had
+  drifted: `_pick_device` plus the cosyvoice device selection were in that copy
+  and not in this one. This repo owns them because it is what installs them —
+  `scripts/install-{tts,whisper}.sh` copy them into `$HOME` on the client, and
+  the cell command runs the `$HOME` copy. The reconciled `tts_server.py` is now
+  the single source.
+
 ## 1.2.4 — 2026-07-18
 
 - Adoption no longer forgets a cell that is alive. On startup the fallback
