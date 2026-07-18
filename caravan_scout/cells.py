@@ -350,16 +350,23 @@ class CellsMixin:
         return 0
 
     @staticmethod
-    def _port_health_ok(port: int, timeout: float = 2.0) -> bool:
+    def _port_health_ok(port: int, timeout: float = 2.0, attempts: int = 1) -> bool:
         """True if the server on <port> answers GET /health with 2xx. llama-server and
         the whisper cell both expose /health; this confirms a real, healthy cell is
-        serving the port before we adopt whatever pid owns it."""
-        try:
-            with urllib.request.urlopen(
-                    f"http://127.0.0.1:{int(port)}/health", timeout=timeout) as resp:
-                return 200 <= int(getattr(resp, "status", 200) or 200) < 300
-        except Exception:
-            return False
+        serving the port before we adopt whatever pid owns it.
+
+        Retries because this runs at agent startup, which is exactly when the host
+        is busiest — a single 2 s probe on a loaded box times out on a cell that is
+        perfectly alive."""
+        for i in range(max(1, int(attempts))):
+            try:
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{int(port)}/health", timeout=timeout) as resp:
+                    return 200 <= int(getattr(resp, "status", 200) or 200) < 300
+            except Exception:
+                if i + 1 < attempts:
+                    time.sleep(1.0)
+        return False
 
     def adopt_or_reap_strays(self) -> None:
         """Re-attach cells that survived the agent restart, then reap only the
@@ -390,9 +397,17 @@ class CellsMixin:
                 # restart. Identify the cell by its real contract instead: whoever
                 # is healthily serving the cell's PORT right now IS the cell.
                 pid = self._port_listener_pid(port)
-                if not (pid and self._port_health_ok(port)):
-                    self._unregister_cell(port)
+                if not pid:
+                    self._unregister_cell(port)   # nothing serves it — really gone
                     continue
+                if not self._port_health_ok(port, timeout=4.0, attempts=3):
+                    # Something owns the port but stayed quiet. On a loaded host
+                    # that is a timeout, not a death — and unregistering here
+                    # stranded a live cell as "stopped" forever while its process
+                    # kept serving traffic, with no way back short of killing it.
+                    # Keep the record, adopt the listener, let polling set phase.
+                    print(f"[llama-node] :{port} holds the port but /health stayed "
+                          f"quiet — adopting anyway rather than forgetting it")
                 if pid != rec_pid:            # re-discovered by port → keep registry honest
                     with self.lock:
                         rec["pid"] = pid

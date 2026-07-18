@@ -79,8 +79,11 @@ class RouteAgent(RegistryMixin, OpenclawMixin, HeartbeatMixin, ModelsMixin, Cell
         rates. Cached ~2s. Returns {promptTps, genTps, requestsProcessing}."""
         now = time.time()
         cache = getattr(self, "_metrics_cache", None)
-        if cache and now - cache[0] < 2 and cache[1] == port:
-            return cache[2]
+        if not isinstance(cache, dict):
+            cache = self._metrics_cache = {}
+        hit = cache.get(port)
+        if hit and now - hit[0] < 2:
+            return hit[1]
         out: dict[str, Any] = {}
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{int(port)}/metrics", timeout=1) as r:
@@ -109,15 +112,19 @@ class RouteAgent(RegistryMixin, OpenclawMixin, HeartbeatMixin, ModelsMixin, Cell
             out["ctxMax"] = ctx_max
             if ratio is not None:
                 out["ctxUsed"] = int(round(ratio * ctx_max))
-        self._metrics_cache = (now, port, out)
+        cache[port] = (now, out)
         return out
 
     def _llama_ctx_max(self, port: int) -> int:
-        """n_ctx the llama-server was launched with, from /props. Cached ~30s."""
+        """n_ctx the llama-server was launched with, from /props. Cached ~30s
+        PER PORT (same single-slot thrash as _firewall — see its note)."""
         now = time.time()
         cache = getattr(self, "_ctx_cache", None)
-        if cache and now - cache[0] < 30 and cache[1] == port:
-            return cache[2]
+        if not isinstance(cache, dict):
+            cache = self._ctx_cache = {}
+        hit = cache.get(port)
+        if hit and now - hit[0] < 30:
+            return hit[1]
         ctx = 0
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{int(port)}/props", timeout=1) as r:
@@ -126,17 +133,28 @@ class RouteAgent(RegistryMixin, OpenclawMixin, HeartbeatMixin, ModelsMixin, Cell
             ctx = int(gen.get("n_ctx") or props.get("n_ctx") or 0)
         except Exception:
             ctx = 0
-        self._ctx_cache = (now, port, ctx)
+        cache[port] = (now, ctx)
         return ctx
 
     def _firewall(self, port: int) -> dict[str, Any]:
-        """Cached (~30s) ufw access classification for the llama-node port."""
+        """Cached (~30s) ufw access classification, keyed PER PORT.
+
+        This was a single-slot cache (one tuple for the whole agent), so a host
+        running more than one cell thrashed it: each port missed the other's
+        entry and re-ran `sudo -n ufw status`. With a few cells and a ~1 s
+        status pass that is several sudo+ufw forks per second — measured at
+        232/min on a 3-cell host, driving its load average past 25 and stalling
+        cell starts. One entry per port fixes it.
+        """
         now = time.time()
         cache = getattr(self, "_fw_cache", None)
-        if cache and now - cache[0] < 30 and cache[1] == port:
-            return cache[2]
+        if not isinstance(cache, dict):
+            cache = self._fw_cache = {}
+        hit = cache.get(port)
+        if hit and now - hit[0] < 30:
+            return hit[1]
         fw = firewall_port_access(port)
-        self._fw_cache = (now, port, fw)
+        cache[port] = (now, fw)
         return fw
 
     def _node_public(self, port: int, slot: "_Slot") -> dict[str, Any]:

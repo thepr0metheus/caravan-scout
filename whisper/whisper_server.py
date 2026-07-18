@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OpenAI-compatible faster-whisper server for Revoice's --asr-endpoint.
+"""OpenAI-compatible faster-whisper server for a voice app's --asr-endpoint.
 
 Serves POST /v1/audio/transcriptions (multipart wav -> {"text": ...}) on your GPU.
 
@@ -148,6 +148,7 @@ class H(BaseHTTPRequestHandler):
             return
         wav = _extract_file(body, self.headers.get("Content-Type", ""))
         lang = _field(body, "language")
+        task = _field(body, "task")           # "translate" -> whisper any->en
         text = ""
         if wav:
             path = tempfile.mktemp(suffix=".wav")
@@ -155,7 +156,8 @@ class H(BaseHTTPRequestHandler):
                 with open(path, "wb") as f:
                     f.write(wav)
                 segs, _ = _model.transcribe(
-                    path, language=(lang or None), beam_size=1, vad_filter=False)
+                    path, language=(lang or None), beam_size=1, vad_filter=False,
+                    task=("translate" if task == "translate" else "transcribe"))
                 text = " ".join(s.text.strip() for s in segs).strip()
             except Exception as e:  # noqa: BLE001
                 sys.stderr.write(f"transcribe error: {e}\n")

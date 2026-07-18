@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.2.4 — 2026-07-18
+
+- Adoption no longer forgets a cell that is alive. On startup the fallback
+  "identify the cell by its port" path unregistered the cell whenever a single
+  2 s `/health` probe failed — but startup is exactly when the host is busiest,
+  so a loaded box timed out on cells that were serving fine. The record was
+  deleted while the process kept running, leaving the board showing "stopped"
+  forever with no way back short of killing the process by hand. Now only an
+  unlistened port unregisters; a port with a live listener is adopted, and the
+  probe retries 3× at 4 s before giving up on the phase.
+- The firewall, context-size and metrics caches are per-port dicts instead of
+  single-slot tuples. With several cells polled in rotation every lookup missed
+  the cache, so `sudo ufw status` ran 232×/min and pinned one client at load
+  25.8 — cell starts timed out. Same host now idles at 0.7 with 24 calls/min.
+- `__version__` had drifted behind the changelog (1.2.1 vs 1.2.3); realigned.
+
+## 1.2.3 — 2026-07-11
+
+- The whisper cell honors an optional `task=translate` multipart field
+  (any→English) — used by a voice app's flows; unknown to a server,
+  the field is simply ignored.
+
+## 1.2.2 — 2026-07-11
+
+- Voice-clone TTS cells provision like whisper: `tts/` ships
+  `tts_server.py` + `run_tts.sh` (XTTS-v2 / F5-TTS / CosyVoice2 behind one
+  `/v1/audio/speech-clone` contract) and `scripts/install-tts.sh` drops
+  them into `$HOME` plus the system ffmpeg torchcodec needs. Standalone —
+  not part of install.sh (engines are tens of GB; pre-warm with
+  `install-tts.sh --prewarm "xtts f5 cosyvoice"`).
+
 ## 1.2.1 — 2026-07-10
 
 - Client build archives keep 2 snapshots by default (current + one-step
