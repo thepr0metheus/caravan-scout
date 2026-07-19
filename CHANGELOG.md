@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.2.6 — 2026-07-19
+
+- Bundled Moonshine v2 STT cell (`stt/` + `scripts/install-moonshine.sh`):
+  CPU-only speech-to-text — the EN model beats Whisper large-v3 accuracy at
+  250M params and runs sub-second on a CPU core, so the GPUs stay free for
+  LLMs. Same cell contract as the whisper server (`/health`,
+  `POST /v1/audio/transcriptions`); the launcher self-installs its venv and
+  the model downloads itself, keyed by a LANGUAGE argument
+  (en es zh ja ko vi uk ar — no Russian, whisper stays the RU recognizer).
+  Licensing: EN is MIT; the other languages ship under the free Moonshine
+  Community License (registration + attribution, below $1M/yr revenue).
+
 ## 1.2.5 — 2026-07-18
 
 - The bundled command-cell servers live here and only here. `tts/` and
