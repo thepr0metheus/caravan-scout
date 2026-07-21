@@ -21,9 +21,15 @@ from typing import Any
 def query_nvidia_gpus() -> list[dict[str, Any]]:
     """Live NVIDIA GPU stats via nvidia-smi (driver required).
 
-    Field names mirror Llama.cpp Easy Admin's own gpu_state() so the admin UI
-    can render client GPUs with the same card layout. Returns [] when nvidia-smi
-    is missing or fails (no driver, macOS/Metal host, etc.).
+    Field names are a CONTRACT with the controller's own gpu_state(), so one card
+    renderer draws local and client GPUs alike. The board reads exactly these:
+    index, name, memoryUsedMiB, memoryTotalMiB, utilizationGpuPct, temperatureC,
+    powerDrawW (see nodeGpuRowHtml in the controller's topology-nodes.js).
+    Rename one here and that value silently turns into "?" on the client's card —
+    no error anywhere, which is how this kind of drift survives. The controller
+    reports a superset (clocks, PCIe); the names above are the shared floor.
+
+    Returns [] when nvidia-smi is missing or fails (no driver, macOS/Metal host).
     """
     try:
         result = subprocess.run(

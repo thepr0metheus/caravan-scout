@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.3.2 — 2026-07-22
+
+- Removed this agent's own llama-server argument builder (130 lines). It was a
+  mirror of the controller's, kept as a fallback, and it had fallen 23 flags
+  behind — no `--api-key`, `--embeddings`, `--context-shift`, `--ssl-*`,
+  `--kv-unified`, `--webui`. A cell started through it looked fully configured
+  on the board while running without half of that configuration. If the
+  controller sends no args, the agent now refuses with a version hint instead of
+  quietly starting something else.
+- The shell wrapper around a command cell is no longer assembled here either.
+  The controller sends `shellLine` — flags, exports, workdir, exec — as one
+  sentence. The local version had already lost `set -euo pipefail` relative to
+  the controller's script renderer.
+- Health probes follow the path the controller computed instead of a hardcoded
+  `/health`, and the path is remembered per cell so re-adoption after an agent
+  restart probes the right endpoint. A vLLM cell answers on `/v1/models`; the
+  old probe would have declared a healthy one dead.
+
+  Both changes require lama-caravan v1.3.115+ on the controller.
+
 ## 1.3.1 — 2026-07-22
 
 - The bundled copies of the cell servers are gone (`stt/`, `tts/`, `whisper/`).

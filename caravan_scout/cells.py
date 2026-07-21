@@ -159,138 +159,9 @@ class CellsMixin:
         return {"dir": str(cell_dir), "startScript": str(start_path),
                 "cellJson": str(json_path), "generatedAt": payload["generatedAt"]}
 
-    def _build_llama_args(self, config: dict[str, Any], model_abs: str,
-                          mmproj_abs: str, spec_abs: str) -> list[str]:
-        """Build the full llama-server arg list (after the binary) from the
-        admin form config — mirror of buildCmdline() in the admin UI."""
-        c = config if isinstance(config, dict) else {}
-        truthy = self._truthy
-
-        def has(key: str) -> bool:
-            v = c.get(key)
-            return v is not None and str(v).strip() != ""
-
-        args: list[str] = [
-            "--host", str(c.get("HOST") or "0.0.0.0"),
-            "--port", str(c.get("PORT") or 8180),
-            "--model", model_abs,
-        ]
-        # numeric / value flags that the admin always renders
-        pairs = [
-            ("--ctx-size", "CTX_SIZE"), ("--threads", "THREADS"),
-            ("--threads-batch", "THREADS_BATCH"), ("--batch-size", "BATCH_SIZE"),
-            ("--ubatch-size", "UBATCH_SIZE"), ("--parallel", "PARALLEL"),
-            ("--n-gpu-layers", "N_GPU_LAYERS"),
-            ("--cache-type-k", "CACHE_TYPE_K"), ("--cache-type-v", "CACHE_TYPE_V"),
-            ("--predict", "N_PREDICT"), ("--keep", "KEEP"),
-            ("--cpu-range", "CPU_RANGE"), ("--poll", "POLL"),
-            ("--rope-scaling", "ROPE_SCALING"), ("--rope-scale", "ROPE_SCALE"),
-            ("--rope-freq-base", "ROPE_FREQ_BASE"), ("--rope-freq-scale", "ROPE_FREQ_SCALE"),
-            ("--numa", "NUMA"), ("--device", "DEVICE"),
-            ("--split-mode", "SPLIT_MODE"), ("--tensor-split", "TENSOR_SPLIT"),
-            ("--main-gpu", "MAIN_GPU"), ("--fit-target", "FIT_TARGET"),
-            ("--fit-ctx", "FIT_CTX"), ("--alias", "ALIAS"),
-            ("--api-prefix", "API_PREFIX"), ("--timeout", "TIMEOUT"),
-            ("--threads-http", "THREADS_HTTP"), ("--cache-reuse", "CACHE_REUSE"),
-            ("--image-min-tokens", "IMAGE_MIN_TOKENS"),
-            ("--image-max-tokens", "IMAGE_MAX_TOKENS"),
-            ("--reasoning", "REASONING"), ("--reasoning-format", "REASONING_FORMAT"),
-            ("--reasoning-budget", "REASONING_BUDGET"),
-            ("--chat-template", "CHAT_TEMPLATE"),
-            ("--chat-template-kwargs", "CHAT_TEMPLATE_KWARGS"),
-        ]
-        for flag, key in pairs:
-            if has(key):
-                args += [flag, str(c[key]).strip()]
-
-        if truthy(c.get("CPU_STRICT")):
-            args += ["--cpu-strict", "1"]
-
-        # on/off toggles with explicit negation (only when set)
-        def add_bool(key: str, on: str, off: str) -> None:
-            if has(key):
-                args.append(on if truthy(c[key]) else off)
-
-        add_bool("KV_OFFLOAD", "--kv-offload", "--no-kv-offload")
-        add_bool("MMAP", "--mmap", "--no-mmap")
-        add_bool("CACHE_PROMPT", "--cache-prompt", "--no-cache-prompt")
-        add_bool("ENABLE_SLOTS", "--slots", "--no-slots")
-        add_bool("SKIP_CHAT_PARSING", "--skip-chat-parsing", "--no-skip-chat-parsing")
-
-        if has("FIT"):
-            args += ["--fit", "on" if truthy(c["FIT"]) else "off"]
-        if truthy(c.get("ENABLE_PROPS")):
-            args.append("--props")
-        if truthy(c.get("ENABLE_CONT_BATCHING")):
-            args.append("--cont-batching")
-        if truthy(c.get("ENABLE_METRICS")):
-            args.append("--metrics")
-        if truthy(c.get("ENABLE_MLOCK")):
-            args.append("--mlock")
-
-        if mmproj_abs:
-            args += ["--mmproj", mmproj_abs]
-            args.append("--mmproj-offload" if truthy(c.get("OFFLOAD_MMPROJ")) else "--no-mmproj-offload")
-
-        spec_type_raw = str(c.get("SPEC_TYPE") or "").strip().lower()
-        if spec_type_raw == "mtp":
-            spec_type_raw = "draft-mtp"
-        if spec_abs:
-            # External draft model (separate .gguf file).
-            spec_type = spec_type_raw or "draft-mtp"
-            if spec_type and spec_type != "none":
-                args += ["--spec-type", spec_type, "--model-draft", spec_abs]
-                draft_gpu = str(c.get("SPEC_DRAFT_N_GPU_LAYERS") or "999").strip()
-                draft_max = str(c.get("SPEC_DRAFT_N_MAX") or "").strip()
-                draft_min = str(c.get("SPEC_DRAFT_N_MIN") or "").strip()
-                if draft_gpu:
-                    args += ["--gpu-layers-draft", draft_gpu]
-                if draft_max:
-                    args += ["--spec-draft-n-max", draft_max]
-                if draft_min:
-                    args += ["--spec-draft-n-min", draft_min]
-        elif spec_type_raw == "draft-mtp":
-            # Built-in MTP: MTP layers are embedded in the model weights —
-            # no separate draft file needed. Just pass --spec-type and n-max.
-            draft_max = str(c.get("SPEC_DRAFT_N_MAX") or "2").strip()
-            draft_min = str(c.get("SPEC_DRAFT_N_MIN") or "").strip()
-            args += ["--spec-type", "draft-mtp"]
-            if draft_max:
-                args += ["--spec-draft-n-max", draft_max]
-            if draft_min:
-                args += ["--spec-draft-n-min", draft_min]
-            print(f"[llama-node] built-in MTP enabled: --spec-type draft-mtp --spec-draft-n-max {draft_max}")
-
-        if truthy(c.get("ENABLE_JINJA")):
-            args.append("--jinja")
-        if truthy(c.get("ENABLE_FLASH_ATTN")):
-            args += ["--flash-attn", "on"]
-        if not truthy(c.get("ENABLE_WEBUI")):
-            args.append("--no-webui")
-
-        # Built-in WebUI tools / MCP proxy (recent llama-server features).
-        if truthy(c.get("ENABLE_TOOLS")):
-            args += ["--tools", "all"]
-        if truthy(c.get("ENABLE_AGENT")):
-            args.append("--agent")
-        if truthy(c.get("ENABLE_MCP_PROXY")):
-            args.append("--ui-mcp-proxy")
-
-        # Fallback: raw extra flags typed in the admin UI, appended verbatim.
-        if has("EXTRA_ARGS"):
-            try:
-                args += shlex.split(str(c["EXTRA_ARGS"]))
-            except ValueError:
-                args += str(c["EXTRA_ARGS"]).split()
-        return args
-
-    # ── llama-node config backups ──────────────────────────────────────────
-
-    # ── cell registry (state.json) — survives agent restarts so cells can be
-    #    re-adopted instead of reaped ─────────────────────────────────────────
-
     def _register_cell(self, port: int, kind: str, pid: int, marker: str,
-                       cfg: dict, log_path, cache_models: bool) -> None:
+                       cfg: dict, log_path, cache_models: bool,
+                       health_path: str = "/health") -> None:
         with self.lock:
             cells = self.state.setdefault("cells", {})
             cells[str(int(port))] = {
@@ -299,6 +170,10 @@ class CellsMixin:
                 "cfg": {k: v for k, v in (cfg or {}).items() if k != "cmd"},
                 "log": str(log_path or ""),
                 "cacheModels": bool(cache_models),
+                # Kept because re-adoption happens at agent startup, long after
+                # the controller told us where this cell answers. A vLLM cell
+                # replies on /v1/models; probing /health would bury it.
+                "healthPath": str(health_path or "/health"),
                 "startedAt": int(time.time()),
             }
             self.save_state()
@@ -351,18 +226,27 @@ class CellsMixin:
         return 0
 
     @staticmethod
-    def _port_health_ok(port: int, timeout: float = 2.0, attempts: int = 1) -> bool:
-        """True if the server on <port> answers GET /health with 2xx. llama-server and
-        the whisper cell both expose /health; this confirms a real, healthy cell is
-        serving the port before we adopt whatever pid owns it.
+    def _port_health_ok(port: int, timeout: float = 2.0, attempts: int = 1,
+                        health_path: str = "/health") -> bool:
+        """True if the server on <port> answers its health endpoint with 2xx —
+        confirming a real, healthy cell serves the port before we adopt whatever
+        pid owns it.
+
+        The path is NOT always /health: the controller computes it per cell (a
+        vLLM cell answers on /v1/models, a command cell can declare its own) and
+        sends it with the start request. Probing a hardcoded /health would call a
+        perfectly healthy vLLM cell dead.
 
         Retries because this runs at agent startup, which is exactly when the host
         is busiest — a single 2 s probe on a loaded box times out on a cell that is
         perfectly alive."""
+        path = str(health_path or "/health").strip() or "/health"
+        if not path.startswith("/"):
+            path = "/" + path
         for i in range(max(1, int(attempts))):
             try:
                 with urllib.request.urlopen(
-                        f"http://127.0.0.1:{int(port)}/health", timeout=timeout) as resp:
+                        f"http://127.0.0.1:{int(port)}{path}", timeout=timeout) as resp:
                     return 200 <= int(getattr(resp, "status", 200) or 200) < 300
             except Exception:
                 if i + 1 < attempts:
@@ -401,14 +285,16 @@ class CellsMixin:
                 if not pid:
                     self._unregister_cell(port)   # nothing serves it — really gone
                     continue
-                if not self._port_health_ok(port, timeout=4.0, attempts=3):
+                if not self._port_health_ok(port, timeout=4.0, attempts=3,
+                                            health_path=rec.get("healthPath") or "/health"):
                     # Something owns the port but stayed quiet. On a loaded host
                     # that is a timeout, not a death — and unregistering here
                     # stranded a live cell as "stopped" forever while its process
                     # kept serving traffic, with no way back short of killing it.
                     # Keep the record, adopt the listener, let polling set phase.
-                    print(f"[llama-node] :{port} holds the port but /health stayed "
-                          f"quiet — adopting anyway rather than forgetting it")
+                    print(f"[llama-node] :{port} holds the port but "
+                          f"{rec.get('healthPath') or '/health'} stayed quiet — "
+                          f"adopting anyway rather than forgetting it")
                 if pid != rec_pid:            # re-discovered by port → keep registry honest
                     with self.lock:
                         rec["pid"] = pid
@@ -578,9 +464,8 @@ class CellsMixin:
         cache_models = bool(payload.get("cacheModels", self.config.get("cacheModels", False)))
         slot.cache_models = cache_models
 
-        # Variant 2: controller-supplied argument list (with path placeholders).
-        # When present we only substitute paths; the legacy _build_llama_args is
-        # a fallback for older controllers that don't send it.
+        # Variant 2: the controller supplies the argument list (with path
+        # placeholders) and this agent only substitutes the real paths.
         incoming_args = payload.get("args") if isinstance(payload.get("args"), list) else None
 
         self._set_llama_startup(
@@ -631,24 +516,16 @@ class CellsMixin:
         except Exception:
             pass
 
-        # Mirror the controller's render: export PORT, then ENV, then cd WORKDIR,
-        # then exec the command (as one bash -lc line).
-        parts = [f"export PORT={shlex.quote(str(port))}"]
-        for raw in re.split(r"[\n,]", str(config.get("ENV") or "")):
-            item = raw.strip()
-            if not item or item.startswith("#") or "=" not in item:
-                continue
-            k, v = item.split("=", 1)
-            k = k.strip()
-            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k):
-                continue
-            v = v.strip().replace("\\", "\\\\").replace('"', '\\"')
-            parts.append(f'export {k}="{v}"')
-        workdir = str(config.get("WORKDIR") or "").strip()
-        if workdir:
-            parts.append(f"cd {shlex.quote(workdir)}")
-        parts.append(f"exec {command}")
-        shell_line = "; ".join(parts)
+        # The controller sends the whole start line — shell flags, exports,
+        # workdir, exec. This agent used to rebuild it from `command` plus the
+        # config, mirroring the controller's script renderer, and the mirror had
+        # already lost `set -euo pipefail`: one config, two behaviours depending
+        # on which host ran the cell. Refusing beats guessing.
+        shell_line = str(payload.get("shellLine") or "").strip()
+        if not shell_line:
+            raise AppError(
+                "controller sent no shellLine for this command cell — it is older "
+                "than this agent (needs lama-caravan v1.3.115+)", 400)
         log_path = self._model_cache_dir() / "command-cell.log"
         cfg = {"modelPath": "", "port": port, "cellKind": "command", "command": command}
         # Command cells download nothing — never purge a model cache on stop.
@@ -677,7 +554,8 @@ class CellsMixin:
             # (the shell resolves it before exec, so ps shows the resolved form).
             marker = command.replace("$PORT", str(port)).replace("~/", "")[:120]
             self._register_cell(port, "command", result.get("pid") or 0, marker,
-                                cfg, log_path, slot.cache_models)
+                                cfg, log_path, slot.cache_models,
+                                health_path=str(payload.get("healthPath") or "/health"))
         return result
 
     @staticmethod
@@ -704,11 +582,17 @@ class CellsMixin:
             return
 
         def build_args() -> list[str]:
-            # Variant 2: prefer the controller-built arg list (single source of
-            # truth) and only substitute paths; fall back to local building.
-            if incoming_args:
-                return self._resolve_arg_paths(incoming_args, str(mp), mmproj_abs, spec_abs)
-            return self._build_llama_args(config, str(mp), mmproj_abs, spec_abs)
+            # The controller builds the arg list; this agent only substitutes the
+            # paths of files it downloaded. It used to carry its own builder as a
+            # fallback — a 130-line mirror of the admin's, already 23 flags behind
+            # (no --api-key, --embeddings, --context-shift, --ssl-*…). A cell
+            # started through it looked configured on the board and ran without
+            # half of that config. Refusing is the honest answer.
+            if not incoming_args:
+                raise AppError(
+                    "controller sent no args for this llama cell — it is older "
+                    "than this agent (needs lama-caravan v1.3.115+)", 400)
+            return self._resolve_arg_paths(incoming_args, str(mp), mmproj_abs, spec_abs)
 
         self._set_llama_startup(port, phase="loading")
         gpu_layers = int(config.get("N_GPU_LAYERS") or 999)
