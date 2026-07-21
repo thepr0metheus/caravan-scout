@@ -71,7 +71,8 @@ command builder. This agent:
   agents in a heartbeat every 60 s (faster while a model is loading);
 - starts/stops llama.cpp **server cells** on this host from configs built by
   the controller (models are downloaded from the controller and cached);
-- runs generic **command cells** (e.g. a whisper server) the same way;
+- runs generic **command cells** (e.g. a whisper server) the same way — the controller
+  supplies both the start line and the cell server files themselves;
 - receives routing assignments and re-points each local agent's provider
   `baseUrl` at its LAMA CARAVAN proxy port (`apply-routes.py`).
 

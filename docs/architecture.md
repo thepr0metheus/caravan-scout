@@ -49,9 +49,16 @@ agent substitutes after downloading the files:
 ```
 
 These constants must stay in sync with the controller's
-`LLAMA_PATH_PLACEHOLDER_*`. Generic command cells (`CELL_KIND=command`) run an
-arbitrary shell line via `bash -lc` with `PORT`/`ENV`/`WORKDIR` — that is how
-whisper cells run on clients.
+`LLAMA_PATH_PLACEHOLDER_*`. There is no local fallback builder: an agent that
+receives no `args` refuses the start rather than assembling its own list. It
+used to carry one — a mirror of the controller's, 23 flags behind — and a cell
+started through it ran without half the configuration the board displayed.
+
+Generic command cells (`CELL_KIND=command`) are the same story one level up:
+the controller sends `shellLine`, the whole `bash -lc` sentence including
+`set -euo pipefail`, the `PORT`/`ENV` exports and the `WORKDIR` change. The
+agent executes it verbatim. Assembling it here is what let the controller's
+script and the agent's line drift apart.
 
 **Slots.** A host can run several servers at once (e.g. a translator + a
 whisper cell). Each port owns a `_Slot`: its `LlamaNode` child process, async
@@ -75,7 +82,7 @@ systemd/launchd units); the code lives in the package:
 | `openclaw.py` | `OpenclawMixin` — read agents' OpenClaw configs, derive live assignments |
 | `heartbeat.py` | `HeartbeatMixin` — public state snapshot + heartbeat POST loop |
 | `models.py` | `ModelsMixin` — model cache: download from the controller, verify, purge |
-| `cells.py` | `CellsMixin` — build args, write cell artifacts, start/stop, routing apply |
+| `cells.py` | `CellsMixin` — resolve the controller's args/shellLine, write cell artifacts, start/stop, routing apply |
 | `agent.py` | `RouteAgent(…mixins)` — slots/config/state core |
 | `http.py` | Handler factory for the `:8092` surface |
 | `app.py` | Thin launcher + legacy re-exports |
