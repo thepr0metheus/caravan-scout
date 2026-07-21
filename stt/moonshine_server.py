@@ -18,6 +18,10 @@ the voice app's LAN discovery lists it in both sections:
 it still sees «model» and treats the cell as a recognizer, so deploying this
 build never breaks an older client.
 
+A cell holds at most MOONSHINE_TTS_CACHE voices (5 by default), dropping the
+least recently used one past that — auditioning many voices cannot balloon the
+process. Evicted voices stay on disk, so coming back to one is a local reload.
+
 STT and TTS load independently and lazily: the recognizer is warmed at start,
 a TTS voice downloads on the first /v1/audio/speech for that language, so a
 recognizer-only cell never pays the voice's memory. NOT a voice clone — the
@@ -38,9 +42,12 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import sys
 import threading
+from collections import OrderedDict
+import gc
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -51,7 +58,13 @@ _state = {"ready": False, "error": ""}
 _lock = threading.Lock()
 _transcriber = None
 _tts_lock = threading.Lock()
-_tts = {}                                        # locale tag -> TextToSpeech
+# (locale tag, voice id) -> TextToSpeech, most-recently-used LAST. Each held
+# voice costs ~180-275 MB of RSS, and a client that lets a user audition
+# voices would otherwise grow the cell without bound — so the cache evicts
+# its least-recently-used entry past TTS_CACHE_MAX. An evicted voice stays on
+# disk; re-selecting it reloads from there, no CDN round trip.
+_tts = OrderedDict()
+TTS_CACHE_MAX = int(os.environ.get("MOONSHINE_TTS_CACHE", "5") or 5)
 
 # our 2-letter codes -> Moonshine TTS locales (RU/UK available here even though
 # the recognizer has no Russian)
@@ -114,6 +127,21 @@ def _synthesize(text: str, lang: str, voice: str | None = None):
             tts = TextToSpeech(tag, voice=vid)   # downloads the voice once
             _tts[key] = tts
             _log(f"moonshine tts[{tag}{' ' + vid if vid else ''}] ready")
+            while len(_tts) > max(1, TTS_CACHE_MAX):
+                (old_tag, old_vid), dead = _tts.popitem(last=False)
+                # close() releases the voice's runtime sessions. Dropping the
+                # reference alone does NOT give the memory back — measured:
+                # 16 evictions without it still grew the process by ~300 MB.
+                try:
+                    dead.close()
+                except Exception as exc:  # noqa: BLE001
+                    _log(f"moonshine tts close failed: {exc}")
+                del dead
+                gc.collect()
+                _log(f"moonshine tts[{old_tag}{' ' + old_vid if old_vid else ''}]"
+                     f" evicted ({len(_tts)}/{TTS_CACHE_MAX} held)")
+        else:
+            _tts.move_to_end(key)                # keep the freshly used one
         return tts.synthesize(str(text))
 
 

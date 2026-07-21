@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.2.9 — 2026-07-21
+
+- The Moonshine cell's voice cache is now an LRU capped at
+  `MOONSHINE_TTS_CACHE` voices (5 by default). Holding every voice ever asked
+  for cost ~180-275 MB each, and English alone offers 60+ — a client letting a
+  user audition them would have grown the cell without bound.
+- Eviction calls the voice's `close()` and collects, which matters more than
+  the eviction itself: measured with a cap of 2 and four languages cycled 20
+  times, dropping the reference alone went 913 -> 1858 MB, while closing brings
+  the same run to 915 -> 1634 MB (~18 MB down to ~5 MB per switch). The
+  remainder is allocator fragmentation, so this bounds growth rather than
+  eliminating it — a cell driven through hundreds of switches still creeps and
+  a restart is the cure. Evicted voices stay on disk; returning to one is a
+  local reload.
+
 ## 1.2.8 — 2026-07-21
 
 - The Moonshine cell now offers a choice of voices.
