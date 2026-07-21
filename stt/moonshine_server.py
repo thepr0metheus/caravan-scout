@@ -9,8 +9,10 @@ the voice app's LAN discovery lists it in both sections:
                                      | 503 {"status":"loading"} while warming
     POST /v1/audio/transcriptions    multipart: file=wav [, language]
                                      -> {"text": "..."}                    (STT)
-    POST /v1/audio/speech            json: {"text": "...", "language": "ru"}
+    POST /v1/audio/speech            json: {"text": "…", "language": "ru"
+                                            [, "voice": "piper_ru_RU-irina-medium"]}
                                      -> audio/wav 16-bit PCM mono          (TTS)
+    GET  /v1/audio/voices?language=en   -> {"present": [...], "downloadable": [...]}
 
 «kinds» is what makes the row appear in both sections; a client that predates
 it still sees «model» and treats the cell as a recognizer, so deploying this
@@ -95,20 +97,35 @@ def _wav_to_floats(data: bytes):
     return [s / 32768.0 for s in a], sr
 
 
-def _synthesize(text: str, lang: str):
-    """(samples, sample_rate) with the STOCK voice of `lang`. The voice is
-    fetched on first use for that language and then cached."""
+def _synthesize(text: str, lang: str, voice: str | None = None):
+    """(samples, sample_rate) with a STOCK voice of `lang`. `voice` picks one of
+    the language's voices (60+ for English, 4 for Russian — see
+    GET /v1/audio/voices); None = the language default. Each (language, voice)
+    is fetched on first use and then cached."""
     tag = TTS_LOCALE.get((lang or "en").split("-")[0].lower())
     if tag is None:
         raise ValueError(f"no TTS voice for language '{lang}'")
+    vid = (voice or "").strip() or None
+    key = (tag, vid)
     with _tts_lock:
-        tts = _tts.get(tag)
+        tts = _tts.get(key)
         if tts is None:
             from moonshine_voice.tts import TextToSpeech
-            tts = TextToSpeech(tag)              # downloads the voice once
-            _tts[tag] = tts
-            _log(f"moonshine tts[{tag}] ready")
+            tts = TextToSpeech(tag, voice=vid)   # downloads the voice once
+            _tts[key] = tts
+            _log(f"moonshine tts[{tag}{' ' + vid if vid else ''}] ready")
         return tts.synthesize(str(text))
+
+
+def _voice_list(lang: str) -> dict:
+    """{"present": [...], "downloadable": [...]} for the language."""
+    tag = TTS_LOCALE.get((lang or "en").split("-")[0].lower())
+    if tag is None:
+        raise ValueError(f"no TTS voice for language '{lang}'")
+    import moonshine_voice as mv
+    r = mv.list_tts_voices(tag) or {}
+    return {"present": list(r.get("present") or []),
+            "downloadable": list(r.get("downloadable") or [])}
 
 
 def _wav_bytes(samples, sr: int) -> bytes:
@@ -150,6 +167,21 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        path = (self.path or "").split("?", 1)[0].rstrip("/")
+        if path.endswith("/voices"):         # which stock voices this cell offers
+            q = (self.path or "").split("?", 1)
+            lang = "en"
+            if len(q) > 1:
+                for kv in q[1].split("&"):
+                    if kv.startswith("language="):
+                        lang = kv.split("=", 1)[1]
+            try:
+                self._send(200, _voice_list(lang))
+            except ValueError as e:
+                self._send(400, {"error": str(e)})
+            except Exception as e:  # noqa: BLE001
+                self._send(500, {"error": str(e)})
+            return
         if _state["ready"]:
             # «model» keeps older clients working (they read it as an ASR cell);
             # «kinds» is what lets a new client also list us as a voice
@@ -175,7 +207,8 @@ class H(BaseHTTPRequestHandler):
                 self._send(400, {"error": "need json {text, language}"})
                 return
             try:
-                samples, sr = _synthesize(text, req.get("language") or "en")
+                samples, sr = _synthesize(text, req.get("language") or "en",
+                                          req.get("voice"))
                 wav = _wav_bytes(samples, sr)
             except ValueError as e:
                 self._send(400, {"error": str(e)})

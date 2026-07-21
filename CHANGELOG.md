@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.2.8 — 2026-07-21
+
+- The Moonshine cell now offers a choice of voices.
+  `GET /v1/audio/voices?language=xx` answers `{present, downloadable}` — the
+  stock voices already on disk and the ones still fetchable (60+ for English,
+  4 for Russian). `POST /v1/audio/speech` takes an optional `voice`; omit it
+  and the language default speaks, exactly as before.
+- The voice cache is keyed by (language, voice) instead of language alone, so
+  two voices of the same language coexist rather than evicting each other.
+  Memory behaves as in 1.2.7: nothing loads until asked for, ~180-275 MB per
+  voice held.
+
 ## 1.2.7 — 2026-07-21
 
 - The Moonshine cell now speaks as well as listens. The same port serves
