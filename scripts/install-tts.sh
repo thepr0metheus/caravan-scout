@@ -24,7 +24,6 @@ err()  { echo -e "${RED}[error]${NC}  $*" >&2; }
 have() { command -v "$1" &>/dev/null; }
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-SRC="${REPO_DIR}/tts"
 PREWARM=""
 if [[ "${1:-}" == "--prewarm" ]]; then PREWARM="${2:-xtts}"; fi
 
@@ -37,16 +36,11 @@ if ! nvidia-smi -L >/dev/null 2>&1 \
   warn "No NVIDIA GPU detected — skipping TTS provisioning."
   exit 0
 fi
-if [[ ! -f "${SRC}/tts_server.py" || ! -f "${SRC}/run_tts.sh" ]]; then
-  err "bundled tts files missing under ${SRC} — cannot provision."
-  exit 1
-fi
 
 info "NVIDIA GPU detected — provisioning voice-clone TTS cells"
 have python3 || { err "python3 required"; exit 1; }
 
-install -m 0644 "${SRC}/tts_server.py" "${HOME}/tts_server.py"
-install -m 0755 "${SRC}/run_tts.sh"    "${HOME}/run_tts.sh"
+"${REPO_DIR}/scripts/fetch-cell-assets.sh" run_tts.sh tts_server.py
 info "  installed ~/tts_server.py + ~/run_tts.sh"
 
 # torchcodec (torch>=2.9 audio IO) needs the system ffmpeg shared libraries.

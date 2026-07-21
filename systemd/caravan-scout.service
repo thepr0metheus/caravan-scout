@@ -6,6 +6,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/projects/caravan-scout
+# Without this Python buffers stdout when it is a pipe, and every print the
+# agent makes — adopted cells, reaped strays, cell-asset fetches — sits in the
+# buffer instead of reaching the journal. Diagnosing a client meant reading
+# code and guessing; now `journalctl --user -u caravan-scout` actually shows it.
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 -m caravan_scout.app --config %h/projects/caravan-scout/config.json --state %h/projects/caravan-scout/state.json
 Restart=always
 RestartSec=3

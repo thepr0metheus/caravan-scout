@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.3.1 — 2026-07-22
+
+- The bundled copies of the cell servers are gone (`stt/`, `tts/`, `whisper/`).
+  The controller owns them now, so keeping a second copy here only recreated
+  the drift 1.3.0 was meant to end. Installers fetch what they need through
+  `scripts/fetch-cell-assets.sh`, which reads the controller URL and fleet
+  token straight from the scout's own config.
+- A failed fetch is not fatal anywhere: the installer says so and moves on,
+  because the scout fetches the same files before every cell start regardless.
+
+## 1.3.0 — 2026-07-22
+
+- Cell servers now come from the controller. Before starting a command cell the
+  scout fetches the files that cell's launcher needs (`GET /api/cell-assets`,
+  hashed manifest + the files themselves, fleet token as usual) and writes them
+  into `$HOME`. The controller already decided WHAT to run and handed over the
+  full command line; it now supplies the script that line names, so a client
+  that has not pulled this repo in months still runs the current cell server.
+- Nothing here can block a start. An unreachable controller, a truncated body
+  or a hash mismatch all leave the existing `$HOME` copy in place and log why —
+  an out-of-date cell beats no cell. Writes are atomic, so a host is never left
+  with half a launcher.
+
 ## 1.2.9 — 2026-07-21
 
 - The Moonshine cell's voice cache is now an LRU capped at

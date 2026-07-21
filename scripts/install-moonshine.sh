@@ -29,14 +29,9 @@ err()  { echo -e "${RED}[error]${NC}  $*" >&2; }
 have() { command -v "$1" &>/dev/null; }
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-SRC="${REPO_DIR}/stt"
 PREWARM=""
 if [[ "${1:-}" == "--prewarm" ]]; then PREWARM="${2:-en}"; fi
 
-if [[ ! -f "${SRC}/moonshine_server.py" || ! -f "${SRC}/run_moonshine.sh" ]]; then
-  err "bundled moonshine files missing under ${SRC} — cannot provision."
-  exit 1
-fi
 
 have python3 || { err "python3 required"; exit 1; }
 if ! python3 -c "import venv" 2>/dev/null; then
@@ -45,8 +40,7 @@ if ! python3 -c "import venv" 2>/dev/null; then
     || warn "could not install python3-venv — install it manually"
 fi
 
-install -m 0644 "${SRC}/moonshine_server.py" "${HOME}/moonshine_server.py"
-install -m 0755 "${SRC}/run_moonshine.sh"    "${HOME}/run_moonshine.sh"
+"${REPO_DIR}/scripts/fetch-cell-assets.sh" run_moonshine.sh moonshine_server.py
 info "installed ~/moonshine_server.py + ~/run_moonshine.sh"
 
 # The launcher self-installs its venv on first start; --install-only does it

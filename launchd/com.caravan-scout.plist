@@ -28,6 +28,13 @@
   <key>KeepAlive</key>
   <true/>
 
+  <!-- Python buffers stdout when it is a file, so without this the log the
+       next two keys point at stays empty until the buffer fills. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
   <key>StandardOutPath</key>
   <string>/Users/user/projects/caravan-scout/caravan-scout.log</string>
 

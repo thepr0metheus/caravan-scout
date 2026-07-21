@@ -17,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from caravan_scout.paths import LLAMA_PATH_PLACEHOLDER_MMPROJ, LLAMA_PATH_PLACEHOLDER_MODEL, LLAMA_PATH_PLACEHOLDER_SPEC, SERVER_CELLS_DIR
+from caravan_scout.cell_assets import sync_for_command
 from caravan_scout.errors import AppError
 
 
@@ -655,6 +656,19 @@ class CellsMixin:
         self._set_llama_startup(port, phase="loading", modelPath=command[:80],
                                 downloadedBytes=0, totalBytes=0, error="",
                                 startedAt=int(time.time()))
+        # The controller owns the cell servers; pick up its current copy before
+        # running the launcher this command names. Never fatal — see cell_assets.
+        try:
+            synced = sync_for_command(
+                command,
+                str(self.config.get("controllerUrl") or ""),
+                self.controller_headers(),
+                log=lambda m: print(f"[llama-node] {m}"))
+            if synced:
+                print(f"[llama-node] cell-assets :{port} — " +
+                      ", ".join(f"{k}={v}" for k, v in synced.items()))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[llama-node] cell-assets :{port} skipped ({exc})")
         result = slot.node.start_command(shell_line, cfg, log_path=log_path)
         self._set_llama_startup(port, phase="running" if result.get("ok") else "error",
                                 error="" if result.get("ok") else (result.get("error") or "start failed"))
