@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.2.7 — 2026-07-21
+
+- The Moonshine cell now speaks as well as listens. The same port serves
+  `POST /v1/audio/speech` (json `{text, language}` -> 16-bit PCM mono wav)
+  alongside the existing `POST /v1/audio/transcriptions`, and `/health` grew a
+  `kinds: ["asr","tts"]` field so a client can list one cell in both roles.
+  `model` is still there, so a client that predates `kinds` keeps seeing a
+  plain recognizer and nothing breaks on upgrade.
+- Recognition and synthesis load independently: the recognizer warms at start
+  as before, a voice downloads on the first request for its language and is
+  then cached. A cell used only for recognition never pays for a voice —
+  measured on the fleet, each loaded voice costs ~180-275 MB of RSS on top of
+  the recognizer's ~900 MB, and the cost is per language.
+- Synthesis covers 20 locales including Russian and Ukrainian, which the
+  recognizer side deliberately does not (whisper stays the RU recognizer).
+  It speaks Moonshine's stock voice — voice cloning stays on the xtts/f5/
+  cosyvoice cells.
+- `run_moonshine.sh --install-only` can pre-download voices via
+  `MOONSHINE_PREWARM_VOICES=ru,en`, turning a first synthesis from ~8 s into
+  an instant one. Off by default so nothing pays for a voice it never uses.
+
 ## 1.2.6 — 2026-07-19
 
 - Bundled Moonshine v2 STT cell (`stt/` + `scripts/install-moonshine.sh`):

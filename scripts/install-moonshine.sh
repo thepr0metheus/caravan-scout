@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# install-moonshine.sh — provision a Moonshine v2 STT server on this host so it
-# can run a moonshine "command" cell:
+# install-moonshine.sh — provision a Moonshine v2 speech server on this host so
+# it can run a moonshine "command" cell. One cell, two roles: it recognizes
+# speech AND synthesizes it.
 #
 #     COMMAND:     bash ~/run_moonshine.sh $PORT en
 #     HEALTH_PATH: /health
@@ -8,7 +9,9 @@
 # CPU-ONLY on purpose: Moonshine's medium-streaming EN model beats Whisper
 # large-v3 WER at 250M params and runs sub-second on a laptop core — so this
 # installs on any box, GPU or not, and the GPUs stay free for LLMs.
-# Languages: en es zh ja ko vi uk ar (no Russian — keep whisper for RU).
+# Languages — recognition: en es zh ja ko vi uk ar (no Russian, whisper stays
+# the RU recognizer); synthesis: 20 locales, Russian included, each voice
+# downloading on its first request.
 # Licensing: the EN model is MIT; the others are Moonshine Community License
 # (free below $1M/yr revenue, registration + attribution required).
 #
