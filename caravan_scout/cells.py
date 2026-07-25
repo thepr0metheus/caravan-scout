@@ -526,7 +526,7 @@ class CellsMixin:
             raise AppError(
                 "controller sent no shellLine for this command cell — it is older "
                 "than this agent (needs lama-caravan v1.3.115+)", 400)
-        log_path = self._model_cache_dir() / "command-cell.log"
+        log_path = self._model_cache_dir() / f"command-cell.{int(port)}.log"
         cfg = {"modelPath": "", "port": port, "cellKind": "command", "command": command}
         # Command cells download nothing — never purge a model cache on stop.
         slot.cache_models = True
@@ -598,7 +598,13 @@ class CellsMixin:
         gpu_layers = int(config.get("N_GPU_LAYERS") or 999)
         ctx_size = int(config.get("CTX_SIZE") or 4096)
         args = build_args()
-        log_path = self._model_cache_dir() / "llama-server.log"
+        # Per PORT, not one file for the whole host. Every llama cell used to
+        # write to llama-server.log and each new start renamed it away, while a
+        # running cell's fd followed the old inode — so a crashed cell's card
+        # quoted whichever cell had spawned last. That is how :8011's "Model
+        # loading failed" ended up showing a benign tokenizer warning from the
+        # Qwen cell on :8006 instead of its own out-of-VRAM error.
+        log_path = self._model_cache_dir() / f"llama-server.{int(port)}.log"
         # Expose specType in the heartbeat so the UI can show the MTP badge
         # even for built-in MTP (where specPath is empty).
         _spec_type_raw = str(config.get("SPEC_TYPE") or "").strip().lower()

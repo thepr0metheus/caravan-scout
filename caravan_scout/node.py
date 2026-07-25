@@ -37,10 +37,20 @@ class LlamaNode:
 
     @staticmethod
     def _read_log_error(log_path: Path | None) -> str:
-        """Pull a concise crash reason from the tail of the llama-server log.
+        """Pull a concise crash reason from the tail of the cell's log.
 
         Priority: corruption/OOM patterns first (most actionable), then any
         other error line, then last line as fallback.
+
+        LEVEL-AWARE. llama.cpp prefixes each line "<time> <LEVEL> <subsys>: …"
+        where LEVEL is one of I/W/E. Reading the last line blindly turned a
+        benign "W load: control-looking token … its type will be overridden"
+        into "Model loading failed" on the card. When the tail carries levels at
+        all, informational and warning lines are skipped — and the blind
+        last-line fallback is dropped, because on a levelled log the last line
+        is usually chatter, not a cause. Command cells (whisper, moonshine, tts)
+        print plain bash/python output with no level prefix; for those nothing
+        changes and the fallback still applies, or a real traceback would vanish.
         """
         if not log_path:
             return ""
@@ -50,6 +60,13 @@ class LlamaNode:
         except Exception:
             return ""
         tail = lines[-80:]  # look further back than before
+        # llama.cpp: "0.00.817.809 W load: …" — capture the level per line.
+        _lvl = re.compile(r"^\s*[\d.]+\s+([IWED])\s")
+        levels = {ln: (_lvl.match(ln).group(1) if _lvl.match(ln) else "") for ln in tail}
+        levelled = any(levels.values())
+        def _skip(ln):
+            """True for a line that cannot be a crash reason on a levelled log."""
+            return levelled and levels.get(ln) in ("I", "W")
         # High-priority: actionable patterns the UI can classify into friendly messages
         priority = (
             "not within the file bounds",
@@ -65,6 +82,11 @@ class LlamaNode:
             "no such file",
             "failed to open",
         )
+        # NOT level-filtered on purpose. These patterns are unambiguous failure
+        # signatures — nothing benign says "corrupted or incomplete" — and the
+        # corrupted-download auto-repair (models.py _is_corruption_error) reads
+        # this very return value. Dropping one because a build happened to log it
+        # at W would cost a self-healing download to save nothing.
         for ln in reversed(tail):
             low = ln.lower()
             if any(p in low for p in priority):
@@ -72,10 +94,22 @@ class LlamaNode:
         # Fallback: any error/failure line
         markers = ("error", "abort", "failed", "invalid argument", "what()")
         for ln in reversed(tail):
+            if _skip(ln):
+                continue
             low = ln.lower()
             if any(m in low for m in markers) and "build:" not in low:
                 return ln[:300]
-        return (lines[-1][:300] if lines else "")
+        # A crash with no level prefix at all (C++ terminate, a python traceback)
+        # still deserves to be surfaced even though it matched nothing above.
+        catastrophes = ("terminate called", "what():", "traceback", "cuda error",
+                        "segmentation fault", "killed")
+        for ln in reversed(tail):
+            if any(c in ln.lower() for c in catastrophes):
+                return ln[:300]
+        # Levelled log with nothing but I/W left: we genuinely do not know why it
+        # went. Say nothing rather than blame the last harmless line — the board
+        # renders an unexplained failure as such.
+        return "" if levelled else (lines[-1][:300] if lines else "")
 
     @staticmethod
     def _rotate_log(log_path: Path | None, keep: int = 15) -> None:

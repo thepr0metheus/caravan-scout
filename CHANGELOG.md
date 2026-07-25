@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.3.3 — 2026-07-25
+
+- Every llama cell wrote to one `llama-server.log`, and each new start renamed
+  it while a running cell's fd followed the old inode. A crashed cell's card
+  therefore quoted whichever cell had spawned last — live incident: :8011's
+  "Model loading failed" showed a benign tokenizer warning belonging to the Qwen
+  cell on :8006, while its own out-of-VRAM error sat in another file. Logs are
+  now per port (`llama-server.<port>.log`, `command-cell.<port>.log`).
+- The crash-reason reader respects the llama.cpp log level. It ended with a
+  blind `lines[-1]`, so an informational or warning line became the failure
+  reason. Now I/W lines are skipped for the loose "error/failed" scan and the
+  fallback, and a levelled log with nothing worse than a warning returns no
+  reason at all rather than blaming a harmless line. Unprefixed catastrophes
+  (`terminate called`, tracebacks, CUDA errors) are still caught, and the
+  unambiguous priority patterns stay level-blind so corrupted-download
+  auto-repair keeps working.
+
 ## 1.3.2 — 2026-07-22
 
 - Removed this agent's own llama-server argument builder (130 lines). It was a
