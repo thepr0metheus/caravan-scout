@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.3.5 — 2026-07-25
+
+- A command cell can have a model now, and keeps it. Both assumptions behind
+  "command cells download nothing" broke when the caravan grew a transcribe.cpp
+  runner whose model is a GGUF path like a llama cell's. Without a download the
+  cell started, bound its port and reported the problem only inside its own log
+  — healthy from the outside, useless in fact; it now resolves MODEL_FILE
+  through the same `_ensure_model` the llama path uses and refuses to start if
+  the file cannot be fetched. And because `purge_model_cache_safe()` keeps the
+  files of running slots by reading `cfg["modelPath"]`, which command cells left
+  empty, a cache purge would have deleted the weights out from under a live
+  recognizer; the key is filled in.
+- `scripts/install-transcribe.sh` — builds transcribe.cpp with CUDA (Linux) or
+  Metal (macOS) and installs the Python binding into `~/transcribe-venv`. Same
+  file the controller ships, so there is no second copy to drift; the cell
+  servers come from the controller over `/api/cell-assets` like every other
+  cell's. Standalone, like install-moonshine.sh and install-tts.sh.
+
+## 1.3.4 — 2026-07-25
+
+- A Stop arriving mid-start no longer loses the race. The startup worker
+  captures its slot object once and could spend minutes downloading a model;
+  meanwhile Stop dropped the slot and unregistered the cell, and the worker then
+  started the process anyway and re-registered it — a llama-server owned by a
+  slot that no longer existed. Live consequence: a cell held 10.7 GB of VRAM for
+  hours while the board showed its port as stopped, and every start on the same
+  GPU then failed for lack of memory. The worker now checks slot identity before
+  launching and again before registering; if it lost the race it terminates the
+  process it just started instead of orphaning it.
+- Stop verifies the port instead of trusting empty handles. With no process
+  handle and no adopted pid, `stop()` returned `{"ok": true, "detail": "not
+  running"}` having consulted nothing — absence rendered as success. The handler
+  now probes the listener, and reclaims it ONLY when the registry marker or the
+  configured llama binary matches its cmdline; an unrecognized process is
+  reported, not killed, and a stop that could not verify no longer erases the
+  registry entry that makes recovery possible.
+
 ## 1.3.3 — 2026-07-25
 
 - Every llama cell wrote to one `llama-server.log`, and each new start renamed

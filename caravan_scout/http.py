@@ -135,6 +135,29 @@ def make_handler(agent: RouteAgent):
                     result = agent.llama_node_start(self.read_body())
                     self.send_json(result, 200 if result.get("ok") else 400)
                     return
+                if self.path == "/api/host/reboot":
+                    # The controller asks; this host reboots itself. Narrow on
+                    # purpose — reboot only, never shutdown: nobody can power a
+                    # headless client back on from the board. Cells are not
+                    # stopped first; systemd takes them down with the machine and
+                    # autostart brings back what should come back.
+                    print("[host] reboot requested by the controller")
+                    try:
+                        _r = subprocess.run(["sudo", "-n", "systemctl", "reboot"],
+                                            capture_output=True, text=True, timeout=10)
+                        if _r.returncode != 0:
+                            _err = (_r.stderr or _r.stdout or "").strip() or f"exit {_r.returncode}"
+                            _hint = (" — passwordless sudo for `systemctl reboot` is required"
+                                     if "password" in _err.lower() else "")
+                            self.send_json({"ok": False, "error": f"reboot refused: {_err}{_hint}"}, 500)
+                            return
+                    except subprocess.TimeoutExpired:
+                        pass   # the box is already going down; that is success
+                    except Exception as exc:  # noqa: BLE001
+                        self.send_json({"ok": False, "error": f"reboot failed: {exc}"}, 500)
+                        return
+                    self.send_json({"ok": True, "detail": "reboot issued"})
+                    return
                 if self.path == "/api/llama-node/stop":
                     body = self.read_body()
                     _p = body.get("port")
@@ -143,7 +166,42 @@ def make_handler(agent: RouteAgent):
                     _purge_any = False
                     for pp in _ports:
                         _sl = agent._slot(pp)
-                        _results.append(_sl.node.stop())
+                        _res = _sl.node.stop()
+                        # "not running" from a node with no handles means it
+                        # consulted NOTHING — the port may still be served by a
+                        # process this agent lost track of (that is precisely how
+                        # a stop once reported success while 10.7 GB stayed
+                        # occupied). Verify the port; kill only what we can
+                        # recognize as ours, never an arbitrary listener.
+                        if _res.get("detail") == "not running":
+                            _lpid = agent._port_listener_pid(pp)
+                            if _lpid:
+                                _cmd = agent._pid_cmdline(_lpid)
+                                _rec = (agent.state.get("cells") or {}).get(str(pp)) or {}
+                                _mark = str(_rec.get("marker") or "")
+                                _bin = str(agent.config.get("llamaServerBin") or "")
+                                if (_mark and agent._marker_matches(_mark, _cmd)) or                                         (_bin and _bin in _cmd):
+                                    try:
+                                        os.kill(_lpid, signal.SIGTERM)
+                                        _dl = time.time() + 10
+                                        while time.time() < _dl and agent._pid_cmdline(_lpid):
+                                            time.sleep(0.3)
+                                        if agent._pid_cmdline(_lpid):
+                                            os.kill(_lpid, signal.SIGKILL)
+                                        _res = {"ok": True, "reclaimed": True, "pid": _lpid}
+                                    except Exception as exc:  # noqa: BLE001
+                                        _res = {"ok": False, "error": f"reclaim failed: {exc}",
+                                                "listenerPid": _lpid}
+                                else:
+                                    _res = {"ok": False, "listenerPid": _lpid,
+                                            "error": f"port {pp} is held by an unrecognized "
+                                                     f"process (pid {_lpid}) — not killing it"}
+                        _results.append(_res)
+                        if not _res.get("ok"):
+                            # A stop that could not verify must not erase the
+                            # registry entry — that would turn a recoverable cell
+                            # into a genuinely unowned process.
+                            continue
                         agent._set_llama_startup(pp, phase="idle", error="",
                                                  downloadedBytes=0, totalBytes=0)
                         # Don't keep models on client disks (unless caching is on).

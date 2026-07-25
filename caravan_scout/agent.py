@@ -64,6 +64,18 @@ class RouteAgent(RegistryMixin, OpenclawMixin, HeartbeatMixin, ModelsMixin, Cell
         with self._slots_lock:
             self.slots.pop(int(port), None)
 
+    def _slot_current(self, port: int, slot) -> bool:
+        """True while `slot` is still THE slot for this port.
+
+        A stop request replaces/removes the slot object, so identity is the
+        cheapest possible cancellation token for the startup worker: no flags,
+        no epochs — if the object changed, someone stopped or re-created the
+        cell while we were downloading. Checked WITHOUT _slot(), which would
+        re-create an empty slot as a side effect.
+        """
+        with self._slots_lock:
+            return self.slots.get(int(port)) is slot
+
     def _set_llama_startup(self, port: int, **kw: Any) -> None:
         slot = self._slot(port)
         with slot.lock:

@@ -214,6 +214,17 @@ class CellsMixin:
         try:
             out = subprocess.run(["ss", "-ltnpH"], capture_output=True,
                                  text=True, timeout=5).stdout
+        except FileNotFoundError:
+            # macOS has no ss; lsof answers the same question. Without this the
+            # mac client silently returned 0 here — port-based re-adoption and
+            # the stop-time port check both degraded to "nobody listening".
+            try:
+                out2 = subprocess.run(
+                    ["lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-t"],
+                    capture_output=True, text=True, timeout=5).stdout.strip()
+                return int(out2.split()[0]) if out2 else 0
+            except Exception:
+                return 0
         except Exception:
             return 0
         for line in out.splitlines():
@@ -527,8 +538,32 @@ class CellsMixin:
                 "controller sent no shellLine for this command cell — it is older "
                 "than this agent (needs lama-caravan v1.3.115+)", 400)
         log_path = self._model_cache_dir() / f"command-cell.{int(port)}.log"
-        cfg = {"modelPath": "", "port": port, "cellKind": "command", "command": command}
-        # Command cells download nothing — never purge a model cache on stop.
+        # A command cell used to mean "no model, ever". The transcribe runner
+        # broke that: its model is a GGUF PATH like a llama cell's, and the
+        # command the controller sends names it under the models dir. So a
+        # download CAN be needed here — and without one the failure was quiet:
+        # the cell came up healthy on its port and only said "model file not
+        # found" inside its own log.
+        #
+        # modelPath is filled in for a second reason. purge_model_cache_safe()
+        # keeps the files of RUNNING slots by reading exactly this key; left
+        # empty, a cache purge deletes the weights out from under a running
+        # recognizer — the kind of bug that surfaces weeks later.
+        model_raw = str(config.get("MODEL_FILE") or "").strip()
+        model_abs = ""
+        if model_raw:
+            self._set_llama_startup(port, phase="resolving", modelPath=model_raw,
+                                    downloadedBytes=0, totalBytes=0, error="",
+                                    startedAt=int(time.time()))
+            try:
+                model_abs = str(self._ensure_model(model_raw, report=True,
+                                                   use_cache=True, port=port))
+            except Exception as exc:  # noqa: BLE001
+                self._set_llama_startup(port, phase="error", error=str(exc))
+                return {"ok": False, "error": f"model not available: {exc}"}
+        cfg = {"modelPath": model_abs, "port": port, "cellKind": "command", "command": command}
+        # Whatever else a command cell runs is not downloadable, so its cache is
+        # never purged on stop.
         slot.cache_models = True
         self._set_llama_startup(port, phase="loading", modelPath=command[:80],
                                 downloadedBytes=0, totalBytes=0, error="",
@@ -615,6 +650,14 @@ class CellsMixin:
                "gpuLayers": gpu_layers, "ctxSize": ctx_size}
         artifact = self._write_llama_cell_artifacts(port, bin_path, args, config, cfg)
         cfg["artifact"] = artifact
+        # A Stop that arrived while we were downloading has already dropped the
+        # slot and unregistered the cell. Starting now would resurrect a process
+        # nobody owns — exactly how a llama-server once survived with 10.7 GB of
+        # VRAM while the board showed its port as stopped. Identity is the check:
+        # _drop_slot removed OUR object, so a fresh lookup no longer returns it.
+        if not self._slot_current(port, slot):
+            print(f"[llama-node] :{port} start cancelled — the cell was stopped mid-download")
+            return
         result = slot.node.start(bin_path, args, cfg, log_path=log_path)
 
         # Auto-recovery: if the error looks like a truncated/corrupted cached
@@ -650,6 +693,16 @@ class CellsMixin:
                 cfg["artifact"] = artifact
                 result = slot.node.start(bin_path, args, cfg, log_path=log_path)
 
+        if result.get("ok") and not self._slot_current(port, slot):
+            # Stopped between our start and here (the corruption retry keeps this
+            # window open for a re-download). Registering would re-add the cell
+            # http.py just deleted; letting the process live would orphan it.
+            print(f"[llama-node] :{port} stopped during startup — terminating the fresh process")
+            try:
+                slot.node.stop()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[llama-node] :{port} cleanup stop failed: {exc}")
+            return
         if result.get("ok"):
             self._set_llama_startup(port, phase="running", error="")
             self._register_cell(port, "llama", result.get("pid") or 0, bin_path,

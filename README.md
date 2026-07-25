@@ -108,6 +108,24 @@ cd ~/projects/caravan-scout
 The host appears on the controller's Topology board within one heartbeat
 (≤ 60 s). Flags: `--admin-url <url>`, `--skip-llama`, `--llama-tag <tag>`.
 
+### Speech engines (standalone, run when you want one)
+
+Not part of `install.sh` on purpose — each takes minutes and most hosts need
+none of them. Run the one you want, then add a cell of that runner in the
+caravan:
+
+```sh
+./scripts/install-moonshine.sh    # 🌙 CPU speech-to-text + synthesis
+./scripts/install-transcribe.sh   # 📝 transcribe.cpp — GGUF ASR on ggml (CUDA/Metal)
+./scripts/install-tts.sh          # 🛠 voice-clone TTS cells
+```
+
+`install-transcribe.sh` builds a C++ library from source (cmake + a few
+minutes), unlike the others which only make a venv. It is what gives a client
+a good RUSSIAN recognizer: GigaAM-v3 sits near 8% WER against 21-25% for
+whisper large-v3, from a 260 MB GGUF the controller ships to the cell's model
+cache on first start.
+
 ## Pairing with a controller (no config editing)
 
 If you skipped `--admin-url` (or want to re-point the host later), open the
