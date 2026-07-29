@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.6 — 2026-07-29
+
+- `GET /api/host/listeners` — what is listening on this box, with the owning
+  process where the OS will say. The controller's cell-port picker could only
+  see its own host, so a listener on a CLIENT was invisible: the picker painted
+  the number free, the cell reserved fine, and then failed to bind. This is the
+  client half of that answer, and the controller's port scan consumes it.
+
 ## 1.3.5 — 2026-07-25
 
 - A command cell can have a model now, and keeps it. Both assumptions behind

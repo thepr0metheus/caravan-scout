@@ -408,6 +408,43 @@ class CellsMixin:
             raise AppError(f"backup not found: {filename}", 404)
         target.unlink()
 
+    def host_listeners(self) -> dict[str, Any]:
+        """TCP ports LISTENing on this host, with the owning process where the
+        OS will say.
+
+        The controller's cell-port picker can only see its own box, so a
+        listener on a CLIENT — someone's dev server, a leftover service — was
+        invisible: the picker painted the number free, the cell reserved fine
+        and then failed to bind. This is the client half of that answer.
+
+        `ss -ltnp` only reveals pids for our own processes without root; an
+        unknown owner still reports the port, with an empty proc. Knowing the
+        number is taken matters more than knowing by whom.
+        """
+        rows: list[dict[str, Any]] = []
+        try:
+            res = subprocess.run(["ss", "-ltnpH"], text=True, capture_output=True, timeout=6)
+            for line in (res.stdout or "").splitlines():
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+                _, _, port = parts[3].rpartition(":")
+                if not port.isdigit():
+                    continue
+                m = re.search(r'\("([^"]+)",pid=(\d+)', line)
+                rows.append({"port": int(port),
+                             "proc": m.group(1) if m else "",
+                             "pid": int(m.group(2)) if m else 0})
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)[:160], "ports": []}
+        # One row per port: a socket bound on both v4 and v6 is one listener.
+        best: dict[int, dict[str, Any]] = {}
+        for r in rows:
+            cur = best.get(r["port"])
+            if cur is None or (not cur.get("proc") and r.get("proc")):
+                best[r["port"]] = r
+        return {"ok": True, "ports": sorted(best.values(), key=lambda r: r["port"])}
+
     def monitor_nvidia_smi(self) -> dict[str, Any]:
         """Run nvidia-smi and return raw text output for the admin monitor panel."""
         try:

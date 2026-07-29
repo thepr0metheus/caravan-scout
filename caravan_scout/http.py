@@ -96,6 +96,13 @@ def make_handler(agent: RouteAgent):
                 if self.path == "/api/monitor/nvidia-smi":
                     self.send_json(agent.monitor_nvidia_smi())
                     return
+                if self.path == "/api/host/listeners":
+                    # What is listening on this box, so the controller's port
+                    # picker stops offering numbers something else already
+                    # owns. The controller can only see its OWN host; a client
+                    # squatter was invisible until now.
+                    self.send_json(agent.host_listeners())
+                    return
                 if self.path == "/api/llama-node/configs":
                     self.send_json({"ok": True, "configs": agent.list_llama_node_configs()})
                     return
