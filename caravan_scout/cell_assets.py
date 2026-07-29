@@ -27,12 +27,36 @@ import urllib.request
 # We only need to spot WHICH launcher a command invokes.
 _LAUNCHER_RE = re.compile(r"\brun_([a-z0-9_]+)\.sh\b")
 
-# launcher stem -> the runner key the controller's manifest uses
+# launcher stem -> the runner key the controller's manifest uses. A LAST RESORT,
+# used only when the manifest cannot be read: the controller publishes the same
+# mapping in `runners`, and resolving it from there means a runner added on the
+# controller reaches every client without a scout release.
+#
+# It was the hardcoded copy that bit us. `transcribe` shipped on the controller
+# and was never added here, so `runner_for_command` returned "" for every
+# transcribe cell, sync_for_command left on its first line, and the client ran
+# whatever a human had once copied in — for four days, with a green board and
+# not one line in the journal.
 _LAUNCHER_RUNNER = {
     "moonshine": "moonshine",
     "whisper": "whisper",
     "tts": "custom",
+    "transcribe": "transcribe",
 }
+
+
+def _launcher_stem(command: str) -> str:
+    m = _LAUNCHER_RE.search(str(command or ""))
+    return m.group(1) if m else ""
+
+
+def _runner_from_manifest(stem: str, manifest: dict) -> str:
+    """Which runner owns run_<stem>.sh, according to the controller itself."""
+    launcher = f"run_{stem}.sh"
+    for runner, names in (manifest.get("runners") or {}).items():
+        if launcher in (names or []):
+            return str(runner)
+    return ""
 
 
 def _digest(path: str) -> str:
@@ -46,10 +70,7 @@ def _digest(path: str) -> str:
 def runner_for_command(command: str) -> str:
     """Which runner a command line belongs to, or "" when it names no launcher
     of ours (a bare custom command, a python one-liner — nothing to sync)."""
-    m = _LAUNCHER_RE.search(str(command or ""))
-    if not m:
-        return ""
-    return _LAUNCHER_RUNNER.get(m.group(1), "")
+    return _LAUNCHER_RUNNER.get(_launcher_stem(command), "")
 
 
 def sync_for_command(command: str, controller_url: str, headers: dict,
@@ -60,9 +81,9 @@ def sync_for_command(command: str, controller_url: str, headers: dict,
     """
     say = log or (lambda _m: None)
     out: dict[str, str] = {}
-    runner = runner_for_command(command)
-    if not runner:
-        return out
+    stem = _launcher_stem(command)
+    if not stem:
+        return out          # names no launcher of ours — genuinely nothing to sync
     base = str(controller_url or "").rstrip("/")
     if not base:
         say("cell-assets: no controllerUrl — keeping local copies")
@@ -75,6 +96,17 @@ def sync_for_command(command: str, controller_url: str, headers: dict,
             manifest = json.loads(resp.read().decode("utf-8") or "{}")
     except Exception as exc:  # noqa: BLE001
         say(f"cell-assets: manifest unavailable ({exc}) — keeping local copies")
+        return out
+
+    # Ask the controller which runner owns this launcher before falling back to
+    # the table above. The controller is the side that gains runners; a client
+    # that trusts its own table is a client that stops syncing the moment one is
+    # added, and says nothing while it does.
+    runner = _runner_from_manifest(stem, manifest) or _LAUNCHER_RUNNER.get(stem, "")
+    if not runner:
+        say(f"cell-assets: run_{stem}.sh belongs to no runner the controller "
+            f"publishes — keeping local copies (upgrade the controller, or this "
+            f"cell runs whatever is already in $HOME)")
         return out
 
     wanted = (manifest.get("runners") or {}).get(runner) or []

@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.3.7 — 2026-07-29
+
+- A cell whose runner this scout has never heard of no longer skips its file
+  sync in silence. The launcher-to-runner mapping was a table compiled in here,
+  and `transcribe` was never added to it: `sync_for_command` resolved every
+  transcribe cell to no runner, returned on its first line, fetched nothing and
+  logged nothing. The client ran whatever a human had once copied into `$HOME`
+  while the board showed the cell as current — for four days, and it would have
+  lasted until someone compared two files by hand.
+
+  The mapping now comes from the controller's own manifest, which already
+  publishes it, so a runner added on the controller reaches every client with no
+  scout release at all. The table survives only as a fallback for when the
+  manifest cannot be read, and a launcher that resolves to nothing is logged
+  with what to do about it.
+
 ## 1.3.6 — 2026-07-29
 
 - `GET /api/host/listeners` — what is listening on this box, with the owning
