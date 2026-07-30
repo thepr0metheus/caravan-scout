@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.3.8 — 2026-07-30
+
+- `POST /api/host/poweroff`, beside the reboot that was already here. Its own
+  path rather than a flag on the existing one: poweroff is the one action the
+  controller cannot undo — nothing on the board can switch this machine back
+  on — so it must not be reachable by getting a field wrong, and a scout too old
+  to know it answers 404 instead of quietly doing the other one.
+
+  Cells are not stopped first, same as reboot: systemd takes them down with the
+  machine. Needs passwordless sudo for `systemctl poweroff`, and says so when it
+  is missing rather than reporting success.
+
 ## 1.3.7 — 2026-07-29
 
 - A cell whose runner this scout has never heard of no longer skips its file

@@ -142,28 +142,34 @@ def make_handler(agent: RouteAgent):
                     result = agent.llama_node_start(self.read_body())
                     self.send_json(result, 200 if result.get("ok") else 400)
                     return
-                if self.path == "/api/host/reboot":
-                    # The controller asks; this host reboots itself. Narrow on
-                    # purpose — reboot only, never shutdown: nobody can power a
-                    # headless client back on from the board. Cells are not
-                    # stopped first; systemd takes them down with the machine and
-                    # autostart brings back what should come back.
-                    print("[host] reboot requested by the controller")
+                if self.path in ("/api/host/reboot", "/api/host/poweroff"):
+                    # The controller asks; this host power-cycles itself. Cells
+                    # are not stopped first — systemd takes them down with the
+                    # machine and autostart brings back what should come back.
+                    #
+                    # poweroff is the one-way door: nothing on the board can
+                    # switch this box on again, so it is separated from reboot by
+                    # its own path rather than a flag in a body. A path cannot be
+                    # reached by accident the way a mistyped field can, and an old
+                    # scout answers 404 to it instead of silently doing the wrong
+                    # one of the two.
+                    _action = "poweroff" if self.path.endswith("poweroff") else "reboot"
+                    print(f"[host] {_action} requested by the controller")
                     try:
-                        _r = subprocess.run(["sudo", "-n", "systemctl", "reboot"],
+                        _r = subprocess.run(["sudo", "-n", "systemctl", _action],
                                             capture_output=True, text=True, timeout=10)
                         if _r.returncode != 0:
                             _err = (_r.stderr or _r.stdout or "").strip() or f"exit {_r.returncode}"
-                            _hint = (" — passwordless sudo for `systemctl reboot` is required"
+                            _hint = (f" — passwordless sudo for `systemctl {_action}` is required"
                                      if "password" in _err.lower() else "")
-                            self.send_json({"ok": False, "error": f"reboot refused: {_err}{_hint}"}, 500)
+                            self.send_json({"ok": False, "error": f"{_action} refused: {_err}{_hint}"}, 500)
                             return
                     except subprocess.TimeoutExpired:
                         pass   # the box is already going down; that is success
                     except Exception as exc:  # noqa: BLE001
-                        self.send_json({"ok": False, "error": f"reboot failed: {exc}"}, 500)
+                        self.send_json({"ok": False, "error": f"{_action} failed: {exc}"}, 500)
                         return
-                    self.send_json({"ok": True, "detail": "reboot issued"})
+                    self.send_json({"ok": True, "detail": f"{_action} issued"})
                     return
                 if self.path == "/api/llama-node/stop":
                     body = self.read_body()
