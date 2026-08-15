@@ -38,11 +38,20 @@ class OpenclawMixin:
             if isinstance(row, dict) and str(row.get("id") or "") == agent_id:
                 selected = row
                 break
+        # model is either {primary, fallbacks} or the shorthand string
+        # "provider/model". Only the dict was handled, so a string-configured
+        # agent reported NO routes — indistinguishable, upstream, from an agent
+        # that genuinely has none, which is how the whole fleet came to look
+        # unrouted while every agent was in fact wired.
+        def _as_model(value):
+            if isinstance(value, str):
+                return {"primary": value}
+            return value if isinstance(value, dict) else {}
+
         model = {}
-        if isinstance(defaults.get("model"), dict):
-            model.update(defaults.get("model") or {})
-        if isinstance(selected, dict) and isinstance(selected.get("model"), dict):
-            model.update(selected.get("model") or {})
+        model.update(_as_model(defaults.get("model")))
+        if isinstance(selected, dict):
+            model.update(_as_model(selected.get("model")))
         primary = str(model.get("primary") or "").strip()
         fallbacks = model.get("fallbacks") or []
         if not isinstance(fallbacks, list):

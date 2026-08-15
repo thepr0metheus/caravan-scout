@@ -89,6 +89,20 @@ class RegistryMixin:
                 continue  # not a vm/docker agent on this host → leave to the static list
             host_ip = str(a.get("host") or "").strip()
             port = a.get("port")
+            # The registry's `host` is a remembered address, and DHCP does not
+            # ask it before moving one. On 2026-08-15 eight of nine VMs here had
+            # swapped addresses: the registry still named two hosts that no
+            # longer existed, while the guests had moved elsewhere in the subnet,
+            # so routes were applied to whichever VM happened to answer at the
+            # old number — and a wrong-but-reachable host looks exactly like the
+            # right one, which is why this survived two prior investigations.
+            # We are ON this hypervisor, so ask it instead of remembering.
+            if on_vm:
+                measured = libvirt_domain_ip(machine)
+                if measured and measured != host_ip:
+                    print(f"[registry] {aid}: host {host_ip or '?'} -> {measured} (from libvirt)")
+                    host_ip = measured
+                    a = {**a, "url": ""}    # rebuild the endpoint from the real IP
             endpoint = str(a.get("url") or "").strip() or (
                 f"http://{host_ip}:{port}" if host_ip and port else "")
             row: dict[str, Any] = {

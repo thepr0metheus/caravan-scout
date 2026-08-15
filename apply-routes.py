@@ -29,6 +29,8 @@ from pathlib import Path
 
 DOCKER_AGENTS_BASE = Path.home() / "docker/agents/data"
 HOST_OPENCLAW_CONFIG = Path.home() / ".openclaw/openclaw.json"
+# Which agent id owns the host's own config; matches the scout's openclawAgentId.
+HOST_AGENT_ID = os.environ.get("APPLY_ROUTES_HOST_AGENT_ID", "openclaw")
 DOCKER_CONTAINER_PREFIX = "agent-"
 VM_SSH_KEY = Path.home() / ".ssh/id_ed25519_vm"
 VM_SSH_USER = os.environ.get("APPLY_ROUTES_VM_SSH_USER", os.environ.get("USER", ""))
@@ -60,7 +62,21 @@ def update_config_obj(config: dict, routes: dict[str, str]) -> bool:
     `lama-caravan` provider which is also set as the default model."""
     models = config.setdefault("models", {})
     providers = models.setdefault("providers", {})
-    defaults_model = (config.get("agents") or {}).get("defaults", {}).get("model", {})
+    raw_model = ((config.get("agents") or {}).get("defaults") or {}).get("model")
+
+    # agents.defaults.model has two valid shapes: the dict {primary, fallbacks}
+    # and the plain-string shorthand "provider/model". Every live config in this
+    # fleet uses the string, so assuming the dict killed this script on its first
+    # line of real work with "'str' object has no attribute 'get'" — and because
+    # a dead applier looks exactly like an applier with nothing to do, the routes
+    # it silently never delivered went unnoticed from 2026-07-20 to 2026-08-15.
+    # The scout's own reader guards this with isinstance; this one did not.
+    if isinstance(raw_model, str):
+        defaults_model = {"primary": raw_model, "fallbacks": []}
+    elif isinstance(raw_model, dict):
+        defaults_model = raw_model
+    else:
+        defaults_model = {}
 
     role_to_provider: dict[str, str] = {}
     primary_ref = str(defaults_model.get("primary") or "")
@@ -116,7 +132,15 @@ def resolve_local_config_path(agent: dict) -> Path | None:
     if agent.get("runtime") == "docker":
         p = DOCKER_AGENTS_BASE / str(agent.get("id") or "") / ".openclaw" / "openclaw.json"
         return p if p.exists() else None
-    return HOST_OPENCLAW_CONFIG if HOST_OPENCLAW_CONFIG.exists() else None
+    # The host's own ~/.openclaw/openclaw.json belongs to exactly ONE agent. It
+    # used to be the fallback for anything not docker, so an agent whose
+    # metadata failed to arrive — a VM whose registry entry is stale, which is
+    # the fleet's normal condition — silently rewrote the HOST agent's endpoint
+    # instead of its own. Observed live: applying cerberus's route repointed
+    # foreman's host agent. Refuse rather than guess.
+    if str(agent.get("id") or "") == HOST_AGENT_ID and HOST_OPENCLAW_CONFIG.exists():
+        return HOST_OPENCLAW_CONFIG
+    return None
 
 
 def apply_local(config_path: Path, routes: dict[str, str]) -> bool:
@@ -137,6 +161,33 @@ def restart_docker(agent_id: str) -> None:
         print(f"  {container} restarted ok")
     else:
         print(f"  [warn] restart {container} failed: {r.stderr.strip()}", file=sys.stderr)
+
+
+# The gateway reads its config at startup, so an agent that is not restarted
+# keeps serving the OLD baseUrl however carefully the file was rewritten. Only
+# docker was ever restarted here: "host" fell through silently and "launchd"
+# (macOS, what crab reports) matched no branch at all, so the Mac agent had
+# never once been restarted by this script.
+def restart_local(agent_id: str, runtime: str) -> None:
+    if runtime == "docker":
+        restart_docker(agent_id)
+        return
+    if runtime == "launchd":
+        label = os.environ.get("APPLY_ROUTES_LAUNCHD_LABEL", "ai.openclaw.gateway")
+        cmd = ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"]
+    else:                                    # host: systemd user unit
+        cmd = ["systemctl", "--user", "restart",
+               os.environ.get("APPLY_ROUTES_HOST_UNIT", "openclaw-gateway")]
+    print(f"  restarting {agent_id} ({runtime}): {' '.join(cmd)}")
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
+    except Exception as exc:
+        print(f"  [warn] restart {agent_id} failed: {exc}", file=sys.stderr)
+        return
+    if r.returncode == 0:
+        print(f"  {agent_id} restarted ok")
+    else:
+        print(f"  [warn] restart {agent_id} failed: {r.stderr.strip()}", file=sys.stderr)
 
 
 # ---- vm: openclaw config lives on the guest, reached over SSH ---------------------
@@ -162,7 +213,15 @@ def apply_vm(agent: dict, routes: dict[str, str]) -> bool:
         raise RuntimeError("no VM ip resolvable from endpoint/host")
     read = _ssh(ip, ["cat", VM_OPENCLAW_CONFIG], timeout=20)
     if read.returncode != 0:
-        raise RuntimeError(f"ssh read {ip}: {read.stderr.strip()}")
+        err = read.stderr.strip()
+        # accept-new adds an UNKNOWN host; it refuses a host whose key CHANGED,
+        # which is what a rebuilt VM looks like. The bare "Host key verification
+        # failed" gives an operator nothing to act on, so name the remedy.
+        if "host key verification failed" in err.lower() or "REMOTE HOST IDENTIFICATION" in err:
+            raise RuntimeError(
+                f"ssh {ip}: host key changed since it was first seen (rebuilt VM?). "
+                f"Verify the host, then clear the stale entry: ssh-keygen -R {ip}")
+        raise RuntimeError(f"ssh read {ip}: {err}")
     config = json.loads(read.stdout)
     changed = update_config_obj(config, routes)
     if not changed:
@@ -172,11 +231,22 @@ def apply_vm(agent: dict, routes: dict[str, str]) -> bool:
                  input_text=data, timeout=20)
     if write.returncode != 0:
         raise RuntimeError(f"ssh write {ip}: {write.stderr.strip()}")
-    restart = _ssh(ip, ["sudo", "systemctl", "restart", f"openclaw-{agent_id}.service"], timeout=40)
-    if restart.returncode == 0:
-        print(f"  restarted openclaw-{agent_id} on {ip}")
-    else:
-        print(f"  [warn] restart openclaw-{agent_id} on {ip} failed: {restart.stderr.strip()}", file=sys.stderr)
+    # The guests run ONE user unit, openclaw-gateway — not a system unit named
+    # after the agent. `sudo systemctl restart openclaw-<id>.service` therefore
+    # failed on every VM in the fleet; it only ever printed a warning, so the
+    # config landed and the agent went on using the previous baseUrl.
+    unit = os.environ.get("APPLY_ROUTES_VM_UNIT", "openclaw-gateway")
+    restart = _ssh(ip, ["systemctl", "--user", "restart", unit], timeout=40)
+    if restart.returncode != 0:
+        legacy = _ssh(ip, ["sudo", "-n", "systemctl", "restart",
+                           f"openclaw-{agent_id}.service"], timeout=40)
+        if legacy.returncode == 0:
+            print(f"  restarted openclaw-{agent_id} on {ip} (legacy system unit)")
+            return True
+        print(f"  [warn] restart {unit} on {ip} failed: {restart.stderr.strip()}",
+              file=sys.stderr)
+        return True
+    print(f"  restarted {unit} on {ip}")
     return True
 
 
@@ -228,8 +298,8 @@ def main() -> int:
                     continue
                 print(f"[{agent_id}] {ocpath}")
                 changed = apply_local(ocpath, routes)
-                if changed and runtime == "docker":
-                    restart_docker(agent_id)
+                if changed:
+                    restart_local(agent_id, runtime)
             if not changed:
                 print(f"[{agent_id}] no changes")
         except Exception as exc:
