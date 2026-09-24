@@ -50,7 +50,7 @@ and the worked example
 | Component | Requirement |
 |---|---|
 | OS | Linux with systemd --user, or macOS (launchd) |
-| Python | **3.10+**, standard library only — no pip packages |
+| Python | **3.9+**, standard library only — no pip packages (the macOS scout runs on the system's 3.9; CI runs the snapshots on 3.9 and 3.12) |
 | For llama cells | a `llama-server` binary on this host (`scripts/install.sh` can build it; CUDA optional) |
 | For GPU info | NVIDIA driver + `nvidia-smi` (optional — CPU-only hosts are fine) |
 | Network | reach the controller's `:7990`; the scout listens on `:8092` |

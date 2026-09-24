@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.0.1 — 2026-09-24
+
+- **The model cache is purged fully on Python 3.9** — the macOS scout's.
+  The purge and the old-model cleanup deleted files while `rglob` was still
+  walking the cache, and removed each emptied folder as they went; on 3.9 the
+  walk then scanned a folder that was gone and raised FileNotFoundError
+  halfway, leaving the rest of the cache on disk. Nothing said so: the stop
+  swallows a failed purge. The walk is finished before anything is deleted
+  now, and CI runs the snapshots on 3.9 as well as 3.12 — they had only ever
+  run on 3.12 and newer. The README names 3.9 as the floor, which is what
+  the fleet runs.
+
 ## 2.0.0 — 2026-09-24
 
 - **Rewritten into classes, each with one job.** The scout was one class

@@ -51,3 +51,23 @@ jobs:
           curl -sf -o /dev/null http://127.0.0.1:18092/api/state
           curl -sf -o /dev/null http://127.0.0.1:18092/
           echo "smoke OK"
+
+  # The macOS scout runs on the system's Python 3.9. The snapshots ran only on
+  # 3.12 until 2026-09-24, and the model cache's purge failed on 3.9 without a
+  # red line anywhere: a live rglob walked into a folder the loop had just
+  # removed. The same snapshots run on the oldest Python the fleet uses.
+  snapshots-py39:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - name: snapshots on 3.9
+        run: |
+          set -e
+          python3 --version
+          for t in scripts/test_scout_*.py scripts/test_check_oop.py; do
+            echo "== $t"
+            python3 "$t"
+          done

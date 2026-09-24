@@ -152,7 +152,10 @@ class ModelFetcher:
             keep_paths = [keep_paths]
         keep_resolved = {Path(p).resolve() for p in keep_paths if p}
         deleted = []
-        for p in cache_dir.rglob("*.gguf"):
+        # list() first: the loop removes emptied folders, and on Python 3.9 —
+        # the macOS scout's — a live rglob then scans a folder that is gone and
+        # raises FileNotFoundError halfway through, leaving the rest behind.
+        for p in list(cache_dir.rglob("*.gguf")):
             if p.resolve() in keep_resolved:
                 continue
             try:
@@ -184,7 +187,7 @@ class ModelFetcher:
         keep_resolved = {Path(p).resolve() for p in (keep or []) if p}
         deleted, freed = [], 0
         for pattern in ("*.gguf", "*.tmp"):
-            for p in cache_dir.rglob(pattern):
+            for p in list(cache_dir.rglob(pattern)):   # list() first: see cleanup_old
                 if p.resolve() in keep_resolved:
                     continue
                 try:
