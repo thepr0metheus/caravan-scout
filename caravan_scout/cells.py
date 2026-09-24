@@ -10,7 +10,7 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from caravan_scout.models import ModelFetcher
 from caravan_scout.process import CellProcess, HostProcesses
@@ -35,47 +35,81 @@ class Cell:
         self.crash: dict[str, Any] | None = None
 
 
-class LlamaProbe:
-    """What a llama-server says about itself over HTTP, per port: token rates
-    and its queue from /metrics (kept ~2 s), the context window it was
-    launched with from /props (kept ~30 s).
+class ServerProbe:
+    """What a cell's server says about itself over HTTP, per port: token rates
+    and its queue from /metrics (kept ~2 s), the context window a
+    llama-server was launched with from /props (kept ~30 s).
+
+    llama-server and vLLM tell the same facts under different names.
+    llama.cpp reports its rates itself. vLLM 0.24 (engine V1) exports only
+    token counters, so its rates are the counters' growth per second between
+    two readings — the aggregate throughput its old avg_*_throughput gauges
+    used to say; a first reading has nothing to compare with and says no
+    rate. Lines with labels (vLLM's engine, model) are summed per name.
 
     A server that does not answer says nothing: no metrics, a window of 0 —
     and that silence is kept as long as an answer would be.
     """
 
-    def __init__(self):
+    #: Read as they are: Prometheus name -> the view's key.
+    GAUGES = {"llamacpp:prompt_tokens_seconds": "promptTps", "llamacpp:predicted_tokens_seconds": "genTps",
+              "llamacpp:requests_processing": "requestsProcessing", "llamacpp:kv_cache_usage_ratio": "_kvRatio",
+              "vllm:num_requests_running": "requestsProcessing", "vllm:num_requests_waiting": "requestsWaiting"}
+    #: Counted: the growth per second between two readings is the rate.
+    COUNTERS = {"vllm:prompt_tokens_total": "promptTps", "vllm:generation_tokens_total": "genTps"}
+
+    def __init__(self, clock: Callable[[], float] | None = None):
+        # None asks time.time at each reading, so a patched clock is seen.
+        self.clock = clock
         self._metrics: dict[Any, tuple[float, dict[str, Any]]] = {}
         self._ctx: dict[Any, tuple[float, int]] = {}
+        self._counted: dict[Any, tuple[float, dict[str, float]]] = {}
+
+    def now(self) -> float:
+        return self.clock() if self.clock else time.time()
 
     def metrics(self, port) -> dict[str, Any]:
-        """Scrape the local llama-server /metrics (Prometheus) for live token
-        rates. Cached ~2s. Returns {promptTps, genTps, requestsProcessing}."""
-        now = time.time()
+        """Scrape the cell's /metrics (Prometheus) for live token rates and
+        its queue. Cached ~2s. Returns {promptTps, genTps, requestsProcessing,
+        requestsWaiting (vLLM)} — each only when the server says it."""
+        now = self.now()
         hit = self._metrics.get(port)
         if hit and now - hit[0] < 2:
             return hit[1]
         out: dict[str, Any] = {}
+        counted: dict[str, float] = {}
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{int(port)}/metrics", timeout=1) as r:
                 for line in r.read().decode("utf-8", "replace").splitlines():
-                    if line.startswith("#") or " " not in line:
+                    if line.startswith("#") or not line.strip():
                         continue
-                    key, _, val = line.partition(" ")
+                    name = line.split("{", 1)[0].split(None, 1)[0]
                     try:
-                        num = float(val.split()[0])
+                        num = float(line.rsplit(None, 1)[-1])
                     except (ValueError, IndexError):
                         continue
-                    if key == "llamacpp:prompt_tokens_seconds":
-                        out["promptTps"] = round(num, 2)
-                    elif key == "llamacpp:predicted_tokens_seconds":
-                        out["genTps"] = round(num, 2)
-                    elif key == "llamacpp:requests_processing":
-                        out["requestsProcessing"] = int(num)
-                    elif key == "llamacpp:kv_cache_usage_ratio":
-                        out["_kvRatio"] = num
+                    if name in self.GAUGES:
+                        key = self.GAUGES[name]
+                        out[key] = out.get(key, 0.0) + num
+                    elif name in self.COUNTERS:
+                        counted[name] = counted.get(name, 0.0) + num
         except Exception:
-            out = {}
+            out, counted = {}, {}
+        for key in ("promptTps", "genTps"):
+            if key in out:
+                out[key] = round(out[key], 2)
+        for key in ("requestsProcessing", "requestsWaiting"):
+            if key in out:
+                out[key] = int(out[key])
+        before = self._counted.get(port)
+        if counted:
+            if before and now > before[0]:
+                for name, value in counted.items():
+                    prev = before[1].get(name)
+                    # A counter that went down is a restarted server: no rate.
+                    if prev is not None and value >= prev:
+                        out[self.COUNTERS[name]] = round((value - prev) / (now - before[0]), 2)
+            self._counted[port] = (now, counted)
         # Context window the server launched with + live KV-cache occupancy.
         ctx_max = self.ctx_max(port)
         ratio = out.pop("_kvRatio", None)
@@ -89,7 +123,7 @@ class LlamaProbe:
     def ctx_max(self, port) -> int:
         """n_ctx the llama-server was launched with, from /props. Cached ~30s
         PER PORT (same single-slot thrash as Machine.firewall — see its note)."""
-        now = time.time()
+        now = self.now()
         hit = self._ctx.get(port)
         if hit and now - hit[0] < 30:
             return hit[1]
@@ -171,7 +205,7 @@ class Cells:
         self.config = config
         self.by_port: dict[int, Cell] = {}
         self._lock = threading.Lock()
-        self.probe = LlamaProbe()
+        self.probe = ServerProbe()
         self.records = CellRecords(state)
         self.processes = HostProcesses()
         # The model files are the cells': downloads report into a cell's
@@ -234,8 +268,18 @@ class Cells:
         if st.get("running"):
             p = st.get("port") or port
             metrics = self.probe.metrics(p) if p else {}
-            return {**st, "port": p, "phase": "running", **metrics,
+            view = {**st, "port": p, "phase": "running", **metrics,
                     "firewall": self.machine.firewall(p) if p else {}}
+            # Whether its port answers here yet: vLLM installs and loads for
+            # minutes before it listens, and from the controller a silent
+            # port looks the same as a firewall. Not listening, the cell says
+            # its last log lines — where the start is.
+            listening = self.machine.listening_ports()
+            if p and listening is not None:
+                view["listening"] = int(p) in listening
+                if not view["listening"]:
+                    view["startingTail"] = cell.process.log_tail()
+            return view
         # Crashed shortly after start (non-zero exit) — surface as error even if
         # the startup worker already marked it "running".
         if st.get("crashed"):

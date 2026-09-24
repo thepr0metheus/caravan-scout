@@ -124,6 +124,40 @@ class CellStart:
             return {"ok": False, "error": f"startup already in progress on port {port} ({phase})", "phase": phase}
         return None
 
+    def short_of_vram(self, port: int) -> dict[str, Any] | None:
+        """The refusal when the card cannot hold what the cell reserves the
+        moment it starts; None when it can, or when the start reserves
+        nothing up front.
+
+        How much a runner reserves is the controller's knowledge (vLLM takes
+        utilization × the card); it sends it with the start as `vram`
+        {device, reserveMiB, who, why, lower}. What is free is this machine's,
+        read now — also when the start comes from autostart at boot, where
+        two cells may want one card. Refused rather than started: otherwise
+        the cell dies in a crash loop a minute later. Best effort, like the
+        controller's own check: no nvidia-smi, no such card — no refusal."""
+        want = self.payload.get("vram")
+        if not isinstance(want, dict):
+            return None
+        try:
+            device, reserve = str(int(want.get("device") or 0)), float(want.get("reserveMiB") or 0)
+        except (TypeError, ValueError):
+            return None
+        card = next((g for g in self.cells.machine.nvidia_gpus() if str(g.get("index")) == device), None)
+        try:
+            free = float((card or {}).get("memoryFreeMiB"))
+        except (TypeError, ValueError):
+            return None
+        if reserve <= 0 or free >= reserve:
+            return None
+        holders = sorted(f":{p}" for p, cell in self.cells.all()
+                         if p != port and cell.process.status().get("running"))
+        lower = str(want.get("lower") or "what it reserves")
+        hint = f" — stop {', '.join(holders)} or lower {lower}" if holders else f" — lower {lower}"
+        who, why = str(want.get("who") or "the cell"), str(want.get("why") or "")
+        return {"ok": False, "error": f"{who} wants {reserve / 1024:.1f} GiB reserved{f' ({why})' if why else ''} "
+                                      f"but only {free / 1024:.1f} GiB VRAM is free on GPU {device}{hint}"}
+
     @staticmethod
     def open_firewall(port: int) -> None:
         """Open the port in ufw so the admin can reach the cell. Silently
@@ -378,7 +412,7 @@ class CommandStart(CellStart):
         if not command:
             raise AppError("command is required for a command cell", 400)
         port = self.port()
-        refusal = self.busy(port)
+        refusal = self.busy(port) or self.short_of_vram(port)
         if refusal:
             return refusal
         cell = cells.at(port)

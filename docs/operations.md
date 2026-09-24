@@ -125,6 +125,25 @@ start), `llama-node-configs/`, `var/server-cells/<port>/`, the model cache
   newest archived build of another commit. It is kept in `state.json` under
   the build (commit and binary time) until dismissed for that build or the
   build changes. Nothing is restored without the operator.
+- **A cell that runs but does not listen yet (2.7+).** vLLM installs its venv
+  and loads for minutes before its port opens; from the controller a silent
+  port looks like a firewall. The scout asks its own OS which ports listen
+  (`ss`, `lsof` on macOS, once per 2 s for all cells) and says `listening` per
+  running cell; one that does not listen yet also says its last log lines
+  (`startingTail`), and the board shows it starting, with where the start is.
+- **A vLLM cell's queue and speed (2.7+).** vLLM 0.24 (engine V1) exports
+  no rates, only token counters; the scout reads its /metrics like a
+  llama-server's and reports the counters' growth per second between two
+  readings as `promptTps` / `genTps` (aggregate throughput, what vLLM's old
+  gauges said), with `requestsProcessing` and `requestsWaiting`. A first
+  reading, a counter seen for the first time, or a restarted server (a
+  counter that went down) gives no rate rather than a made-up one.
+- **A start the card cannot hold is refused (2.7+).** vLLM reserves
+  utilization × the card when it starts and otherwise dies in a crash loop a
+  minute later. The controller sends what a start reserves (`vram`); the scout
+  reads its free memory at launch — at boot too, where two autostart cells may
+  want one card — and refuses with the numbers and the cells holding the card.
+  No nvidia-smi, or no such card: no check, as on the controller.
 - **Memory limits (2.6+).** On Linux a cell is launched in its own systemd
   user scope with the limits of the controller's cells (`lama-cell@.service`):
   `MemoryHigh=70%`, `MemoryMax=80%`, `MemorySwapMax=2G` of this machine's RAM.

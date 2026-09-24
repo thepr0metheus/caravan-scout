@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _scout_harness import make_scout, patched  # noqa: E402
+from _scout_harness import TMP, make_scout, patched  # noqa: E402
 
 import caravan_scout.report as report_module  # noqa: E402
 from caravan_scout.process import CellProcess  # noqa: E402
@@ -49,6 +49,8 @@ class ReportSample:
     CPU = {"loadPct": 12.5, "load1": 1.5, "ncpu": 12, "logicalCores": 12, "availableCores": 12,
            "physicalCores": 6, "ram": {"usedGb": 18.2, "totalGb": 62.7}}
     METRICS = {"promptTps": 812.5, "genTps": 41.3, "requestsProcessing": 1, "ctxMax": 8192, "ctxUsed": 2048}
+    # A vLLM cell says its queue, and its rates come from its counters (2.7).
+    VLLM_METRICS = {"requestsProcessing": 2, "requestsWaiting": 1, "promptTps": 150.0, "genTps": 40.0}
     UPDATE = {"running": False, "done": True, "rc": 0, "startedAt": NOW - 86_400, "tag": "b9947",
               "lastLine": "llama.cpp b9947 installed"}
 
@@ -70,12 +72,28 @@ class ReportSample:
         # And it starts with the machine (2.4): its port rides "autostart".
         scout.autostart.set(22001, True, {"modelPath": "models/org/model-q4.gguf", "port": 22001,
                                           "args": ["--port", "22001"], "config": {"PORT": 22001}})
+        vllm = scout.cells.at(22012)
+        vllm.process.adopt(4343, {"modelPath": "", "port": 22012, "cellKind": "command",
+                                  "command": "$HOME/vllm-venv/bin/vllm serve org/model --port \"$PORT\""},
+                           started_at=self.NOW - 300)
+        scout.cells.report(22012, phase="running", error="")
+        # Another vLLM cell still installs: its process runs, its port does
+        # not listen yet, and it says where the start is (2.7).
+        log = TMP / "sample-logs" / "command-cell.22013.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("[caravan] provisioning vLLM venv at $HOME/vllm-venv (first start on this host, several "
+                       "minutes)…\nCollecting vllm==0.24.0\n", encoding="utf-8")
+        scout.cells.at(22013).process.adopt(4444, {"modelPath": "", "port": 22013, "cellKind": "command",
+                                                   "command": "$HOME/vllm-venv/bin/vllm serve org/other"},
+                                            log_path=log, started_at=self.NOW - 60)
+        scout.cells.report(22013, phase="running", error="")
         scout.cells.report(22002, phase="downloading", modelPath="models/org/other-q8.gguf",
                            downloadedBytes=1_000_000, totalBytes=4_000_000, downloadingFile="other-q8.gguf",
                            startedAt=self.NOW - 30)
         machine = {"gpus": lambda: [dict(self.GPU)], "compute_apps": lambda: [dict(self.APP)],
                    "cpu_ram": lambda: json.loads(json.dumps(self.CPU)), "address": lambda: "10.0.0.5",
-                   "firewall": lambda port: {"state": "open", "allowedFrom": []}}
+                   "firewall": lambda port: {"state": "open", "allowedFrom": []},
+                   "listening_ports": lambda: {22001, 22012}}
         # Its cells crash since a build made an hour ago (2.6): the board's
         # banner offers the archived build before it.
         built_at = self.NOW - 3600
@@ -90,8 +108,10 @@ class ReportSample:
                   "binary_mtime": lambda: "2026-09-01T10:00:00", "status_slim": lambda: dict(self.UPDATE),
                   "archive": lambda: archive}
         with patched(scout.machine, **machine), patched(scout.builds, **builds), \
-                patched(scout.cells.probe, metrics=lambda port: dict(self.METRICS)), \
-                patched(CellProcess, pid_alive=staticmethod(lambda pid: pid == 4242)), \
+                patched(scout.cells.probe, metrics=lambda port: dict(self.VLLM_METRICS if port == 22012
+                                                                      else self.METRICS if port == 22001
+                                                                      else {})), \
+                patched(CellProcess, pid_alive=staticmethod(lambda pid: pid in (4242, 4343, 4444))), \
                 patched(socket, gethostname=lambda: "box-a.lan"), patched(time, time=lambda: float(self.NOW)), \
                 patched(sys, platform="linux"), patched(report_module, APP_VERSION=self.VERSION):
             return {"heartbeat": scout.report.heartbeat(), "state": scout.report.public()}

@@ -30,6 +30,7 @@ class Machine:
     GPUS_TTL = 10
     APPS_TTL = 5
     FIREWALL_TTL = 30
+    LISTEN_TTL = 2
 
     def __init__(self, config):
         self.config = config
@@ -38,6 +39,8 @@ class Machine:
         self._apps: list[dict[str, Any]] = []
         self._apps_at = 0.0
         self._firewall: dict[Any, tuple[float, dict[str, Any]]] = {}
+        self._listening: set[int] | None = None
+        self._listening_at = 0.0
 
     # ── cached probes ───────────────────────────────────────────────────────
 
@@ -59,6 +62,16 @@ class Machine:
         self._apps = self.nvidia_apps()
         self._apps_at = now
         return self._apps
+
+    def listening_ports(self) -> set[int] | None:
+        """The TCP ports something listens on here, asked at most every 2 s
+        for all the cells at once; None when the OS will not say."""
+        now = time.time()
+        if self._listening_at and now - self._listening_at < self.LISTEN_TTL:
+            return self._listening
+        self._listening = self.listening_now()
+        self._listening_at = now
+        return self._listening
 
     def firewall(self, port) -> dict[str, Any]:
         """Who ufw lets reach `port`, cached ~30 s PER PORT.
@@ -103,6 +116,26 @@ class Machine:
     def name(self) -> str:
         """What this machine is called where one word is wanted."""
         return self.config.get("hostId") or self.config.get("displayName") or "remote"
+
+    @staticmethod
+    def listening_now() -> set[int] | None:
+        """The ports LISTENing right now: `ss` on Linux, `lsof` on macOS
+        (the local address is the 4th and the 9th column); None when
+        neither answers — not "nothing listens"."""
+        for cmd, column in ((["ss", "-ltnH"], 3), (["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"], 8)):
+            try:
+                res = subprocess.run(cmd, text=True, capture_output=True, timeout=5)
+            except Exception:
+                continue
+            if res.returncode != 0 and not (res.stdout or "").strip():
+                continue
+            ports: set[int] = set()
+            for line in (res.stdout or "").splitlines():
+                parts = line.split()
+                if len(parts) > column and parts[column].rpartition(":")[2].isdigit():
+                    ports.add(int(parts[column].rpartition(":")[2]))
+            return ports
+        return None
 
     # ── asked on demand ─────────────────────────────────────────────────────
 

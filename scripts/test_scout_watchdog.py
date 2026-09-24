@@ -163,7 +163,8 @@ def test_the_last_lines():
           "падение — заметка берёт последние строки лога упавшего запуска")
     clock.now += 10
     ticks(dog)
-    with patched(s.cells.probe, metrics=lambda port: {}), patched(s.cells.machine, firewall=lambda port: {}):
+    with patched(s.cells.probe, metrics=lambda port: {}), \
+            patched(s.cells.machine, firewall=lambda port: {}, listening_ports=lambda: {22021}):
         view = s.cells.view(cell)
     check(proc.relaunches == 1 and (view.get("crash") or {}).get("tail") == "E load: tensor data is not within the file bounds\nE main: exiting",
           "перезапуск отодвинул лог, а строки в заметке — всё ещё того падения; карточка их читает")

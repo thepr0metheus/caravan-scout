@@ -432,6 +432,63 @@ def test_live_numbers():
         check(make_scout().cells.probe.ctx_max(22003) == 4096, "boundary: окно и из верхнего n_ctx старых сборок")
 
 
+VLLM_METRICS = """# HELP vllm:num_requests_running Number of requests in model execution batches.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{engine="0",model_name="org/model"} 2.0
+vllm:num_requests_waiting{engine="0",model_name="org/model"} 1.0
+vllm:prompt_tokens_total{engine="0",model_name="org/model"} %(prompt)s
+vllm:generation_tokens_total{engine="0",model_name="org/model"} %(gen)s
+vllm:generation_tokens_total{engine="1",model_name="org/model"} %(gen2)s
+vllm:time_to_first_token_seconds_sum{engine="0",model_name="org/model"} 3.5
+"""
+
+
+def test_live_numbers_vllm():
+    CHECKS.section("живые числа запущенного vLLM (движок V1 отдаёт только счётчики):")
+    readings = [{"prompt": 1000.0, "gen": 400.0, "gen2": 100.0}, {"prompt": 1600.0, "gen": 520.0, "gen2": 140.0},
+                {"prompt": 10.0, "gen": 5.0, "gen2": 0.0}]
+    clock = [5000.0]
+
+    def urlopen(url, timeout=None):
+        if url.endswith("/props"):
+            raise OSError("404")
+        return FakeResponse((VLLM_METRICS % readings[0]).encode())
+    probe = make_scout().cells.probe
+    with patched(urllib.request, urlopen=urlopen), patched(time, time=lambda: clock[0]):
+        first = probe.metrics(22012)
+        check(first == {"requestsProcessing": 2, "requestsWaiting": 1},
+              f"первое чтение: идут и ждут — как есть; скорости нет — не с чем сравнить, и она не выдумана (got {first})")
+        check(all(type(first.get(k)) is int for k in ("requestsProcessing", "requestsWaiting")),
+              "очередь — целые числа (Prometheus отдаёт 2.0), как у llama-server")
+        readings.pop(0)
+        clock[0] += 4.0
+        second = probe.metrics(22012)
+        check(second == {"requestsProcessing": 2, "requestsWaiting": 1, "promptTps": 150.0, "genTps": 40.0},
+              f"через 4 с: прирост счётчиков в секунду — промпт 600/4, генерация (120+40)/4 по обоим движкам (got {second})")
+        readings.pop(0)
+        clock[0] += 4.0
+        third = probe.metrics(22012)
+        check("promptTps" not in third and "genTps" not in third,
+              "negative: счётчики уменьшились (vLLM перезапущен) — скорости нет, а не отрицательная")
+    late = [{"prompt": 500.0}, {"prompt": 900.0, "gen": 800.0}]
+
+    def partial(url, timeout=None):
+        if url.endswith("/props"):
+            raise OSError("404")
+        body = "".join(f'vllm:{k}_tokens_total{{engine="0"}} {v}\n'
+                       for k, v in (("prompt", late[0].get("prompt")), ("generation", late[0].get("gen"))) if v)
+        return FakeResponse(body.encode())
+    probe = make_scout().cells.probe
+    with patched(urllib.request, urlopen=partial), patched(time, time=lambda: clock[0]):
+        probe.metrics(22013)
+        late.pop(0)
+        clock[0] += 4.0
+        got = probe.metrics(22013)
+    check(got == {"promptTps": 100.0},
+          f"negative: счётчик появился только во втором чтении — его скорости нет (не всё, что накоплено, за 4 с), "
+          f"у прежнего — есть (got {got})")
+
+
 def test_report_sample():
     CHECKS.section("образец отчёта — один на обе стороны:")
     from report_sample import ReportSample
@@ -447,7 +504,7 @@ def test_report_sample():
 
 for fn in (test_config, test_state, test_token, test_pairing, test_public_state, test_heartbeat_payload,
            test_heartbeat_once, test_heartbeat_pace, test_unpair, test_local_ip, test_binary_version,
-           test_live_numbers, test_report_sample):
+           test_live_numbers, test_live_numbers_vllm, test_report_sample):
     fn()
 
 sys.exit(CHECKS.finish())

@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.7.0 — 2026-09-24
+
+- **vLLM cells, ready for the move.** A start the card cannot hold is refused
+  before it runs: the controller sends what a start reserves (`vram` — vLLM
+  takes utilization × the card), and the scout checks its free memory at
+  launch, at boot too, naming the numbers, the card and the cells holding
+  it. A vLLM cell reports its queue (`requestsProcessing`,
+  `requestsWaiting`) and its token speed — vLLM 0.24 exports only counters,
+  so the rates are their growth per second between two readings; a first
+  reading, a new counter or a restarted server gives no rate.
+- **A cell that runs but does not listen yet says so.** vLLM installs and
+  loads for minutes before its port opens; the scout asks its OS which ports
+  listen (`ss`, `lsof` on macOS) and says `listening` per running cell, and
+  one still starting says its last log lines (`startingTail`), so the board
+  shows it starting and where, instead of running.
+- The metrics probe is `ServerProbe` now (it reads llama-server and vLLM).
+  The vLLM start line itself comes from the controller, which fixed it in
+  1.3.362: it used to never start on a scout.
+
 ## 2.6.0 — 2026-09-24
 
 - **Memory limits, as the controller's cells have.** On Linux a cell is
