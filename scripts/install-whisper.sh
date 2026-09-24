@@ -45,20 +45,26 @@ if ! python3 -c "import venv" 2>/dev/null; then
 fi
 
 [[ -x "${VENV}/bin/python" ]] || { info "Creating venv at ${VENV}..."; python3 -m venv "$VENV"; }
-"${VENV}/bin/python" -m pip install -q --upgrade pip
-info "Installing faster-whisper + CUDA libs (cuDNN/cuBLAS) — a few hundred MB..."
-"${VENV}/bin/python" -m pip install --upgrade \
-    faster-whisper nvidia-cudnn-cu12 nvidia-cublas-cu12
-if ! "${VENV}/bin/python" -c "import faster_whisper" 2>/dev/null; then
-  err "faster-whisper failed to import in ${VENV} — check pip output above."
-  exit 1
+# A venv that already runs whisper is left as it is. Every run used to
+# upgrade it, so installing the scout again quietly moved a working whisper
+# cell onto new CUDA libraries. To reinstall, remove the venv first.
+if "${VENV}/bin/python" -c "import faster_whisper" 2>/dev/null; then
+  info "faster-whisper is already in ${VENV} — left as it is (remove the venv to reinstall)"
+else
+  "${VENV}/bin/python" -m pip install -q --upgrade pip
+  info "Installing faster-whisper + CUDA libs (cuDNN/cuBLAS) — a few hundred MB..."
+  "${VENV}/bin/python" -m pip install faster-whisper nvidia-cudnn-cu12 nvidia-cublas-cu12
+  if ! "${VENV}/bin/python" -c "import faster_whisper" 2>/dev/null; then
+    err "faster-whisper failed to import in ${VENV} — check pip output above."
+    exit 1
+  fi
 fi
 
 "${REPO_DIR}/scripts/fetch-cell-assets.sh" run_whisper.sh whisper_server.py
 info "  installed ~/whisper_server.py + ~/run_whisper.sh"
 
-# No ufw rule here on purpose: the 8001–8099 inference range is already open, and
-# firewall changes are managed separately.
+# No ufw rule here on purpose: a whisper cell listens on one of the controller's
+# cell ports, which install.sh's summary says how to open.
 
 info "whisper ready. CARAVAN command cell → COMMAND: bash ~/run_whisper.sh \$PORT large-v3   HEALTH_PATH: /health"
 info "  (the model ~large-v3 auto-downloads from HuggingFace on first start)"

@@ -185,7 +185,7 @@ python3 -m caravan_scout.app --config config.json --state state.json
 |---|---|
 | `7990` | LAMA CARAVAN admin (controller) |
 | `8092` | this scout |
-| `8180` | llama-server on the client (default, configurable) |
+| `22001–22999` | the cells on this machine — ports the controller picks from its cell range |
 
 ## Config reference
 

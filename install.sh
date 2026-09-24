@@ -116,6 +116,11 @@ fi
 
 # ── 5. the firewall lets the controller in ───────────────────────────────────
 # The controller reaches the scout on its port and each cell on its own port.
+# The scout's port is opened here. The cells' ports are the controller's to
+# pick (its cell range, 22001–22999 unless changed there); a whole range is
+# left to the operator, who can open it to the controller's address alone.
+CELL_RANGE="22001:22999"
+CELL_HINT="the cells need the controller's cell ports (22001–22999 unless changed there): sudo ufw allow from <controller-ip> to any port ${CELL_RANGE} proto tcp"
 if on_linux && have ufw && sudo -n true 2>/dev/null \
    && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
   if ! sudo ufw status 2>/dev/null | grep -qE "^${PORT}(/tcp)?\b"; then
@@ -123,8 +128,10 @@ if on_linux && have ufw && sudo -n true 2>/dev/null \
     sudo ufw allow "${PORT}/tcp" comment 'caravan-scout' >/dev/null \
       || warn "could not open ${PORT}/tcp — run: sudo ufw allow ${PORT}/tcp"
   fi
+  sudo ufw status 2>/dev/null | grep -qE "^${CELL_RANGE%%:*}:" || warn "ufw is active here, and ${CELL_HINT}"
 elif on_linux && have ufw; then
   warn "If ufw is active here, the controller needs port ${PORT}: sudo ufw allow ${PORT}/tcp"
+  warn "and ${CELL_HINT}"
 fi
 
 # ── 6. wait until the scout answers, then say where it is ────────────────────

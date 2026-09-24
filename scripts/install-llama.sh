@@ -150,22 +150,6 @@ else:
     print("  config.json already has llamaServerBin + modelsBasePath")
 PYEOF
 
-  # ── open the inference port in ufw (lab subnet) ──────────────────────────────
-  # llama-server binds 0.0.0.0 but ufw would otherwise block the admin/proxy
-  # from reaching it over the network.
-  if have ufw && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
-    local node_port
-    node_port=$(python3 -c "import json,sys; print(json.load(open('$config_json')).get('llamaNodeDefaultPort') or 8180)" 2>/dev/null || echo 8180)
-    local subnet="${LLAMA_LAN_SUBNET:-}"
-    if [ -z "$subnet" ]; then
-      warn "LLAMA_LAN_SUBNET not set — open port ${node_port} for your LAN manually if remote inference is needed."
-    elif ! sudo ufw status 2>/dev/null | grep -qE "^${node_port}\b"; then
-      info "Opening ufw ${node_port}/tcp from ${subnet} for remote inference..."
-      sudo ufw allow from "$subnet" to any port "$node_port" comment 'llama-node remote inference' >/dev/null 2>&1 || \
-        warn "Could not add ufw rule for port ${node_port} — open it manually."
-    fi
-  fi
-
   # ── restart the agent so it reloads config ───────────────────────────────────
   if [[ "$restart" == "1" ]] && have systemctl; then
     if systemctl --user list-unit-files 2>/dev/null | grep -q caravan-scout.service; then

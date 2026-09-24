@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.1.1 — 2026-09-24
+
+- **Installing the scout again changes nothing that works.** The whisper
+  step upgraded its venv on every run, so a reinstall quietly moved a working
+  whisper cell onto new CUDA libraries (it happened: cuDNN 9.24 → 9.26 on the
+  first reinstall). A venv where faster-whisper already imports is left as it
+  is now; remove it to reinstall.
+- **The firewall hint names the ports cells really use.** The llama.cpp step
+  told the operator to open 8180 — the port of the single llama-server of old,
+  on which no cell lives. The installer's firewall step now opens the scout's
+  port as before and names the controller's cell range (22001–22999 unless
+  changed there) with the command that opens it to the controller alone; a
+  whole range stays the operator's call. The README's port table says the same.
+
 ## 2.1.0 — 2026-09-24
 
 - **The controller adds the scout; the machine only installs it.** On the

@@ -112,7 +112,87 @@ def test_the_rule_can_fail():
           "negative: помощник с функцией и запуском за BASH_SOURCE — нарушения нет")
 
 
-for fn in (test_the_installer, test_one_command, test_the_rule_can_fail):
+FAKE_PYTHON = r"""#!/usr/bin/env bash
+echo "$*" >> "$FAKE_LOG"
+if [[ "$1" == "-c" && "$2" == "import faster_whisper" ]]; then
+  [[ -f "$FAKE_STATE/installed" ]] && exit 0 || exit 1
+fi
+if [[ "$1" == "-m" && "$2" == "pip" && "$*" == *faster-whisper* ]]; then touch "$FAKE_STATE/installed"; fi
+exit 0
+"""
+
+
+def run_whisper_install(tmp, installed):
+    """install-whisper.sh, for real, on a pretend Linux GPU box: a fake venv
+    python that writes down every call, fake uname and nvidia-smi, HOME and
+    the repo in `tmp`. Returns (exit code, output, the python calls)."""
+    repo = tmp / "repo" / "scripts"
+    repo.mkdir(parents=True)
+    for name in ("install-whisper.sh", "fetch-cell-assets.sh"):
+        (repo / name).write_text(read_real(name), encoding="utf-8")
+        (repo / name).chmod(0o755)
+    fake_bin, venv_bin, state = tmp / "bin", tmp / "venv" / "bin", tmp / "state"
+    for d in (fake_bin, venv_bin, state, tmp / "home"):
+        d.mkdir(parents=True, exist_ok=True)
+    for name, body in (("uname", "#!/usr/bin/env bash\necho Linux\n"),
+                       ("nvidia-smi", "#!/usr/bin/env bash\nexit 0\n")):
+        (fake_bin / name).write_text(body)
+        (fake_bin / name).chmod(0o755)
+    (venv_bin / "python").write_text(FAKE_PYTHON)
+    (venv_bin / "python").chmod(0o755)
+    if installed:
+        (state / "installed").touch()
+    log = tmp / "calls.log"
+    env = {**os.environ, "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}", "HOME": str(tmp / "home"),
+           "VENV": str(tmp / "venv"), "FAKE_LOG": str(log), "FAKE_STATE": str(state)}
+    # One door opened on purpose: the script runs against fakes in `tmp` only.
+    with patched(subprocess, Popen=REAL["Popen"]):
+        done = REAL["run"](["bash", str(repo / "install-whisper.sh")], capture_output=True, text=True,
+                           env=env, timeout=60)
+    calls = log.read_text().splitlines() if log.exists() else []
+    return done.returncode, done.stdout + done.stderr, calls
+
+
+def test_a_rerun_changes_nothing():
+    CHECKS.section("повторная установка не трогает работающее (2.1.1):")
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        code, out, calls = run_whisper_install(Path(tmp), installed=True)
+    pip = [c for c in calls if c.startswith("-m pip")]
+    check(code == 0 and pip == [] and "left as it is" in out,
+          f"defect-history: venv, где whisper уже импортируется, остаётся как есть — повторный запуск "
+          f"обновил cuDNN под работающей ячейкой (pip: {pip})")
+    with tempfile.TemporaryDirectory() as tmp:
+        code, out, calls = run_whisper_install(Path(tmp), installed=False)
+    pip = [c for c in calls if c.startswith("-m pip")]
+    check(code == 0 and pip == ["-m pip install -q --upgrade pip",
+                                "-m pip install faster-whisper nvidia-cudnn-cu12 nvidia-cublas-cu12"],
+          f"negative: пустой venv получает whisper — одна установка, без --upgrade пакетов (pip: {pip}, код {code})")
+
+
+def test_the_firewall_hint():
+    CHECKS.section("подсказка про файрвол называет настоящие порты (2.1.1):")
+    installer = (ROOT / "install.sh").read_text(encoding="utf-8")
+    llama = read_real("install-llama.sh")
+    check("8180" not in llama and "LLAMA_LAN_SUBNET" not in llama,
+          "defect-history: install-llama.sh больше не велит открыть 8180 — порт одиночного llama-server, "
+          "на котором ячейки не живут")
+    rng = re.search(r'^CELL_RANGE="(\d+):(\d+)"$', installer, re.M)
+    check(bool(rng) and f"{rng.group(1)}–{rng.group(2)}" in installer and "${CELL_RANGE}" in installer,
+          "install.sh называет диапазон ячеек контроллера и команду, открывающую его контроллеру — "
+          "тот же диапазон в словах и в команде")
+    sibling = ROOT.parent / "lama-caravan" / "caravan" / "admin" / "paths.py"
+    if rng and sibling.exists():
+        text = sibling.read_text(encoding="utf-8")
+        base = re.search(r'CARAVAN_CELL_BASE_PORT", "(\d+)"', text)
+        span = re.search(r'CARAVAN_CELL_PORT_SPAN", "(\d+)"', text)
+        want = (int(base.group(1)), int(base.group(1)) + int(span.group(1))) if base and span else None
+        check(want == (int(rng.group(1)), int(rng.group(2))),
+              f"диапазон тот же, что у контроллера по умолчанию ({want}) — один факт на оба репозитория")
+
+
+for fn in (test_the_installer, test_one_command, test_the_rule_can_fail, test_a_rerun_changes_nothing,
+           test_the_firewall_hint):
     fn()
 
 sys.exit(CHECKS.finish())
