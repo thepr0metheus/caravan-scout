@@ -773,12 +773,25 @@ def test_start():
          "as-is: после крэша новый провал запуска прячется за старым — status показывает прошлую причину")
     same(crashed, st, "as-is: status после неудачного старта слово в слово тот же, что до него")
 
-    ws, popen = Workspace(), FakePopen()
+    ws, popen = Workspace(), FakePopen(FakeProc(pid=5153))
     lost = ws.dir / "no-such-dir" / "llama-server.22001.log"
     with faked(FakeClock(), popen=popen):
         res = outcome(CellProcess().start, str(ws.bin), [], {"port": 22001}, log_path=lost)
-    same((res, popen.calls), ({"ok": False, "error": f"[Errno 2] No such file or directory: '{lost}'"}, []),
-         "boundary: каталога лога нет — отказ ошибкой open, Popen не зовётся")
+    popen.close_logs()
+    out = dig(popen.calls, 0, 1) or {}
+    same((res, lost.is_file(), getattr(out.get("stdout"), "name", None)),
+         ({"ok": True, "pid": 5153, "port": 22001}, True, str(lost)),
+         "defect-history: каталога лога нет — был отказ ошибкой open; теперь каталог создаётся, лог открыт, "
+         "процесс запущен")
+
+    ws, popen = Workspace(), FakePopen()
+    blocked = ws.dir / "a-file"
+    blocked.write_text("not a folder")
+    with faked(FakeClock(), popen=popen):
+        res = outcome(CellProcess().start, str(ws.bin), [], {"port": 22001},
+                      log_path=blocked / "llama-server.22001.log")
+    same((res, popen.calls), ({"ok": False, "error": f"[Errno 17] File exists: '{blocked}'"}, []),
+         "negative: каталог не создать (на его месте файл) — отказ с причиной, Popen не зовётся")
 
 
 def test_start_command():

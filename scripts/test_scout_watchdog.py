@@ -17,6 +17,7 @@ Run: python3 scripts/test_scout_watchdog.py
 import contextlib
 import io
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -303,6 +304,16 @@ def test_relaunch_itself():
           "тот же argv, метка скаута с портом, окружение сверх обычного и тот же лог")
     check(again == {"ok": False, "error": "the cell is running"} and len(spawned) == 1,
           "negative: работает — второй раз не запускает")
+    gone = TMP / "logs-gone" / "llama-server.22022.log"
+    shutil.rmtree(gone.parent, ignore_errors=True)
+    q = CellProcess()
+    q._cfg = {"port": 22022}
+    q._launch = {"argv": ["/x/llama-server", "--port", "22022"], "extraEnv": {}, "log": str(gone)}
+    with patched(subprocess, Popen=popen):
+        got = q.relaunch()
+    check(got == {"ok": True, "pid": 4321} and gone.is_file()
+          and getattr(spawned[-1][1].get("stdout"), "name", None) == str(gone),
+          "папку лога убрали между запусками — перезапуск создаёт её снова, а не падает на открытии лога")
     bare = CellProcess()
     check(bare.relaunch() == {"ok": False, "error": "no launch to repeat — it was started before this scout kept one"},
           "negative: нечего повторить (запущена скаутом старше 2.5) — отказ с причиной")

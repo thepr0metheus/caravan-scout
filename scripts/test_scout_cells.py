@@ -1534,9 +1534,18 @@ def test_command_cell_refusals():
     r = start_command({"cellKind": "command", "command": "python3 srv.py", "shellLine": "exec python3 srv.py",
                        "config": {"PORT": port}}, make_cache_dir=False)
     log = r.s.models.cache_dir() / f"command-cell.{port}.log"
-    check(r.res == {"ok": False, "error": f"[Errno 2] No such file or directory: '{log}'"},
-          "as-is: ДЕФЕКТ — на хосте без папки моделей командная ячейка не стартует: её лог открывается в "
-          "несуществующей папке, а создаёт папку только загрузка модели")
+    spawn = r.popen.calls[0] if r.popen.calls else {}
+    check(r.res == {"ok": True, "pid": 7070, "port": port} and log.is_file()
+          and getattr(spawn.get("stdout"), "name", None) == str(log),
+          "defect-history: на хосте без папки моделей командная ячейка не стартовала — лог открывался в "
+          "несуществующей папке, а папку создавала только загрузка модели; теперь папку создаёт сам лог")
+    port = 22225
+    occupied = TMP / f"cache-is-a-file-{port}"
+    occupied.write_text("not a folder", encoding="utf-8")
+    r = start_command({"cellKind": "command", "command": "python3 srv.py", "shellLine": "exec python3 srv.py",
+                       "config": {"PORT": port}}, config={"modelsBasePath": str(occupied)}, make_cache_dir=False)
+    check(r.res == {"ok": False, "error": f"[Errno 17] File exists: '{occupied}'"} and r.popen.calls == [],
+          "negative: папку не создать (на её месте файл) — отказ с причиной, процесс не запущен")
 
 
 def test_command_cell_model():
@@ -1761,10 +1770,18 @@ def test_worker_log_dir_missing():
     s = make_scout({"llamaServerBin": str(LLAMA_BIN)})
     r = worker(s, port, {"MODEL_FILE": str(ABS_MODEL), "PORT": port}, model=str(ABS_MODEL), make_cache_dir=False)
     log = s.models.cache_dir() / f"llama-server.{port}.log"
-    check(s.cells.startup(port).get("error") == f"[Errno 2] No such file or directory: '{log}'"
-          and r.popen.calls == [],
-          "as-is: ДЕФЕКТ — модель по абсолютному пути, папки кэша нет: лог открывается в несуществующей папке, "
-          "ячейка не стартует")
+    spawn = r.popen.calls[0] if r.popen.calls else {}
+    check(len(r.popen.calls) == 1 and s.cells.startup(port).get("phase") == "running" and log.is_file()
+          and getattr(spawn.get("stdout"), "name", None) == str(log),
+          "defect-history: модель читается на месте, папки кэша нет — лог открывался в несуществующей папке, и "
+          "ячейка не стартовала (первая перенесённая ячейка машины контроллера); теперь папку создаёт сам лог")
+    port = 22141
+    occupied = TMP / f"cache-is-a-file-{port}"
+    occupied.write_text("not a folder", encoding="utf-8")
+    s = make_scout({"llamaServerBin": str(LLAMA_BIN), "modelsBasePath": str(occupied)})
+    r = worker(s, port, {"MODEL_FILE": str(ABS_MODEL), "PORT": port}, model=str(ABS_MODEL), make_cache_dir=False)
+    check(s.cells.startup(port).get("error") == f"[Errno 17] File exists: '{occupied}'" and r.popen.calls == [],
+          "negative: папку не создать (на её месте файл) — фаза error с причиной, процесс не запущен")
     port = 22140
     s = make_scout({"llamaServerBin": str(LLAMA_BIN)})
     r = worker(s, port, {"MODEL_FILE": str(ABS_MODEL), "PORT": port}, model=str(ABS_MODEL))

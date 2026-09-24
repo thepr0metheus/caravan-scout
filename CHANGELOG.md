@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.8.2 — 2026-09-25
+
+- **A cell's log makes its own folder.** The logs live in the model cache,
+  and only a download made that folder: a scout that reads every model in
+  place had none, and its first cell died opening its log ("No such file or
+  directory") before it ran. The folder is now made where the log opens —
+  for a llama cell, a command cell and a restart after a crash alike.
+
 ## 2.8.1 — 2026-09-25
 
 - **A llama cell starts with the environment the controller names.** A

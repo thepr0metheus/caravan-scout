@@ -152,6 +152,20 @@ class CellLog:
         # renders an unexplained failure as such.
         return "" if levelled else (lines[-1][:300] if lines else "")
 
+    def open_new(self):
+        """The file this run writes to, opened fresh: its folder made first,
+        and the previous run's log kept aside (rotate). DEVNULL without a path.
+
+        The logs live in this scout's model cache, and only a download used
+        to make that folder: a scout that reads every model in place had
+        none, and its first cell died opening its log ("No such file or
+        directory") before it ever ran."""
+        if not self.path:
+            return subprocess.DEVNULL
+        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        self.rotate()
+        return open(self.path, "w")
+
     def rotate(self, keep: int = 15) -> None:
         """Preserve the previous run's log instead of truncating it.
 
@@ -331,10 +345,8 @@ class CellProcess:
             if model_path and not Path(model_path).exists():
                 return {"ok": False, "error": f"model file not found: {model_path}"}
             cmd = [str(bp), *[str(a) for a in args]]
-            if log_path:
-                CellLog(log_path).rotate()  # keep the crashed run's log, don't truncate it
             try:
-                log_fh = open(log_path, "w") if log_path else subprocess.DEVNULL
+                log_fh = CellLog(log_path).open_new()
                 self._proc = subprocess.Popen(
                     MemoryScope.wrap(cmd),
                     stdout=log_fh,
@@ -368,10 +380,8 @@ class CellProcess:
                         "port": self._cfg.get("port")}
             self._adopted_pid = None
             cmd = ["bash", "-lc", shell_command]
-            if log_path:
-                CellLog(log_path).rotate()
             try:
-                log_fh = open(log_path, "w") if log_path else subprocess.DEVNULL
+                log_fh = CellLog(log_path).open_new()
                 self._proc = subprocess.Popen(
                     MemoryScope.wrap(cmd),
                     stdout=log_fh,
@@ -406,10 +416,8 @@ class CellProcess:
             if not spec or not spec.get("argv"):
                 return {"ok": False, "error": "no launch to repeat — it was started before this scout kept one"}
             log_path = Path(spec["log"]) if spec.get("log") else None
-            if log_path:
-                CellLog(log_path).rotate()
             try:
-                log_fh = open(log_path, "w") if log_path else subprocess.DEVNULL
+                log_fh = CellLog(log_path).open_new()
                 self._proc = subprocess.Popen(
                     MemoryScope.wrap(list(spec["argv"])),
                     stdout=log_fh,
