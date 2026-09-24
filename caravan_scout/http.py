@@ -80,6 +80,9 @@ class Api:
             "/api/llama-node/update-status": lambda: s.builds.status(),
             "/api/llama-node/builds": lambda: s.builds.archive(),
             "/api/llama-node/list-cache": lambda: {"ok": True, "models": s.models.listing()},
+            # vLLM in this machine's venv: version, history, the install job.
+            "/api/vllm": lambda: s.vllm.info(),
+            "/api/vllm/update-status": lambda: s.vllm.job.status(),
         }
         # Asked with a query: path -> fn(the query's first values).
         self.get_query: dict[str, Callable[[dict[str, str]], Any]] = {
@@ -98,6 +101,7 @@ class Api:
             "/api/host/poweroff": lambda body: self.power.issue("poweroff"),
             "/api/llama-node/stop": lambda body: (s.cells.stop(body().get("port")), 200),
             "/api/llama-node/update": lambda body: (s.builds.start_update(body()), 200),
+            "/api/vllm/update": lambda body: (s.vllm.start_update(body()), 200),
             "/api/llama-node/restore": self._restore,
             # The operator hid the "fresh build, crashing cells" banner: for this build.
             "/api/llama-node/suspect-dismiss": lambda body: (s.suspect.dismiss(), 200),

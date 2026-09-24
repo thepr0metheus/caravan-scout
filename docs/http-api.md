@@ -21,6 +21,8 @@ nothing about the agents or clients on it.
 | `/api/llama-node/list-cache` | Contents of the local model cache. |
 | `/api/llama-node/update-status` | The llama.cpp update job: running/done, return code, the last 200 lines. |
 | `/api/llama-node/builds` | Archived llama.cpp builds on this host, newest first. |
+| `/api/vllm` | vLLM in this machine's `~/vllm-venv` (2.9+): `{ok, installed, version, venv, history: [{version, seenAt}], job}` — the version read from its dist-info folder, the versions the venv has had (newest first, five kept: the rollback candidates) and the install job, briefly. |
+| `/api/vllm/update-status` | The vLLM install job: running/done, return code, the last 200 lines (2.9+). |
 
 ## POST
 
@@ -34,6 +36,7 @@ nothing about the agents or clients on it.
 | `/api/llama-node/autostart` | Autostart of one cell (2.4+): `{port, enabled, payload}`. On keeps `payload` — the very request `/api/llama-node/start` takes — and the scout starts the cell when its machine boots: on the first scout start of a boot only (the machine's boot id), so a scout update never brings back a cell the operator stopped. A start of an autostart cell refreshes the kept request. Off drops it. Answers `{ok, port, autostart: [ports]}`; 400 for a bad port or an on without a request. |
 | `/api/llama-node/update` | Start a llama.cpp update job: `{tag?}` — empty is the latest release; a commit works too. 409 while one runs. |
 | `/api/llama-node/restore` | Restore an archived build: `{id}`. |
+| `/api/vllm/update` | Install another vLLM into `~/vllm-venv` (2.9+): `{version?}` — empty is the latest release (`pip install --upgrade vllm`), a version pins it (`vllm==X`; a rollback is an older pin). The current version goes into the history first. Its own background job, apart from the llama.cpp build's: 409 while one runs; 400 for a version that is not one, or when the venv does not exist yet (the first vLLM cell start provisions it). Running cells keep their vLLM until restarted. |
 | `/api/llama-node/suspect-dismiss` | Hide the "fresh build, crashing cells" banner for the current build (2.6+); a new build can raise it again. |
 | `/api/llama-node/purge-cache` | Manually clear the model cache (safe variant). |
 | `/api/llama-node/configs/delete` | Delete a saved launch config by `filename`. |

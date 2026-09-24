@@ -14,6 +14,7 @@ from caravan_scout.saved_configs import SavedConfigs
 from caravan_scout.state import ScoutState
 from caravan_scout.suspect import CrashSuspect
 from caravan_scout.telemetry import Telemetry
+from caravan_scout.vllm import VllmVenv
 from caravan_scout.watchdog import Watchdog
 
 
@@ -36,6 +37,9 @@ class Scout:
         # purge are asked over HTTP.
         self.models = self.cells.models
         self.builds = LlamaBuilds(self.config)
+        # The venv the controller's vLLM start line uses ($HOME/vllm-venv);
+        # the versions it had are kept next to the state, like the configs.
+        self.vllm = VllmVenv(Path.home() / "vllm-venv", self.state.path.parent / "vllm-versions.json")
         self.configs = SavedConfigs(self.state.path.parent / "llama-node-configs")
         self.autostart = Autostart(self.state, self.cells, self.machine)
         self.suspect = CrashSuspect(self.state, self.builds)

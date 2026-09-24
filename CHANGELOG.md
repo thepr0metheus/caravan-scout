@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.9.0 — 2026-09-25
+
+- **vLLM on this machine, its versions and its updates.** The controller
+  updated and rolled back vLLM in its own machine's venv only; a machine
+  with a scout had no way to move its vLLM, and the controller's machine
+  runs its cells through its scout now. The scout answers for
+  `~/vllm-venv` — the venv the controller's vLLM start line provisions and
+  runs: `GET /api/vllm` (the version from its dist-info folder, the
+  versions it has had — five, newest first: the rollback candidates, kept
+  next to state.json — and the install job), `POST /api/vllm/update`
+  `{version?}` (the latest release, or a pinned version: a rollback) and
+  `GET /api/vllm/update-status`. The install is a job of its own, apart
+  from the llama.cpp build's (`BackgroundJob`, the build's job taken out
+  of `LlamaBuilds`), so it never shows as "building…" on the board.
+
 ## 2.8.2 — 2026-09-25
 
 - **A cell's log makes its own folder.** The logs live in the model cache,

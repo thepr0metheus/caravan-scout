@@ -102,7 +102,9 @@ systemd/launchd units); the code lives in the package:
 | `watchdog.py` | `Watchdog` — a crashed cell launched again the same way after 10 s, at most 3 times in 10 minutes, and the crash note the board shows |
 | `telemetry.py` | `Telemetry` — the machine's cards and processor, a sample a second while a board watches (ten seconds otherwise), ten minutes kept, for the board's charts |
 | `suspect.py` | `CrashSuspect` — cells crashing soon after a fresh llama.cpp build: the incident kept per build, dismissed per build, and the archived build to offer |
-| `builds.py` | `LlamaBuilds` — llama.cpp on this machine: the binary's version and date, the update/restore job and its ring buffer, the archive of earlier builds |
+| `builds.py` | `LlamaBuilds` — llama.cpp on this machine: the binary's version and date, the update/restore job, the archive of earlier builds |
+| `job.py` | `BackgroundJob` — one long job at a time (a llama.cpp build, a vLLM install): a thread, its output in a ring buffer, the whole and the slim status, the refusal while one runs |
+| `vllm.py` | `VllmVenv` — vLLM in `~/vllm-venv`: the installed version, the versions it had (the rollback candidates), the pip job that installs another |
 | `saved_configs.py` | `SavedConfigs` — launch parameters saved by hand as `llama-node.bak.<stamp>.json` |
 | `cell_assets.py` | `CellAssets` — before a command cell starts, the files its launcher runs are brought up to the controller's copies (by sha256); never blocks a start |
 | `starts.py` | `CellStart` → `LlamaStart` (checked on the request) + `LlamaLaunch` (download, artifacts, start, register — in the background) and `CommandStart` (all on the request); `CellArtifacts` — start.sh and cell.json under `var/server-cells/<port>/` |
@@ -119,6 +121,6 @@ its short list of exceptions — `__init__.py`, `paths.py`, `app.py`, each with
 its reason — and a subclass that leaves its parent's `NotImplementedError`
 method unimplemented.
 
-Layering is strict: `paths`/`errors` ← `config`/`state`/`process`/`builds`/`saved_configs` ← `machine`/`starts` ← `cells` ← `report` ← `heartbeat` ← `scout` ←
+Layering is strict: `paths`/`errors` ← `job` ← `config`/`state`/`process`/`builds`/`vllm`/`saved_configs` ← `machine`/`starts` ← `cells` ← `report` ← `heartbeat` ← `scout` ←
 `http` ← `app`. State lives in `state.json` next to the config; per-node
 launch artifacts under `var/server-cells/<port>/`.
