@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The installer sources only helpers that are safe to source.
 
-install.sh sourced install-whisper.sh and then called install_whisper. That
+install.sh (then scripts/install.sh) sourced install-whisper.sh and then called install_whisper. That
 helper is a script of its own: it defines no such function, and it exits
 early on a host with no NVIDIA GPU. Sourced, its `exit 0` ended the installer
 before its summary; on a GPU host the missing function failed the install at
@@ -15,12 +15,14 @@ The rule, checked by reading the scripts:
 
 Run: python3 scripts/test_scout_install.py
 """
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _scout_harness import Checks  # noqa: E402
+from _scout_harness import REAL, Checks, patched  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "scripts"
@@ -60,11 +62,37 @@ def read_real(name):
 
 def test_the_installer():
     CHECKS.section("установщик подключает только безопасные помощники:")
-    installer = (SCRIPTS / "install.sh").read_text(encoding="utf-8")
+    installer = (ROOT / "install.sh").read_text(encoding="utf-8")
     check(installer_problems(installer, read_real) == [],
           "install.sh: подключает install-llama.sh, тот определяет install_llama и прячет свой запуск за BASH_SOURCE")
     check('bash "$INSTALL_DIR/scripts/install-whisper.sh"' in installer,
           "install-whisper.sh запускается отдельным процессом")
+
+
+def test_one_command():
+    CHECKS.section("установка одной командой, сопряжение — с контроллера (2.1):")
+    installer = (ROOT / "install.sh").read_text(encoding="utf-8")
+    uninstaller = (ROOT / "uninstall.sh").read_text(encoding="utf-8")
+    for name in ("install.sh", "uninstall.sh"):
+        path = ROOT / name
+        # One door opened on purpose: `bash -n` parses the script and runs nothing.
+        with patched(subprocess, Popen=REAL["Popen"]):
+            syntax = REAL["run"](["bash", "-n", str(path)], capture_output=True, text=True)
+        check(syntax.returncode == 0 and os.access(path, os.X_OK),
+              f"{name} в корне репозитория: исполняемый, bash его разбирает ({syntax.stderr.strip()[:80]})")
+    check(not (SCRIPTS / "install.sh").exists(), "negative: второго установщика в scripts/ нет — один путь")
+    check("--admin-url" not in installer and "ADMIN_URL" not in installer
+          and not re.search(r"controllerUrl['\"]\]\s*=", installer),
+          "negative: адрес контроллера установщик не спрашивает и не пишет — сопрягает контроллер")
+    check("systemctl --user restart caravan-scout.service" in installer and "enable-linger" in installer,
+          "служба запущена сразу и переживает выход из системы")
+    check("/api/pairing" in installer and "Add scout" in installer,
+          "в конце — адрес и порт от самого скаута и где их ввести: Model servers → ＋ Add scout")
+    stop_at, disable_at = uninstaller.find("/api/llama-node/stop"), uninstaller.find("disable --now")
+    check(0 <= stop_at < disable_at,
+          "удаление сначала останавливает ячейки через скаут, потом службу — llama-server не остаётся сиротой на GPU")
+    check("X-Caravan-Token" in uninstaller and "print(token" not in uninstaller.replace(" ", ""),
+          "токен флота для остановки берётся из config.json в заголовок и не печатается")
 
 
 def test_the_rule_can_fail():
@@ -84,7 +112,7 @@ def test_the_rule_can_fail():
           "negative: помощник с функцией и запуском за BASH_SOURCE — нарушения нет")
 
 
-for fn in (test_the_installer, test_the_rule_can_fail):
+for fn in (test_the_installer, test_one_command, test_the_rule_can_fail):
     fn()
 
 sys.exit(CHECKS.finish())

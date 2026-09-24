@@ -41,74 +41,83 @@ install_llama() {
     return 0
   fi
 
-  info "NVIDIA GPU detected — building llama.cpp with CUDA"
+  # CUDA installs itself under /usr/local/cuda, which a non-login shell's PATH
+  # does not include: nvcc looked missing on a machine that had it, and the
+  # toolkit was about to be installed a second time from apt.
+  [[ -d /usr/local/cuda/bin ]] && export PATH="/usr/local/cuda/bin:${PATH}"
 
-  # ── toolchain ──────────────────────────────────────────────────────────────
-  if ! have nvcc; then
-    info "Installing CUDA toolkit + build deps (nvidia-cuda-toolkit, cmake, build-essential, git)..."
-    sudo apt-get update -qq
-    sudo apt-get install -y nvidia-cuda-toolkit cmake build-essential git
-  else
-    have cmake || sudo apt-get install -y cmake build-essential git
-  fi
-  if ! have nvcc; then
-    err "nvcc still not on PATH after install — cannot build CUDA llama.cpp."
-    return 1
-  fi
-
-  # ── resolve tag ──────────────────────────────────────────────────────────────
-  if [[ -z "$llama_tag" ]]; then
-    info "Fetching latest llama.cpp release tag..."
-    if have curl; then
-      llama_tag=$(curl -fsSL "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest" \
-        | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" 2>/dev/null || echo "")
-    fi
-    if [[ -z "$llama_tag" ]]; then
-      llama_tag="master"
-      warn "Could not fetch latest tag — using master branch"
-    else
-      info "  latest tag: $llama_tag"
-    fi
-  else
-    info "Using pinned llama.cpp tag: $llama_tag"
-  fi
-
-  # ── clone / update ───────────────────────────────────────────────────────────
-  if [[ -d "${llama_dir}/.git" ]]; then
-    info "llama.cpp exists at ${llama_dir}, fetching..."
-    git -C "$llama_dir" fetch --tags -q
-    git -C "$llama_dir" checkout "$llama_tag" -q 2>/dev/null || \
-      git -C "$llama_dir" checkout "tags/${llama_tag}" -q 2>/dev/null || \
-      git -C "$llama_dir" checkout master -q
-  else
-    info "Cloning llama.cpp @ ${llama_tag}..."
-    if [[ "$llama_tag" == "master" ]]; then
-      git clone --depth 1 https://github.com/ggml-org/llama.cpp "$llama_dir"
-    else
-      git clone --depth 1 --branch "$llama_tag" \
-        https://github.com/ggml-org/llama.cpp "$llama_dir"
-    fi
-  fi
-
-  # ── build ────────────────────────────────────────────────────────────────────
   local llama_bin="${llama_dir}/build/bin/llama-server"
   if [[ -f "$llama_bin" ]]; then
-    info "llama-server already built at $llama_bin"
+    # Built already: nothing to install, nothing to fetch. The checkout used to
+    # move to the latest tag here while the binary stayed as it was — source
+    # and binary of two different builds. Updating is the update job's work
+    # (scripts/update-llama.sh), which rebuilds what it checks out.
+    info "llama-server already built at $llama_bin — keeping it"
   else
+    info "NVIDIA GPU detected — building llama.cpp with CUDA"
+
+    # ── toolchain ──────────────────────────────────────────────────────────────
+    if ! have nvcc; then
+      info "Installing CUDA toolkit + build deps (nvidia-cuda-toolkit, cmake, build-essential, git)..."
+      sudo apt-get update -qq
+      sudo apt-get install -y nvidia-cuda-toolkit cmake build-essential git
+    else
+      have cmake || sudo apt-get install -y cmake build-essential git
+    fi
+    if ! have nvcc; then
+      err "nvcc still not on PATH after install — cannot build CUDA llama.cpp."
+      return 1
+    fi
+
+    # ── resolve tag ──────────────────────────────────────────────────────────────
+    if [[ -z "$llama_tag" ]]; then
+      info "Fetching latest llama.cpp release tag..."
+      if have curl; then
+        llama_tag=$(curl -fsSL "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest" \
+          | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" 2>/dev/null || echo "")
+      fi
+      if [[ -z "$llama_tag" ]]; then
+        llama_tag="master"
+        warn "Could not fetch latest tag — using master branch"
+      else
+        info "  latest tag: $llama_tag"
+      fi
+    else
+      info "Using pinned llama.cpp tag: $llama_tag"
+    fi
+
+    # ── clone / update ───────────────────────────────────────────────────────────
+    if [[ -d "${llama_dir}/.git" ]]; then
+      info "llama.cpp exists at ${llama_dir}, fetching..."
+      git -C "$llama_dir" fetch --tags -q
+      git -C "$llama_dir" checkout "$llama_tag" -q 2>/dev/null || \
+        git -C "$llama_dir" checkout "tags/${llama_tag}" -q 2>/dev/null || \
+        git -C "$llama_dir" checkout master -q
+    else
+      info "Cloning llama.cpp @ ${llama_tag}..."
+      if [[ "$llama_tag" == "master" ]]; then
+        git clone --depth 1 https://github.com/ggml-org/llama.cpp "$llama_dir"
+      else
+        git clone --depth 1 --branch "$llama_tag" \
+          https://github.com/ggml-org/llama.cpp "$llama_dir"
+      fi
+    fi
+
+    # ── build ────────────────────────────────────────────────────────────────────
     info "Building llama-server (first build ~10-20 min)..."
-    cmake -S "$llama_dir" -B "${llama_dir}/build" \
-      -DGGML_CUDA=ON \
-      -DLLAMA_BUILD_TESTS=OFF \
-      -DLLAMA_BUILD_EXAMPLES=OFF \
-      -DCMAKE_BUILD_TYPE=Release \
-      -DLLAMA_SERVER=ON \
-      -Wno-dev -DCMAKE_WARN_DEPRECATED=OFF
-    cmake --build "${llama_dir}/build" \
-      --config Release \
-      --target llama-server \
-      -j "$(nproc_safe)"
-    info "Build complete: $llama_bin"
-  fi
+      cmake -S "$llama_dir" -B "${llama_dir}/build" \
+        -DGGML_CUDA=ON \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_BUILD_EXAMPLES=OFF \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DLLAMA_SERVER=ON \
+        -Wno-dev -DCMAKE_WARN_DEPRECATED=OFF
+      cmake --build "${llama_dir}/build" \
+        --config Release \
+        --target llama-server \
+        -j "$(nproc_safe)"
+      info "Build complete: $llama_bin"
+  fi  # built already
   if [[ ! -f "$llama_bin" ]]; then
     err "Build finished but $llama_bin is missing."
     return 1

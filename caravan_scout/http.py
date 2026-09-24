@@ -46,7 +46,7 @@ class Power:
 class Api:
     """What each path does, as tables: one line per path.
 
-    The pairing page, /api/pairing and /api/health are open. Everything else
+    The scout's page, /api/pairing and /api/health are open. Everything else
     stands behind the fleet token when config.json has one: the controller
     sends it as X-Caravan-Token, the pairing form may put it in the body. No
     token configured means open (a trusted LAN). The gate stands BEFORE the
@@ -83,6 +83,8 @@ class Api:
         # path -> fn(read_body) -> (payload, status)
         self.post: dict[str, Callable[[Callable[[], dict]], tuple[Any, int]]] = {
             "/api/heartbeat": lambda body: (s.heartbeat.once(), 200),
+            # The controller lets go of this machine (its board's ✕).
+            "/api/unpair": lambda body: (s.heartbeat.unpair(), 200),
             "/api/llama-node/start": self._start,
             "/api/host/reboot": lambda body: self.power.issue("reboot"),
             "/api/host/poweroff": lambda body: self.power.issue("poweroff"),

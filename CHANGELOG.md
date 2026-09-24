@@ -1,5 +1,28 @@
 # Changelog
 
+## 2.1.0 — 2026-09-24
+
+- **The controller adds the scout; the machine only installs it.** On the
+  machine: `./install.sh` from the root of this repository — it installs
+  what the machine needs, starts the scout as a service that survives logout
+  and reboot, waits until it answers and prints its address and port. On the
+  controller: Model servers → ＋ Add scout, the address, Connect — the
+  controller hands the scout its address and fleet token and waits for the
+  first heartbeat. Its ✕ on the board lets go (`POST /api/unpair`: the scout
+  forgets the controller; its cells keep running).
+  - Gone, with no way back: `--admin-url`, `scripts/install.sh` (it is
+    `./install.sh` now) and the Pair form on the scout's page. The page only
+    reads: the machine, whether a controller has paired it, and the address
+    to enter.
+  - A scout nobody has paired records `unpaired` instead of an error every
+    minute; `/api/pairing` names the scout's port.
+  - `./uninstall.sh` takes the scout off: the cells first, through the scout
+    itself, then the service and the scout's files; it names what it left.
+  - The installer leaves a built llama-server alone: it used to move the
+    llama.cpp checkout to the latest tag while the binary stayed as it was —
+    source and binary of two builds. And it finds CUDA under
+    /usr/local/cuda instead of installing the toolkit a second time.
+
 ## 2.0.1 — 2026-09-24
 
 - **The model cache is purged fully on Python 3.9** — the macOS scout's.

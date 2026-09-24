@@ -12,9 +12,10 @@ from caravan_scout.errors import AppError
 class Heartbeat:
     """The heartbeat to the controller: one beat is the report POSTed to
     <controllerUrl>/api/topology/client-heartbeat; the loop beats forever;
-    pairing points the scout at a controller and beats once to show whether
-    that works. Every outcome is written to state.json — the pairing page and
-    /api/state read it there.
+    pairing — which the CONTROLLER does, from its board — points the scout at
+    it and beats once to show whether that works; unpairing lets go. Every
+    outcome is written to state.json — the scout's page and /api/state read
+    it there.
     """
 
     def __init__(self, config, state, report, cells):
@@ -53,14 +54,19 @@ class Heartbeat:
         return self.post_json(url, self.report.heartbeat())
 
     def loop(self) -> None:
-        """Beat forever, writing each outcome down."""
+        """Beat forever, writing each outcome down. A scout nobody has paired
+        yet has nobody to beat to: it records that it waits, rather than an
+        error every minute."""
         while True:
             started = int(time.time())
-            try:
-                result = self.once()
-                status = {"state": "ok", "lastAt": started, "result": result}
-            except Exception as exc:
-                status = {"state": "error", "lastAt": started, "error": str(exc)}
+            if not self.config.get("controllerUrl"):
+                status = {"state": "unpaired"}
+            else:
+                try:
+                    result = self.once()
+                    status = {"state": "ok", "lastAt": started, "result": result}
+                except Exception as exc:
+                    status = {"state": "error", "lastAt": started, "error": str(exc)}
             self.record(status)
             # Use a short interval during llama-node startup so the admin UI
             # receives download/loading progress updates in near-real-time.
@@ -75,10 +81,10 @@ class Heartbeat:
         """Whether a pairing may bring a fleet token this scout does not hold.
 
         When the controller's token is rotated, a paired scout still holds the
-        old one — and the pairing page, the way to hand it the new one, was
-        closed by that old token: the new token in the form was checked
-        against the old one and refused. The way back was editing config.json
-        by hand on the machine.
+        old one, and a pairing bringing the new one was checked against the
+        old one and refused. The way back was editing config.json by hand on
+        the machine. Since 2.1 the controller adds the scout again from its
+        board, with its new token, and this is what lets that through.
 
         A new token is taken only for the SAME controller, and only after that
         controller accepts a heartbeat carrying it: whoever brings it knows
@@ -104,10 +110,20 @@ class Heartbeat:
         print("[pairing] the controller accepted a fleet token this scout did not hold — taking it")
         return True
 
+    def unpair(self) -> dict[str, Any]:
+        """The controller lets go of this machine: the scout forgets its address
+        and token and stops beating. Its cells keep running — stopping them
+        is a separate request, made before this one when wanted."""
+        self.config.unpair()
+        self.record({"state": "unpaired"})
+        print("[pairing] unpaired: the controller let go of this machine")
+        return {"ok": True}
+
     def pair(self, raw_url: str, raw_token: str = "") -> dict[str, Any]:
-        """Point the scout at a controller: store its address (and token) in
-        config.json and try one heartbeat right away, so the pairing page can
-        show success or failure without waiting a cycle."""
+        """Point the scout at a controller — the controller calls this when it
+        adds the scout: store its address (and token) in config.json and try
+        one heartbeat right away, so the controller learns at once whether the
+        scout can reach it back."""
         url = self.config.pair(raw_url, raw_token)
         try:
             result = self.once()

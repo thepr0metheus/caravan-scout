@@ -15,8 +15,8 @@ from caravan_scout.paths import DEFAULT_CONFIG
 class ScoutConfig:
     """config.json, read once and merged over DEFAULT_CONFIG.
 
-    Read like a dict (get, []); the one writer is pair(), which is also the
-    only thing that changes the file on disk.
+    Read like a dict (get, []); its writers are pair() and unpair(), the only
+    things that change the file on disk.
     """
 
     def __init__(self, path: Path):
@@ -72,24 +72,46 @@ class ScoutConfig:
         merged defaults, which do not belong in the user's file — and take it
         into the running config. Returns the address as stored."""
         url = self.controller_address(raw_url)
-        raw: dict[str, Any] = {}
-        if self.path.exists():
-            try:
-                loaded = json.loads(self.path.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    raw = loaded
-            except Exception:
-                raw = {}
+        raw = self._raw()
         raw["controllerUrl"] = url
         token = str(raw_token or "").strip()
         if token:
             raw["controllerToken"] = token
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        tmp.replace(self.path)
+        self._write(raw)
         with self._lock:
             self.data["controllerUrl"] = url
             if token:
                 self.data["controllerToken"] = token
         return url
+
+    def unpair(self) -> None:
+        """Forget the controller: its address and its token leave config.json
+        and the running config. The machine, its cells and the rest of the file
+        stay; the scout waits to be paired again — by any controller, since
+        without a token nothing is closed (a trusted LAN, as on a fresh
+        install)."""
+        raw = self._raw()
+        raw.pop("controllerUrl", None)
+        raw.pop("controllerToken", None)
+        self._write(raw)
+        with self._lock:
+            self.data["controllerUrl"] = ""
+            self.data.pop("controllerToken", None)
+
+    def _raw(self) -> dict[str, Any]:
+        """config.json as the user's file holds it — without the defaults,
+        which do not belong in it. {} when it is missing or unreadable."""
+        if self.path.exists():
+            try:
+                loaded = json.loads(self.path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    return loaded
+            except Exception:
+                pass
+        return {}
+
+    def _write(self, raw: dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(self.path)

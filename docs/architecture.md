@@ -35,6 +35,13 @@ inventory, compute apps, the llama.cpp build and its update job, the scout's
 version (`scoutVersion`), and per-cell `llamaNodes` — the same fields, under
 the same names, as `/api/state`.
 
+**Pairing (down).** The controller pairs the scout, from its board: the
+operator enters the machine's address, the controller reads the scout's open
+`/api/pairing`, then posts its own address and fleet token to
+`/api/controller-url`; the scout saves them and beats once. `/api/unpair`
+lets go. A freshly installed scout waits, unpaired, and records that it waits
+instead of an error every minute.
+
 **Commands (down).** The controller calls the scout's HTTP surface (see
 [http-api.md](http-api.md)): llama-node start/stop/purge-cache/configs,
 llama.cpp update and restore, `nvidia-smi` snapshots, listening ports, and
@@ -83,7 +90,7 @@ systemd/launchd units); the code lives in the package:
 | `errors.py` | `AppError` (HTTP-visible failures) |
 | `machine.py` | `Machine` — the host as its OS tells it: NVIDIA GPUs and the processes on them, CPU/RAM, who ufw lets in, listening ports, raw `nvidia-smi`, the address facing the controller; the caches that keep polling cheap |
 | `process.py` | `CellProcess` — one cell's process: start, adopt, stop, status; `CellLog` — the log kept across runs and read for a crash reason; `HostProcesses` — a process found again by its command line or by the port it serves |
-| `report.py` | `Report` — what the scout says about its machine: `public()` for /api/state, `heartbeat()` for the beat (same facts, same names), `pairing()` for the pairing page |
+| `report.py` | `Report` — what the scout says about its machine: `public()` for /api/state, `heartbeat()` for the beat (same facts, same names), `pairing()` for the scout's page and the controller's first look |
 | `heartbeat.py` | `Heartbeat` — one beat to the controller, the loop of beats, and pairing; each outcome written to state.json |
 | `models.py` | `ModelFetcher` — the model cache: download from the controller with retries, verify, clean up, purge; reports progress through a callback |
 | `cells.py` | `Cell` (one port); `Cells` — the table by port, startup records, the views the controller reads, re-adoption after a restart, stray reaping, stop, the safe purge, and the model cache the cells own; `CellRecords` (state.json `cells`); `LlamaProbe` (a server's /metrics and /props) |
@@ -95,7 +102,7 @@ systemd/launchd units); the code lives in the package:
 | `state.py` | `ScoutState` — state.json as a dict with one lock and an atomic save; drops 1.x agent keys once |
 | `scout.py` | `Scout` — the machine's scout, put together: the config, the state, the machine, the cells (and their model cache), the llama.cpp builds, the saved configs, the report and the heartbeat |
 | `http.py` | `Api` — the `:8092` surface as tables, one line per path, behind the fleet-token gate; `ScoutHandler` — one request answered from them; `Power` — reboot and poweroff, each on its own path |
-| `webui.py` | `PairingPage` — the page on `GET /`, reading the open `/api/pairing` |
+| `webui.py` | `PairingPage` — the read-only page on `GET /`: the machine, its pairing, the address to enter on the controller; reads the open `/api/pairing` |
 | `app.py` | The process entry point: arguments, the scout, re-adoption, the heartbeat thread, the server |
 
 The shape is guarded: `scripts/check_oop.py` (in CI, with a self-test that

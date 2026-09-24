@@ -15,7 +15,8 @@ class Report:
     - public(): everything, for /api/state;
     - heartbeat(): the body of a heartbeat — the same facts under the same
       names;
-    - pairing(): what the pairing page shows, open even behind a token.
+    - pairing(): what the scout's page shows and the controller reads first
+      when it adds the scout — open even behind a token.
 
     One set of names for all of them: the controller keeps whichever report
     arrived last, and a field only one of them carried was erased by the
@@ -62,10 +63,11 @@ class Report:
             }
 
     def pairing(self) -> dict[str, Any]:
-        """What the pairing page shows, and nothing more — open even when a
+        """What the scout's page shows, and nothing more — open even when a
         fleet token closes the rest. The page read /api/state, which the token
-        closes too, so on a scout that had a token the page stayed blank: the
-        very page that is for pasting the token.
+        closes too, so on a scout that had a token the page stayed blank. The
+        controller reads this first when it adds the scout: that a scout
+        answers at the address, which version, whether it holds a token.
 
         No controller reply here (the heartbeat's `result` carries the host
         record the controller keeps) and nothing a caller could act on.
@@ -80,6 +82,8 @@ class Report:
             "hostId": self.config.get("hostId"),
             "hostname": socket.gethostname(),
             "ip": self.machine.address(),
+            # What the operator types on the controller: address and this port.
+            "port": int(self.config.get("listenPort") or 8092),
             "platform": sys.platform,
             "gpus": [str(g.get("name") or g.get("model") or "GPU") for g in gpus],
             "cells": {"running": sum(1 for n in nodes if n.get("running")), "total": len(nodes)},

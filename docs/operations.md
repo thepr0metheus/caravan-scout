@@ -2,18 +2,29 @@
 
 ## Install
 
-One-liner on a fresh scout host (Linux or macOS):
+On the machine being added (Linux or macOS):
 
 ```sh
 git clone <your-remote>/caravan-scout.git ~/projects/caravan-scout
 cd ~/projects/caravan-scout
-bash scripts/install.sh --admin-url http://<controller-ip>:7990
+./install.sh
 ```
 
-`install.sh` is idempotent: writes `config.json` (host id, controller URL),
-installs the systemd `--user` unit (Linux) or LaunchAgent (macOS), builds
-llama.cpp with CUDA when an NVIDIA GPU is present (`scripts/install-llama.sh`),
-and on NVIDIA hosts provisions the faster-whisper server (`install-whisper.sh`).
+`install.sh` is idempotent and runs the scout where it was cloned: builds
+llama.cpp with CUDA when an NVIDIA GPU is present (`scripts/install-llama.sh`,
+which leaves an already built binary and its checkout alone), provisions the
+faster-whisper server on NVIDIA hosts (`install-whisper.sh`), installs and
+starts the systemd `--user` unit (Linux, with lingering so it survives
+logout and reboot) or the LaunchAgent (macOS), opens the scout's port in ufw
+when it can, waits for `/api/pairing` to answer and prints the address and
+port. It writes no controller address: the controller pairs the scout from
+its board (Model servers → ＋ Add scout) through `POST /api/controller-url`,
+and lets go of it through `POST /api/unpair`.
+
+`uninstall.sh` stops the cells through the scout's own API, then removes the
+service and the scout's files (config, state, cell artifacts, logs), and
+names what it left: the llama.cpp build, the model cache, the whisper venv,
+the clone.
 
 Manual start:
 
@@ -52,9 +63,10 @@ llama-server that is in no record — an orphan holding a GPU and a port
 The essentials: `hostId`, `controllerUrl`, `llamaServerBin`, `modelsBasePath`,
 and `controllerToken` when the controller has sign-in enabled.
 
-`controllerUrl` can also be set from a browser: open `http://<host>:8092/`
-and use the Pair form — it rewrites `config.json` atomically and fires an
-immediate heartbeat (no restart needed).
+`controllerUrl` and `controllerToken` are written by the controller when it
+adds the scout (`POST /api/controller-url`: atomic rewrite, an immediate
+heartbeat, no restart) and removed when it lets go (`POST /api/unpair`). The
+page on `http://<host>:8092/` only reads.
 
 Runtime files (never in git): `state.json` (heartbeat status and the `cells`
 registry; a 1.x state's `assignments`/`applyStatus` are dropped once at

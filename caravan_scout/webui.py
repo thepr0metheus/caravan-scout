@@ -1,13 +1,14 @@
-"""The pairing page on GET /."""
+"""The scout's page on GET /."""
 from __future__ import annotations
 
 
 class PairingPage:
-    """The page on GET / that lets a novice point this host at a LAMA CARAVAN
-    controller from a browser instead of editing config.json.
+    """The page on GET /: what this machine is, whether a controller has
+    paired it, and — while none has — the address to enter on the
+    controller's board (Model servers → ＋ Add scout).
 
-    It reads /api/pairing, which stays open when a fleet token closes the
-    rest: the page for pasting the token must work before the token does.
+    Read-only since 2.1: the controller pairs the scout, not the other way
+    round. The page reads /api/pairing, which stays open behind a fleet token.
     """
 
     HTML = """<!doctype html>
@@ -38,20 +39,7 @@ class PairingPage:
   .pill.ok    { background: #133b26; color: #58d68d; }
   .pill.err   { background: #3b1616; color: #ec7063; }
   .pill.off   { background: #2a2e3b; color: #9a9aa5; }
-  form { display: flex; gap: 8px; margin-top: 6px; }
-  input[type=url], input[type=text] {
-    flex: 1; background: #12141a; color: #e6e6ea; border: 1px solid #2a2e3b;
-    border-radius: 8px; padding: 9px 12px; font-size: 14px; }
-  input:focus { outline: none; border-color: #4a7dbd; }
-  button { background: #2e6bb0; color: #fff; border: 0; border-radius: 8px;
-           padding: 9px 16px; font-size: 14px; cursor: pointer; }
-  button:hover { background: #3a7cc4; }
-  button:disabled { opacity: .5; cursor: default; }
   .hint { color: #8b8b96; font-size: 12.5px; margin: 8px 0 0; }
-  .msg { margin-top: 10px; font-size: 13.5px; display: none; }
-  .msg.show { display: block; }
-  .msg.ok { color: #58d68d; }
-  .msg.err { color: #ec7063; }
   a { color: #6db3f2; }
   .foot { color: #6f6f7a; font-size: 12px; margin-top: 16px; text-align: center; }
 </style>
@@ -59,7 +47,7 @@ class PairingPage:
 <body>
 <div class="wrap">
   <h1><span class="llama">&#129433;</span>Caravan Scout</h1>
-  <p class="sub">This machine is ready to join a <a
+  <p class="sub">This machine lends its hardware to a <a
      href="https://github.com/thepr0metheus/lama-caravan" target="_blank"
      rel="noopener">LAMA CARAVAN</a> fleet.</p>
 
@@ -75,22 +63,11 @@ class PairingPage:
   <div class="card">
     <h2>Controller</h2>
     <div class="row"><span class="k">Paired with</span><span class="v" id="controller">—</span></div>
-    <div class="row"><span class="k">Heartbeat</span><span class="v" id="hb"><span class="pill off">not configured</span></span></div>
-    <form id="pairForm">
-      <input type="text" id="urlInput" placeholder="http://controller-ip:7990"
-             autocomplete="off" spellcheck="false">
-      <button type="submit" id="pairBtn">Pair</button>
-    </form>
-    <input type="password" id="tokenInput" placeholder="fleet token — only if the controller requires sign-in"
-           autocomplete="off" spellcheck="false" style="margin-top:8px;width:100%">
-    <p class="hint">Enter the address of the machine running the LAMA CARAVAN
-      admin (default port <b>7990</b>). This host will start sending heartbeats
-      and appear on its topology board within a minute. If the controller has
-      accounts enabled, paste its <b>fleet token</b> too (shown in the admin's
-      System → Security panel). After the token was regenerated there, pair
-      again with the same address and the new token: this host takes it once
-      the controller accepts it.</p>
-    <p class="msg" id="msg"></p>
+    <div class="row"><span class="k">Heartbeat</span><span class="v" id="hb"><span class="pill off">not paired</span></span></div>
+    <p class="hint" id="howto">To add this machine, open the LAMA CARAVAN board
+      and use <b>Model servers → ＋ Add scout</b> with this address:
+      <b id="selfAddr">…</b>. The controller pairs the scout itself and hands
+      over its fleet token — there is nothing to enter here.</p>
   </div>
 
   <p class="foot"><span id="ver">caravan-scout</span> · HTTP API on this port — see
@@ -99,7 +76,6 @@ class PairingPage:
 </div>
 <script>
 (function () {
-  var boardUrl = "";
   function $(id) { return document.getElementById(id); }
   function esc(s) { var d = document.createElement("div"); d.textContent = s == null ? "" : String(s); return d.innerHTML; }
 
@@ -112,18 +88,18 @@ class PairingPage:
     $("gpus").textContent = gpus.length ? gpus.join(", ") : "none (CPU host)";
     var cells = st.cells || {};
     $("cells").textContent = cells.total ? cells.running + " running / " + cells.total : "none";
+    $("selfAddr").textContent = (st.ip || "?") + ":" + (st.port || 8092);
 
     var ctl = st.controllerUrl || "";
-    boardUrl = ctl;
     $("controller").innerHTML = ctl
       ? '<a href="' + esc(ctl) + '" target="_blank" rel="noopener">' + esc(ctl) + "</a>"
       : "—";
-    if (!$("urlInput").value && ctl) $("urlInput").placeholder = ctl;
+    $("howto").style.display = ctl ? "none" : "";
 
     var hb = st.heartbeat || {};
     var el = $("hb");
     if (!ctl) {
-      el.innerHTML = '<span class="pill off">not configured</span>';
+      el.innerHTML = '<span class="pill off">not paired</span>';
     } else if (hb.state === "ok") {
       var when = hb.lastAt ? new Date(hb.lastAt * 1000).toLocaleTimeString() : "";
       el.innerHTML = '<span class="pill ok">ok' + (when ? " · " + when : "") + "</span>";
@@ -138,45 +114,8 @@ class PairingPage:
   function refresh() {
     fetch("/api/pairing").then(function (r) { return r.json(); }).then(render).catch(function () {});
   }
-
-  $("pairForm").addEventListener("submit", function (ev) {
-    ev.preventDefault();
-    var url = $("urlInput").value.trim();
-    var msg = $("msg");
-    if (!url) { return; }
-    $("pairBtn").disabled = true;
-    msg.className = "msg";
-    fetch("/api/controller-url", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url: url, token: $("tokenInput").value.trim() })
-    }).then(function (r) { return r.json(); }).then(function (res) {
-      $("pairBtn").disabled = false;
-      if (res.ok) {
-        var hb = res.heartbeat || {};
-        if (hb.state === "ok") {
-          msg.className = "msg show ok";
-          msg.innerHTML = "Paired! This host should now be visible on the "
-            + '<a href="' + esc(res.controllerUrl) + '" target="_blank" rel="noopener">topology board</a>.';
-        } else {
-          msg.className = "msg show err";
-          msg.textContent = "Saved, but the controller did not answer: "
-            + (hb.error || "unknown error") + " — check the address and that the admin is running.";
-        }
-      } else {
-        msg.className = "msg show err";
-        msg.textContent = res.error || "failed";
-      }
-      refresh();
-    }).catch(function (e) {
-      $("pairBtn").disabled = false;
-      msg.className = "msg show err";
-      msg.textContent = String(e);
-    });
-  });
-
   refresh();
-  setInterval(refresh, 3000);
+  setInterval(refresh, 5000);
 })();
 </script>
 </body>

@@ -47,8 +47,8 @@ client and gives each agent a proxy port by hand.
 
 Why it's safe to adopt: standard library Python only, one JSON config, one
 small HTTP surface on `:8092`, systemd/launchd units, and the
-[pairing page](#pairing-with-a-controller-no-config-editing) means setup is
-"install, open a browser, paste the controller address".
+setup is "run `./install.sh`, then enter the printed address on the
+controller's board" ([Adding the machine](#adding-the-machine-to-a-controller)).
 
 The bigger picture — hybrid local/cloud routing, queues, schedules, spend
 accounting — is the controller's story: see
@@ -62,7 +62,7 @@ and the worked example
 |---|---|
 | OS | Linux with systemd --user, or macOS (launchd) |
 | Python | **3.9+**, standard library only — no pip packages (the macOS scout runs on the system's 3.9; CI runs the snapshots on 3.9 and 3.12) |
-| For llama cells | a `llama-server` binary on this host (`scripts/install.sh` can build it; CUDA optional) |
+| For llama cells | a `llama-server` binary on this host (`./install.sh` builds it; CUDA optional) |
 | For GPU info | NVIDIA driver + `nvidia-smi` (optional — CPU-only hosts are fine) |
 | Network | reach the controller's `:7990`; the scout listens on `:8092` |
 
@@ -102,22 +102,39 @@ Machine A (any GPU or no GPU)          Machine B (controller)
 
 ## Install
 
-One-liner on a fresh scout host (Linux or macOS):
+On the machine you are adding (Linux or macOS), from a clone of this
+repository:
 
 ```sh
 git clone <your-remote>/caravan-scout.git ~/projects/caravan-scout
 cd ~/projects/caravan-scout
-./scripts/install.sh --admin-url http://<controller-ip>:7990
+./install.sh
+```
+
+That is the whole setup on the machine. The installer puts in what the
+machine needs, starts the scout as a service that survives logout and reboot,
+waits until it answers and ends with its address and port:
+
+```text
+[install] ━━━ caravan-scout is running ━━━
+  Address : 192.0.2.23
+  Port    : 8092
+
+  Now open the LAMA CARAVAN board: Model servers → ＋ Add scout,
+  and enter 192.0.2.23 with port 8092. That is all.
 ```
 
 | Situation | What happens |
 |---|---|
-| Linux + NVIDIA GPU | Installs CUDA toolkit, builds `llama.cpp` with CUDA, sets up the model cache |
-| Linux, no GPU | Installs the scout only |
-| macOS | Installs the scout + launchd service |
+| Linux + NVIDIA GPU | CUDA toolkit if missing (asks for your password once), `llama.cpp` built with CUDA, the model cache, the whisper speech server |
+| Linux, no GPU | the scout only — CPU cells need nothing more |
+| macOS | the scout + a launchd agent; llama.cpp from Homebrew (`brew install llama.cpp`) |
 
-The host appears on the controller's Topology board within one heartbeat
-(≤ 60 s). Flags: `--admin-url <url>`, `--skip-llama`, `--llama-tag <tag>`.
+Re-running it is safe. Flags: `--skip-llama`, `--skip-whisper`,
+`--llama-tag <tag>`. `./uninstall.sh` takes the scout off again: it stops
+the cells first, then removes the service and the scout's own files, and
+names what it left (the llama.cpp build, the model cache) with the command
+that removes each.
 
 ### Speech engines (standalone, run when you want one)
 
@@ -137,34 +154,28 @@ a good RUSSIAN recognizer: GigaAM-v3 sits near 8% WER against 21-25% for
 whisper large-v3, from a 260 MB GGUF the controller ships to the cell's model
 cache on first start.
 
-## Pairing with a controller (no config editing)
+## Adding the machine to a controller
 
-If you skipped `--admin-url` (or want to re-point the host later), open the
-scout's built-in page from any browser:
+The controller pairs the scout — from its board, not from this machine. On
+the LAMA CARAVAN board open **Model servers → ＋ Add scout**, enter the
+address the installer printed (port 8092 is filled in) and press Connect.
+The controller finds the scout, hands it its own address and — when sign-in
+is on — its fleet token, and waits for the first heartbeat: the machine
+appears as a node with its GPUs, ready for cells. Connecting again is the
+connection test, and the machine's ✕ on the board lets go of it: the scout
+forgets the controller and waits to be added again.
 
-```
-http://<this-host-ip>:8092/
-```
+A scout nobody has added yet is open on the LAN, like any fresh install;
+once paired, everything but its page and `/api/health` asks for the fleet
+token. After the token is regenerated on the controller, adding the scout
+again hands over the new one.
 
-![Pairing page](docs/screenshots/pairing.png)
+The scout's own page, `http://<this-host>:8092/`, is for reading: what the
+machine has, whether a controller has paired it, and the address to enter.
 
-It shows what the scout found on this machine (GPUs, running cells) and has a
-single **Pair** field — paste the controller address
-(`http://<controller-ip>:7990`), press Pair, and the host saves it to
-`config.json`, sends a heartbeat immediately and reports whether the
-controller answered. No file editing, no restart.
-
-If the controller has sign-in enabled, paste its **fleet token** into the
-second field (the admin shows it in System → Security); it is stored as
-`controllerToken` and from then on both directions of scout ⇄ controller
-traffic authenticate with it. When the token is regenerated on the
-controller, pair again with the same address and the new token: the scout
-takes it once the controller accepts a heartbeat carrying it.
-
-Manual start:
+Manual start (without the service):
 
 ```sh
-cp examples/config.example.json config.json   # edit hostId/controllerUrl
 python3 -m caravan_scout.app --config config.json --state state.json
 ```
 
@@ -184,7 +195,6 @@ python3 -m caravan_scout.app --config config.json --state state.json
   "displayName": "host-a",
   "listenHost": "0.0.0.0",
   "listenPort": 8092,
-  "controllerUrl": "http://<controller-ip>:7990",
   "heartbeatIntervalSeconds": 60,
   "llamaServerBin": "~/llama.cpp/build/bin/llama-server",
   "modelsBasePath": "~/llama-model-cache",
@@ -195,17 +205,17 @@ python3 -m caravan_scout.app --config config.json --state state.json
 
 | Field | Description |
 |---|---|
-| `controllerUrl` | The LAMA CARAVAN admin URL the heartbeat posts to. |
+| `controllerUrl` | The LAMA CARAVAN admin URL the heartbeat posts to — written by the controller when it adds the scout. |
 | `llamaServerBin` | Path to the `llama-server` binary (set by `install.sh`). |
 | `modelsBasePath` | Local cache dir for downloaded models. |
-| `controllerToken` | The fleet token, when the controller has sign-in enabled (the pairing page stores it). |
+| `controllerToken` | The fleet token, when the controller has sign-in enabled (the controller hands it over when it adds the scout). |
 
 ## API
 
 See [docs/http-api.md](docs/http-api.md). In one line each: GET
 `health · pairing · state · llama-node/status · monitor/nvidia-smi · host/listeners ·
 llama-node/configs · llama-node/list-cache · llama-node/update-status ·
-llama-node/builds`; POST `controller-url · heartbeat · llama-node/start ·
+llama-node/builds`; POST `controller-url · unpair · heartbeat · llama-node/start ·
 llama-node/stop · llama-node/update · llama-node/restore ·
 llama-node/purge-cache · llama-node/configs/delete · host/reboot ·
 host/poweroff`.
@@ -235,8 +245,9 @@ restart the scout`. No `scp`. Runtime files (`state.json`, `var/`,
 
 ## Safety model
 
-Open by default on a trusted LAN; once a fleet token is configured, every
-endpoint except the pairing page, `/api/pairing` and `/api/health` requires
-it — and a pairing with a new token passes only when the same controller
-accepts that token. Command cells execute controller-supplied shell — do not
-expose the port beyond your LAN.
+Open until a controller adds it, on a trusted LAN; once the controller has
+handed over its fleet token, every endpoint except the scout's page,
+`/api/pairing` and `/api/health` requires it — including letting go of the
+scout, which only its controller can do. A pairing with a new token passes
+only when the same controller accepts that token. Command cells execute
+controller-supplied shell — do not expose the port beyond your LAN.

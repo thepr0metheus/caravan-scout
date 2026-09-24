@@ -286,7 +286,7 @@ def test_heartbeat_pace():
             except Stop:
                 pass
         check(slept == [want], f"{why} (got {slept})")
-    scout = make_scout()
+    scout = make_scout({"controllerUrl": "http://10.0.0.1:7990"})
 
     def fail():
         raise OSError("down")
@@ -301,6 +301,31 @@ def test_heartbeat_pace():
     check(scout.state["heartbeat"]["state"] == "error" and scout.state["heartbeat"]["error"] == "down"
           and json.loads(scout.state.path.read_text())["heartbeat"]["state"] == "error",
           "negative: пульс не прошёл — ошибка записана в состояние, петля живёт дальше")
+    idle, beats = make_scout(), []
+    with patched(idle.heartbeat, once=lambda: beats.append(1) or {"ok": True}), \
+            patched(idle.cells, views=lambda: []), patched(time, sleep=stop):
+        try:
+            idle.heartbeat.loop()
+        except Stop:
+            pass
+    check(beats == [] and idle.state["heartbeat"] == {"state": "unpaired"},
+          "скаут, которого никто не сопряг, в пустоту не стучит: в состоянии «unpaired», а не ошибка каждую минуту")
+
+
+def test_unpair():
+    CHECKS.section("контроллер отпускает машину:")
+    scout = make_scout({"controllerUrl": "http://10.0.0.1:7990", "controllerToken": "sekret", "extra": 1})
+    out = scout.heartbeat.unpair()
+    raw = json.loads(scout.config.path.read_text(encoding="utf-8"))
+    check(out == {"ok": True} and "controllerUrl" not in raw and "controllerToken" not in raw and raw.get("extra") == 1,
+          "адрес и токен контроллера ушли из config.json, остальное в файле на месте")
+    check(scout.config.get("controllerUrl") == "" and scout.config.token() == ""
+          and scout.state["heartbeat"] == {"state": "unpaired"},
+          "и из работающего конфига: токена нет — скаут открыт до следующего сопряжения; пульс «unpaired»")
+    again = make_scout()
+    again.heartbeat.unpair()
+    check(again.config.get("controllerUrl") == "" and again.state["heartbeat"] == {"state": "unpaired"},
+          "negative: отпустить скаут, которого никто не держал, — не ошибка")
 
 
 class FakeSocket:
@@ -413,8 +438,8 @@ def test_report_sample():
 
 
 for fn in (test_config, test_state, test_token, test_pairing, test_public_state, test_heartbeat_payload,
-           test_heartbeat_once, test_heartbeat_pace, test_local_ip, test_binary_version, test_live_numbers,
-           test_report_sample):
+           test_heartbeat_once, test_heartbeat_pace, test_unpair, test_local_ip, test_binary_version,
+           test_live_numbers, test_report_sample):
     fn()
 
 sys.exit(CHECKS.finish())

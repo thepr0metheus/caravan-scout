@@ -9,8 +9,8 @@ nothing about the agents or clients on it.
 
 | Path | Purpose |
 |---|---|
-| `/` | Built-in pairing page (HTML): host summary + a form that sets `controllerUrl`. |
-| `/api/pairing` | What the pairing page shows, open even with a token: host id/name/IP, platform, GPU names, cells running/total, `controllerUrl`, `tokenRequired`, heartbeat `{state, lastAt, error}` — never the controller's reply. |
+| `/` | The scout's page (HTML, read-only since 2.1): the machine, whether a controller has paired it, and the address:port to enter on the controller's board. |
+| `/api/pairing` | What the page shows, open even with a token: host id/name/IP, the scout's port, platform, GPU names, cells running/total, `controllerUrl`, `tokenRequired`, heartbeat `{state, lastAt, error}` (`state` is `unpaired` until a controller adds it) — never the controller's reply. The controller reads it first when the operator adds the scout. |
 | `/api/health` | Liveness, open even with a token: `{ok, service, version, tokenRequired, time}`. |
 | `/api/state` | The machine: host identity/IP, GPUs, CPU/RAM, compute apps, heartbeat status, llama.cpp build and update status (`llamaUpdate`), the scout's own version (`scoutVersion`), per-cell `llamaNodes`. The heartbeat pushes the same facts under the same names. |
 | `/api/llama-node/status` | Just the cells: `{ok, nodes: [...]}`. |
@@ -26,7 +26,8 @@ nothing about the agents or clients on it.
 | Path | Purpose |
 |---|---|
 | `/api/heartbeat` | Trigger one immediate heartbeat POST to the controller (the controller calls this when the Topology page opens). |
-| `/api/controller-url` | Pair this host with a controller: `{url, token?}` → validates (`http[s]://`, scheme optional in the form), writes `controllerUrl` into `config.json` (atomic, preserves the rest of the file), updates the running scout and fires one heartbeat right away. Returns `{ok, controllerUrl, heartbeat}` — `heartbeat.state` is `error` if the controller didn't answer (the URL is still saved). |
+| `/api/unpair` | The controller lets go of this machine (the ✕ on its node): `controllerUrl` and `controllerToken` leave `config.json`, the heartbeat stops (`state: unpaired`); the cells keep running. Token-gated like everything else — only the scout's controller can let go. |
+| `/api/controller-url` | Pair this host with a controller — the controller calls it when the operator adds the scout on its board: `{url, token?}` → validates (`http[s]://`, scheme optional in the form), writes `controllerUrl` into `config.json` (atomic, preserves the rest of the file), updates the running scout and fires one heartbeat right away. Returns `{ok, controllerUrl, heartbeat}` — `heartbeat.state` is `error` if the controller didn't answer (the URL is still saved). |
 | `/api/llama-node/start` | Start a server cell on this host. A llama cell needs the controller-built `args` (with `{{MODEL_PATH}}`-style placeholders), `port`, model file references to download and `cacheModels`. A command cell (`cellKind=command`) needs `shellLine` — the complete `bash -lc` sentence — plus `healthPath`, which is stored with the cell so re-adoption after a scout restart probes the right endpoint (a vLLM cell answers on `/v1/models`, not `/health`). Missing `args` or `shellLine` is refused with a version hint: this scout never assembles its own. Async: returns `{status: "starting", phase: "resolving"}` immediately; progress is visible in `/api/llama-node/status` and the fast heartbeats. |
 | `/api/llama-node/stop` | Stop one cell (`{port}`) or ALL cells (no port). Drops the cell from the fleet view and the registry; purges cached models unless the cell had `cacheModels` (safe purge — never evicts a model a sibling cell still serves). A port still held by a process the scout lost track of is reclaimed only when it is recognisably ours (its marker or the llama-server binary); an unrecognised holder is named and left alone. |
 | `/api/llama-node/update` | Start a llama.cpp update job: `{tag?}` — empty is the latest release; a commit works too. 409 while one runs. |

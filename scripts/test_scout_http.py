@@ -40,8 +40,9 @@ def test_open_paths():
     with Served(scout) as srv:
         for path in ("/", "/index.html"):
             status, body = srv.get(path)
-            check(status == 200 and isinstance(body, str) and 'id="tokenInput"' in body,
-                  f"{path} — страница сопряжения с полем токена")
+            check(status == 200 and isinstance(body, str) and 'id="selfAddr"' in body
+                  and "/api/controller-url" not in body and "<form" not in body,
+                  f"{path} — справочная страница: адрес машины для контроллера, формы сопряжения нет (2.1)")
         headers = {k.lower(): v for k, v in srv.last_headers.items()}
         check(headers.get("content-type") == "text/html; charset=utf-8" and headers.get("cache-control") == "no-cache",
               "страница — HTML в UTF-8 и не кэшируется: браузер не покажет старую после обновления скаута")
@@ -62,7 +63,7 @@ def test_open_paths():
         check(status == 200 and body["tokenRequired"] is True,
               "с токеном здоровье открыто и говорит, что токен нужен")
         status, page = srv.get("/")
-        check(status == 200 and 'id="tokenInput"' in page, "страница сопряжения открыта и с токеном")
+        check(status == 200 and 'id="selfAddr"' in page, "страница скаута открыта и с токеном")
 
 
 def test_the_token_gate():
@@ -100,14 +101,15 @@ def test_pairing_page_reads_an_open_path():
           "defect-history: страница читает /api/pairing — /api/state закрыт токеном, и при токене она была пустой")
     check(status == 200 and body == {
         "service": "caravan-scout", "version": __version__, "hostId": "box-a", "hostname": "box-a.lan",
-        "ip": "10.0.0.5", "platform": sys.platform,
+        "ip": "10.0.0.5", "port": 18092, "platform": sys.platform,
         "gpus": ["NVIDIA GeForce RTX 3090", "M", "GPU"], "cells": {"running": 1, "total": 2},
         "controllerUrl": "http://10.0.0.1:7990", "tokenRequired": True,
         "heartbeat": {"state": "ok", "lastAt": 5}},
           "открыт и при токене: машина, карты, ячейки, контроллер и пульс — ровно то, что показывает страница")
     check("result" not in body.get("heartbeat", {}) and state_status == 401,
           "negative: ответа контроллера на пульс в нём нет, а /api/state по-прежнему закрыт")
-    check("7990" in page and "8090" not in page, "подсказки страницы — порт контроллера 7990, не 8090")
+    check("Model servers" in page and "Add scout" in page and "8090" not in page,
+          "страница говорит, где добавить машину на контроллере: Model servers → ＋ Add scout")
 
 
 def test_get_routes():
@@ -273,6 +275,23 @@ def test_pairing_after_a_token_rotation():
               f"с токеном, который он держит")
 
 
+def test_unpair_route():
+    CHECKS.section("контроллер отпускает машину (/api/unpair):")
+    scout = make_scout({"controllerToken": TOKEN, "controllerUrl": "http://10.0.0.1:7990"})
+    with patched(scout.machine, gpus=lambda: [], address=lambda: "10.0.0.5"), Served(scout) as srv:
+        denied = srv.post("/api/unpair")
+        kept = scout.config.token()
+        done = srv.post("/api/unpair", headers=AUTH)
+        _status, after = srv.get("/api/pairing")
+        reopened = srv.get("/api/state?probe")[0]
+    check(denied == (401, {"error": "fleet token required (X-Caravan-Token)"}) and kept == TOKEN,
+          "negative: отпустить машину может только её контроллер — без токена 401, всё на месте")
+    check(done == (200, {"ok": True}), "со своим токеном — ok")
+    check(after.get("controllerUrl") == "" and after.get("tokenRequired") is False
+          and after.get("heartbeat") == {"state": "unpaired"} and reopened == 404,
+          "после — ни контроллера, ни токена: скаут открыт и ждёт следующего сопряжения, пульс «unpaired»")
+
+
 def test_host_power():
     CHECKS.section("перезагрузка и выключение:")
     scout = make_scout()
@@ -370,7 +389,7 @@ def test_stop_every_slot():
 
 TESTS = (test_open_paths, test_the_token_gate, test_pairing_page_reads_an_open_path, test_get_routes,
          test_errors_become_envelopes, test_post_routes, test_pairing_accepts_the_token_in_the_body,
-         test_pairing_after_a_token_rotation, test_host_power, test_stop, test_stop_every_slot)
+         test_pairing_after_a_token_rotation, test_unpair_route, test_host_power, test_stop, test_stop_every_slot)
 
 for test in TESTS:
     try:
