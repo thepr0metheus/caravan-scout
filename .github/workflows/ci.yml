@@ -16,6 +16,27 @@ jobs:
       - name: py_compile
         run: python3 -m py_compile $(git ls-files '*.py')
 
+      # What the scout does, pinned by value; the rewrite into classes was
+      # checked against these. Every door to the host (processes, signals,
+      # network) is shut in scripts/_scout_harness.py, so these cannot
+      # reboot or kill anything.
+      - name: snapshots
+        run: |
+          set -e
+          for t in scripts/test_scout_*.py; do
+            echo "== $t"
+            python3 "$t"
+          done
+
+      # The scout's shape: classes with one job each, no mixins, no modules
+      # of loose functions, no abstract method left unimplemented. The
+      # self-test plants each breakage and proves the guard goes red on it.
+      - name: oop guard
+        run: |
+          set -e
+          python3 scripts/check_oop.py
+          python3 scripts/test_check_oop.py
+
       - name: boot smoke (agent serves)
         run: |
           set -e

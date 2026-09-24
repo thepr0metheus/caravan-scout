@@ -1,42 +1,31 @@
-"""LlamaNode process wrapper + _Slot (one managed server per port)."""
+"""A cell's process on this machine and the log it writes: how it is started
+or adopted, how it stops, and what its log says when it dies."""
 from __future__ import annotations
 
-import json
 import os
 import re
 import signal
-import shlex
-import socket
 import subprocess
-import sys
 import threading
 import time
-import urllib.error
 import urllib.request
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 
-class LlamaNode:
-    """Manages a local llama-server subprocess on this host's GPU.
+class CellLog:
+    """The log a cell's process writes.
 
-    Lifecycle: start() → running → stop() or crash.
-    Thread-safe: all state access is behind self._lock.
+    A new run moves the previous run's log aside instead of truncating it,
+    and a dead process's log is read for the reason it died. A process
+    started without a log has a CellLog of nothing: nothing is kept, nothing
+    is read.
     """
 
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._proc: subprocess.Popen | None = None
-        self._adopted_pid: int | None = None  # re-attached process (not our child)
-        self._cfg: dict[str, Any] = {}
-        self._started_at: int = 0
-        self._last_error: str = ""
-        self._log_path: Path | None = None
-        self._exit_info: dict[str, Any] | None = None
+    def __init__(self, path):
+        self.path = path
 
-    @staticmethod
-    def _read_log_error(log_path: Path | None) -> str:
+    def crash_reason(self) -> str:
         """Pull a concise crash reason from the tail of the cell's log.
 
         Priority: corruption/OOM patterns first (most actionable), then any
@@ -52,6 +41,7 @@ class LlamaNode:
         print plain bash/python output with no level prefix; for those nothing
         changes and the fallback still applies, or a real traceback would vanish.
         """
+        log_path = self.path
         if not log_path:
             return ""
         try:
@@ -84,7 +74,7 @@ class LlamaNode:
         )
         # NOT level-filtered on purpose. These patterns are unambiguous failure
         # signatures — nothing benign says "corrupted or incomplete" — and the
-        # corrupted-download auto-repair (models.py _is_corruption_error) reads
+        # corrupted-download auto-repair (ModelFetcher.is_corruption_error) reads
         # this very return value. Dropping one because a build happened to log it
         # at W would cost a self-healing download to save nothing.
         for ln in reversed(tail):
@@ -111,8 +101,7 @@ class LlamaNode:
         # renders an unexplained failure as such.
         return "" if levelled else (lines[-1][:300] if lines else "")
 
-    @staticmethod
-    def _rotate_log(log_path: Path | None, keep: int = 15) -> None:
+    def rotate(self, keep: int = 15) -> None:
         """Preserve the previous run's log instead of truncating it.
 
         llama-server's stdout/stderr is opened in "w" mode on every start, which
@@ -122,6 +111,7 @@ class LlamaNode:
         (llama-server.<YYYYmmdd-HHMMSS>.log) so the crash can still be inspected.
         Keep only the most recent `keep` backups; never let logging block a start.
         """
+        log_path = self.path
         if not log_path:
             return
         try:
@@ -147,8 +137,27 @@ class LlamaNode:
         except Exception:
             pass
 
+
+class CellProcess:
+    """The process of one cell: a llama-server, or whatever a command cell
+    runs. It knows nothing of ports or phases — only its process.
+
+    Lifecycle: start()/start_command() or adopt() → running → stop() or crash.
+    Thread-safe: all state access is behind self._lock.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._proc: subprocess.Popen | None = None
+        self._adopted_pid: int | None = None  # re-attached process (not our child)
+        self._cfg: dict[str, Any] = {}
+        self._started_at: int = 0
+        self._last_error: str = ""
+        self._log = CellLog(None)
+        self._exit_info: dict[str, Any] | None = None
+
     @staticmethod
-    def _pid_alive(pid: int) -> bool:
+    def pid_alive(pid: int) -> bool:
         try:
             os.kill(int(pid), 0)
             return True
@@ -172,14 +181,14 @@ class LlamaNode:
             self._cfg = dict(cfg or {})
             self._started_at = int(started_at) or int(time.time())
             self._last_error = ""
-            self._log_path = log_path
+            self._log = CellLog(log_path)
             self._exit_info = None
             return {"ok": True, "pid": int(pid), "adopted": True}
 
     def _running_locked(self) -> bool:
         if self._proc and self._proc.poll() is None:
             return True
-        return bool(self._adopted_pid and self._pid_alive(self._adopted_pid))
+        return bool(self._adopted_pid and self.pid_alive(self._adopted_pid))
 
     def start(self, bin_path: str, args: list[str], cfg: dict[str, Any],
               log_path: Path | None = None) -> dict[str, Any]:
@@ -200,7 +209,7 @@ class LlamaNode:
                 return {"ok": False, "error": f"model file not found: {model_path}"}
             cmd = [str(bp), *[str(a) for a in args]]
             if log_path:
-                self._rotate_log(log_path)  # keep the crashed run's log, don't truncate it
+                CellLog(log_path).rotate()  # keep the crashed run's log, don't truncate it
             try:
                 log_fh = open(log_path, "w") if log_path else subprocess.DEVNULL
                 self._proc = subprocess.Popen(
@@ -212,7 +221,7 @@ class LlamaNode:
                 self._cfg = {**cfg, "cmd": cmd}
                 self._started_at = int(time.time())
                 self._last_error = ""
-                self._log_path = log_path
+                self._log = CellLog(log_path)
                 self._exit_info = None
                 return {"ok": True, "pid": self._proc.pid, "port": cfg.get("port")}
             except Exception as exc:
@@ -233,7 +242,7 @@ class LlamaNode:
             self._adopted_pid = None
             cmd = ["bash", "-lc", shell_command]
             if log_path:
-                self._rotate_log(log_path)
+                CellLog(log_path).rotate()
             try:
                 log_fh = open(log_path, "w") if log_path else subprocess.DEVNULL
                 self._proc = subprocess.Popen(
@@ -245,7 +254,7 @@ class LlamaNode:
                 self._cfg = {**cfg, "cmd": cmd}
                 self._started_at = int(time.time())
                 self._last_error = ""
-                self._log_path = log_path
+                self._log = CellLog(log_path)
                 self._exit_info = None
                 return {"ok": True, "pid": self._proc.pid, "port": cfg.get("port")}
             except Exception as exc:
@@ -265,13 +274,13 @@ class LlamaNode:
                 self._adopted_pid = None
                 self._cfg = {}
                 self._started_at = 0
-                if self._pid_alive(pid):
+                if self.pid_alive(pid):
                     try:
                         os.kill(pid, signal.SIGTERM)
                         deadline = time.time() + 10
-                        while time.time() < deadline and self._pid_alive(pid):
+                        while time.time() < deadline and self.pid_alive(pid):
                             time.sleep(0.3)
-                        if self._pid_alive(pid):
+                        if self.pid_alive(pid):
                             os.kill(pid, signal.SIGKILL)
                     except Exception as exc:
                         return {"ok": False, "error": str(exc)}
@@ -295,10 +304,18 @@ class LlamaNode:
             self._started_at = 0
             return {"ok": True}
 
+    def held_files(self) -> list[str]:
+        """The model files this process holds while it runs — what a cache
+        purge must leave alone. A process that does not run holds none."""
+        if not self.status().get("running"):
+            return []
+        cfg = self._cfg
+        return [cfg[k] for k in ("modelPath", "mmprojPath", "specPath") if cfg.get(k)]
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             if self._adopted_pid:
-                if self._pid_alive(self._adopted_pid):
+                if self.pid_alive(self._adopted_pid):
                     return {
                         "running": True,
                         "pid": self._adopted_pid,
@@ -308,7 +325,7 @@ class LlamaNode:
                         **{k: v for k, v in self._cfg.items() if k != "cmd"},
                     }
                 # Died while adopted: no exit code is observable (not our child).
-                err = self._read_log_error(self._log_path)
+                err = self._log.crash_reason()
                 self._exit_info = {"exitCode": None, "lastError": err, "crashed": True}
                 self._adopted_pid = None
                 return {"running": False, **self._exit_info}
@@ -323,7 +340,7 @@ class LlamaNode:
             if rc is not None:
                 # Process exited (e.g. crashed during model/clip load). Capture
                 # the reason from the log so the admin can show it.
-                err = self._last_error or self._read_log_error(self._log_path)
+                err = self._last_error or self._log.crash_reason()
                 self._exit_info = {"exitCode": rc, "lastError": err, "crashed": rc != 0}
                 self._proc = None
                 return {"running": False, **self._exit_info}
@@ -336,15 +353,91 @@ class LlamaNode:
             }
 
 
-class _Slot:
-    """One managed server process on this host, addressed by its port. A client
-    can hold several at once (e.g. a translator + a whisper cell) — each keeps
-    its own LlamaNode process, async startup progress and cache flag."""
+class HostProcesses:
+    """A process on this machine that the scout did not start — found by the
+    command line it runs, or by the port it listens on and answers.
 
-    def __init__(self):
-        self.node = LlamaNode()
-        self.startup: dict[str, Any] = {"phase": "idle"}
-        self.lock = threading.Lock()
-        self.cache_models = False
+    This is how a cell outlives a scout restart: the registry remembers a pid
+    and a marker, and these questions check that memory against the host.
+    Each is one question to the OS; none of them keeps anything.
+    """
 
+    @staticmethod
+    def marker_matches(marker: str, cmdline: str) -> bool:
+        """The exec'd argv[0] may be a resolved binary path (python3 → .../MacOS/Python),
+        so besides the exact substring also accept the marker's argument tail."""
+        if not marker or not cmdline:
+            return False
+        if marker in cmdline:
+            return True
+        tail = " ".join(marker.split()[1:])
+        return bool(tail) and tail in cmdline
 
+    @staticmethod
+    def cmdline(pid: int) -> str:
+        try:
+            out = subprocess.run(["ps", "-p", str(int(pid)), "-o", "command="],
+                                 capture_output=True, text=True, timeout=5)
+            return out.stdout.strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def listener(port: int) -> int:
+        """PID LISTENING on <port> (any local address), via `ss`; 0 if none. Lets us
+        re-identify a cell by its port when the launch marker no longer matches: a
+        wrapper that exec's into another program (run_whisper.sh → exec python)
+        rewrites argv, so the marker is gone from ps though the port is still served."""
+        want = str(int(port))
+        try:
+            out = subprocess.run(["ss", "-ltnpH"], capture_output=True,
+                                 text=True, timeout=5).stdout
+        except FileNotFoundError:
+            # macOS has no ss; lsof answers the same question. Without this the
+            # mac client silently returned 0 here — port-based re-adoption and
+            # the stop-time port check both degraded to "nobody listening".
+            try:
+                out2 = subprocess.run(
+                    ["lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-t"],
+                    capture_output=True, text=True, timeout=5).stdout.strip()
+                return int(out2.split()[0]) if out2 else 0
+            except Exception:
+                return 0
+        except Exception:
+            return 0
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) < 4 or parts[3].rsplit(":", 1)[-1] != want:
+                continue  # parts[3] is the Local Address:Port column
+            m = re.search(r"pid=(\d+)", line)
+            if m:
+                return int(m.group(1))
+        return 0
+
+    @staticmethod
+    def healthy(port: int, timeout: float = 2.0, attempts: int = 1,
+                health_path: str = "/health") -> bool:
+        """True if the server on <port> answers its health endpoint with 2xx —
+        confirming a real, healthy cell serves the port before we adopt whatever
+        pid owns it.
+
+        The path is NOT always /health: the controller computes it per cell (a
+        vLLM cell answers on /v1/models, a command cell can declare its own) and
+        sends it with the start request. Probing a hardcoded /health would call a
+        perfectly healthy vLLM cell dead.
+
+        Retries because this runs at agent startup, which is exactly when the host
+        is busiest — a single 2 s probe on a loaded box times out on a cell that is
+        perfectly alive."""
+        path = str(health_path or "/health").strip() or "/health"
+        if not path.startswith("/"):
+            path = "/" + path
+        for i in range(max(1, int(attempts))):
+            try:
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{int(port)}{path}", timeout=timeout) as resp:
+                    return 200 <= int(getattr(resp, "status", 200) or 200) < 300
+            except Exception:
+                if i + 1 < attempts:
+                    time.sleep(1.0)
+        return False

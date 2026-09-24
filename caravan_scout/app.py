@@ -10,9 +10,8 @@ import threading
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-from caravan_scout.agent import RouteAgent
-from caravan_scout.errors import AppError            # noqa: F401  (re-export)
-from caravan_scout.http import json_bytes, make_handler  # noqa: F401
+from caravan_scout.http import Api
+from caravan_scout.scout import Scout
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -23,14 +22,14 @@ def main(argv: list[str] | None = None) -> int:
                         os.environ.get("LLM_EASY_ROUTE_STATE", "state.json")))
     args = parser.parse_args(argv)
 
-    agent = RouteAgent(Path(args.config).expanduser(), Path(args.state).expanduser())
-    agent.adopt_or_reap_strays()
-    heartbeat = threading.Thread(target=agent.heartbeat_loop, daemon=True)
+    agent = Scout(Path(args.config).expanduser(), Path(args.state).expanduser())
+    agent.cells.adopt_survivors()
+    heartbeat = threading.Thread(target=agent.heartbeat.loop, daemon=True)
     heartbeat.start()
 
     host = str(agent.config.get("listenHost") or "0.0.0.0")
     port = int(agent.config.get("listenPort") or 8092)
-    server = ThreadingHTTPServer((host, port), make_handler(agent))
+    server = ThreadingHTTPServer((host, port), Api(agent).handler())
     print(f"caravan-scout listening on http://{host}:{port}")
     server.serve_forever()
     return 0

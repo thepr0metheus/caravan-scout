@@ -4,3 +4,10 @@ __pycache__/
 state.json
 config.json
 llama-node-configs/
+
+# Backups a host makes of its own config and state. config.json holds the
+# fleet token; a committed backup of it put the token in the history once.
+*.bak
+*.bak-*
+config.json.*
+state.json.*

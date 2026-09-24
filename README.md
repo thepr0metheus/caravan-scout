@@ -4,34 +4,35 @@ The client-side sidecar of the [LAMA CARAVAN](https://github.com/thepr0metheus/l
 control plane. **Formerly known as `llm-easy-route-agent`** — if you see that
 name in older screenshots, configs or docs, it is this project.
 
-One small service per client machine — with or without a GPU —
-that reports the host into the fleet topology and executes the controller's
-commands: run llama.cpp server cells locally, download models, re-point
-OpenClaw agents at their assigned proxy ports.
+One small service per machine that lends its hardware to the fleet: it
+reports the machine — GPUs, CPU/RAM, running cells — and executes the
+controller's commands: run llama.cpp and command server cells locally,
+download models, update llama.cpp. It knows nothing about the AI agents or
+clients that may live on the same box: those are the controller's records,
+made by hand, and a client needs nothing installed.
 
 Dependency-light on purpose: Python standard library only, one JSON config,
 a small HTTP API on `:8092`.
 
-## Why put a scout on every box
+## Why put a scout on a box
 
-The controller can only route to what it can see. The scout is how a machine
-becomes visible — and it earns its keep on any box that has either
-**hardware** or **agents**:
+The controller can only run models where it can see hardware. The scout is how
+a machine's hardware becomes visible and usable:
 
 - **A machine with a GPU** (even a modest one) becomes a place where the
   fleet can run models: reserve a cell on the board, pick a model, press
   Start — the scout downloads the GGUF from the controller's cache, launches
-  `llama-server`, reports load progress and slot activity back to the board.
+  `llama-server`, reports load progress and cell activity back to the board.
   An old 12 GB card serving a small model at night is real capacity the
   router can use.
-- **A machine with AI agents** (OpenClaw, Hermes, anything with an
-  OpenAI-style `baseUrl`) gets its agents onto the topology: the scout
-  detects them (host processes, docker, VMs), and `apply-routes.py` re-points
-  each agent at its personal proxy port on the controller — after which all
-  the queueing/scheduling/spill rules apply to that agent's traffic with no
-  further changes on the machine, ever.
-- Both kinds of hosts report GPUs, VRAM, running compute apps and heartbeat
-  health, so the board shows the whole fleet's real state in one place.
+- **A machine without one** can still run CPU cells (speech recognition,
+  small models) the same way.
+- Every scout reports GPUs, VRAM, running compute apps and its heartbeat, so
+  the board shows the fleet's real hardware in one place.
+
+A machine where AI agents run (OpenClaw, Hermes, anything with an OpenAI-style
+`baseUrl`) needs no scout: the operator adds it on the controller's board as a
+client and gives each agent a proxy port by hand.
 
 Why it's safe to adopt: standard library Python only, one JSON config, one
 small HTTP surface on `:8092`, systemd/launchd units, and the
@@ -52,7 +53,7 @@ and the worked example
 | Python | **3.10+**, standard library only — no pip packages |
 | For llama cells | a `llama-server` binary on this host (`scripts/install.sh` can build it; CUDA optional) |
 | For GPU info | NVIDIA driver + `nvidia-smi` (optional — CPU-only hosts are fine) |
-| Network | reach the controller's `:8090`; the agent listens on `:8092` |
+| Network | reach the controller's `:7990`; the scout listens on `:8092` |
 
 ## Documentation
 
@@ -64,28 +65,27 @@ and the worked example
 
 ## Role
 
-The controller (lama-caravan, `:8090`) is the topology registry and the single
-command builder. This agent:
+The controller (lama-caravan, `:7990`) is the topology registry and the single
+command builder. The scout:
 
-- reports host identity, GPU/CPU inventory, compute apps and local OpenClaw
-  agents in a heartbeat every 60 s (faster while a model is loading);
+- reports host identity, GPU/CPU inventory and compute apps in a heartbeat
+  every 60 s (every 5 s while a cell is loading);
 - starts/stops llama.cpp **server cells** on this host from configs built by
   the controller (models are downloaded from the controller and cached);
 - runs generic **command cells** (e.g. a whisper server) the same way — the controller
   supplies both the start line and the cell server files themselves;
-- receives routing assignments and re-points each local agent's provider
-  `baseUrl` at its LAMA CARAVAN proxy port (`apply-routes.py`).
+- updates or rolls back llama.cpp on this host when the controller asks.
 
 ```text
 Machine A (any GPU or no GPU)          Machine B (controller)
 ┌─────────────────────────────┐        ┌──────────────────────────────┐
-│  caravan-scout :8092        │◄──────►│  LAMA CARAVAN admin :8090    │
-│  ┌───────────────────────┐  │        │                              │
-│  │ OpenClaw / local app  │  │        │  Topology board:             │
-│  └───────────────────────┘  │        │  • sees Machine A            │
-│  ┌───────────────────────┐  │        │  • shows GPU info            │
-│  │ llama-server (NVIDIA) │  │        │  • "+ Add as llama server"   │
-│  └───────────────────────┘  │        │    → model served over HTTP  │
+│  caravan-scout :8092        │◄──────►│  LAMA CARAVAN admin :7990    │
+│  ┌───────────────────────┐  │        │  Topology board:             │
+│  │ llama-server (NVIDIA) │  │        │  • Machine A as a node       │
+│  └───────────────────────┘  │        │  • its GPUs and cells        │
+│  ┌───────────────────────┐  │        │  • "＋ Reserve cell"         │
+│  │ command cell (whisper)│  │        │    → model served over HTTP  │
+│  └───────────────────────┘  │        │                              │
 └─────────────────────────────┘        └──────────────────────────────┘
 ```
 
@@ -96,7 +96,7 @@ One-liner on a fresh client host (Linux or macOS):
 ```sh
 git clone <your-remote>/caravan-scout.git ~/projects/caravan-scout
 cd ~/projects/caravan-scout
-./scripts/install.sh --admin-url http://<controller-ip>:8090
+./scripts/install.sh --admin-url http://<controller-ip>:7990
 ```
 
 | Situation | What happens |
@@ -137,9 +137,9 @@ http://<this-host-ip>:8092/
 
 ![Pairing page](docs/screenshots/pairing.png)
 
-It shows what the agent detected on this machine (GPUs, local agents, running
-cells) and has a single **Pair** field — paste the controller address
-(`http://<controller-ip>:8090`), press Pair, and the host saves it to
+It shows what the scout found on this machine (GPUs, running cells) and has a
+single **Pair** field — paste the controller address
+(`http://<controller-ip>:7990`), press Pair, and the host saves it to
 `config.json`, sends a heartbeat immediately and reports whether the
 controller answered. No file editing, no restart.
 
@@ -159,7 +159,7 @@ python3 -m caravan_scout.app --config config.json --state state.json
 
 | Port | Service |
 |---|---|
-| `8090` | LAMA CARAVAN admin (controller) |
+| `7990` | LAMA CARAVAN admin (controller) |
 | `8092` | this agent |
 | `8180` | llama-server on the client (default, configurable) |
 
@@ -171,39 +171,31 @@ python3 -m caravan_scout.app --config config.json --state state.json
   "displayName": "host-a",
   "listenHost": "0.0.0.0",
   "listenPort": 8092,
-  "controllerUrl": "http://<controller-ip>:8090",
+  "controllerUrl": "http://<controller-ip>:7990",
   "heartbeatIntervalSeconds": 60,
-  "registryUrl": "",
-  "agents": [
-    { "id": "openclaw", "name": "OpenClaw", "kind": "openclaw",
-      "scope": "host", "runtime": "host", "port": 18791,
-      "endpoint": "http://127.0.0.1:18791" }
-  ],
   "llamaServerBin": "~/llama.cpp/build/bin/llama-server",
   "modelsBasePath": "~/llama-model-cache",
   "llamaNodeDefaultPort": 8180,
-  "cleanOldModels": false,
-  "applyCommand": "python3 ~/projects/caravan-scout/apply-routes.py",
-  "openclawConfigPath": "",
-  "openclawAgentId": "openclaw"
+  "cleanOldModels": false
 }
 ```
 
 | Field | Description |
 |---|---|
 | `controllerUrl` | The LAMA CARAVAN admin URL the heartbeat posts to. |
-| `registryUrl` | Optional fleet registry; when set, VM/docker agents are derived from `<registryUrl>/api/agents` instead of the static `agents` list. |
 | `llamaServerBin` | Path to the `llama-server` binary (set by `install.sh`). |
 | `modelsBasePath` | Local cache dir for downloaded models. |
-| `applyCommand` | Shell command that receives routing assignments as JSON on stdin. |
+| `controllerToken` | The fleet token, when the controller has sign-in enabled (the pairing page stores it). |
 
 ## API
 
 See [docs/http-api.md](docs/http-api.md). In one line each: GET
-`health · state · llama-node/status · agent-config?id= · monitor/nvidia-smi ·
-llama-node/configs · llama-node/list-cache`; POST `routing/apply · heartbeat ·
-llama-node/start · llama-node/stop · llama-node/purge-cache ·
-llama-node/configs/delete`.
+`health · state · llama-node/status · monitor/nvidia-smi · host/listeners ·
+llama-node/configs · llama-node/list-cache · llama-node/update-status ·
+llama-node/builds`; POST `controller-url · heartbeat · llama-node/start ·
+llama-node/stop · llama-node/update · llama-node/restore ·
+llama-node/purge-cache · llama-node/configs/delete · host/reboot ·
+host/poweroff`.
 
 ## Services
 
@@ -230,5 +222,6 @@ restart the agent`. No `scp`. Runtime files (`state.json`, `var/`,
 
 ## Safety model
 
-No auth on `:8092`; command cells execute controller-supplied shell. The
-trusted-LAN assumption is explicit — do not expose the port beyond your LAN.
+Open by default on a trusted LAN; once a fleet token is configured, every
+endpoint except the pairing page and `/api/health` requires it. Command cells
+execute controller-supplied shell — do not expose the port beyond your LAN.

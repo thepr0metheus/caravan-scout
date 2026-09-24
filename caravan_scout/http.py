@@ -1,260 +1,210 @@
-"""ThreadingHTTPServer handler factory: the agent's HTTP surface on :8092."""
+"""The scout's HTTP surface on :8092: which path does what, and who may ask."""
 from __future__ import annotations
 
+import hmac
 import json
-import os
-import re
-import signal
-import shlex
-import socket
 import subprocess
-import sys
-import threading
 import time
-import urllib.error
-import urllib.request
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-from typing import Any
+from http.server import BaseHTTPRequestHandler
+from typing import Any, Callable
+
 from caravan_scout import __version__ as APP_VERSION
 from caravan_scout.errors import AppError
+from caravan_scout.webui import PairingPage
 
 
-def json_bytes(payload: Any) -> bytes:
-    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+class Power:
+    """Reboot or power off this machine when the controller asks.
+
+    Cells are not stopped first — systemd takes them down with the machine
+    and autostart brings back what should come back.
+
+    poweroff is the one-way door: nothing on the board can switch this box
+    on again, so it is separated from reboot by its own path rather than a
+    flag in a body. A path cannot be reached by accident the way a mistyped
+    field can, and an old scout answers 404 to it instead of silently doing
+    the wrong one of the two.
+    """
+
+    def issue(self, action: str) -> tuple[dict[str, Any], int]:
+        print(f"[host] {action} requested by the controller")
+        try:
+            r = subprocess.run(["sudo", "-n", "systemctl", action],
+                               capture_output=True, text=True, timeout=10)
+            if r.returncode != 0:
+                err = (r.stderr or r.stdout or "").strip() or f"exit {r.returncode}"
+                hint = (f" — passwordless sudo for `systemctl {action}` is required"
+                        if "password" in err.lower() else "")
+                return {"ok": False, "error": f"{action} refused: {err}{hint}"}, 500
+        except subprocess.TimeoutExpired:
+            pass   # the box is already going down; that is success
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{action} failed: {exc}"}, 500
+        return {"ok": True, "detail": f"{action} issued"}, 200
 
 
-def make_handler(agent: RouteAgent):
-    class Handler(BaseHTTPRequestHandler):
-        server_version = f"caravan-scout/{APP_VERSION}"
+class Api:
+    """What each path does, as tables: one line per path.
 
-        def log_message(self, fmt: str, *args: Any) -> None:
-            print(f"{self.address_string()} - {fmt % args}")
+    The pairing page, /api/pairing and /api/health are open. Everything else
+    stands behind the fleet token when config.json has one: the controller
+    sends it as X-Caravan-Token, the pairing form may put it in the body. No
+    token configured means open (a trusted LAN). The gate stands BEFORE the
+    routes, so an unknown path without a token is 401, not 404 — as it was.
 
-        def send_json(self, payload: Any, status: int = 200) -> None:
-            data = json_bytes(payload)
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+    A path matches whole, query string and all. A POST route gets the body
+    as a function and reads it only if it needs one: a body that does not
+    parse fails only the routes that read it.
+    """
 
-        def read_body(self) -> dict[str, Any]:
-            length = int(self.headers.get("Content-Length", "0") or "0")
-            raw = self.rfile.read(length) if length else b"{}"
-            payload = json.loads(raw.decode("utf-8"))
-            if not isinstance(payload, dict):
-                raise AppError("body must be a JSON object")
-            return payload
+    def __init__(self, scout):
+        s = self.scout = scout
+        self.power = Power()
+        self.open_get: dict[str, Callable[[], Any]] = {
+            # Open like the page itself: see Report.pairing().
+            "/api/pairing": lambda: s.report.pairing(),
+            "/api/health": lambda: {"ok": True, "service": "caravan-scout", "version": APP_VERSION,
+                                    "tokenRequired": bool(s.config.token()), "time": int(time.time())},
+        }
+        self.get: dict[str, Callable[[], Any]] = {
+            "/api/state": lambda: s.report.public(),
+            "/api/llama-node/status": lambda: {"ok": True, "nodes": s.cells.views()},
+            "/api/monitor/nvidia-smi": lambda: s.machine.nvidia_smi(),
+            # What is listening on this box, so the controller's port picker
+            # stops offering numbers something else already owns. The
+            # controller can only see its OWN host; a client squatter was
+            # invisible until now.
+            "/api/host/listeners": lambda: s.machine.listeners(),
+            "/api/llama-node/configs": lambda: {"ok": True, "configs": s.configs.listing()},
+            "/api/llama-node/update-status": lambda: s.builds.status(),
+            "/api/llama-node/builds": lambda: s.builds.archive(),
+            "/api/llama-node/list-cache": lambda: {"ok": True, "models": s.models.listing()},
+        }
+        # path -> fn(read_body) -> (payload, status)
+        self.post: dict[str, Callable[[Callable[[], dict]], tuple[Any, int]]] = {
+            "/api/heartbeat": lambda body: (s.heartbeat.once(), 200),
+            "/api/llama-node/start": self._start,
+            "/api/host/reboot": lambda body: self.power.issue("reboot"),
+            "/api/host/poweroff": lambda body: self.power.issue("poweroff"),
+            "/api/llama-node/stop": lambda body: (s.cells.stop(body().get("port")), 200),
+            "/api/llama-node/update": lambda body: (s.builds.start_update(body()), 200),
+            "/api/llama-node/restore": self._restore,
+            "/api/llama-node/purge-cache": lambda body: ({"ok": True, **s.cells.purge_models_safely()}, 200),
+            "/api/llama-node/configs/delete": self._delete_config,
+        }
 
-        def _token_ok(self, body: dict[str, Any] | None = None) -> bool:
-            """When a controllerToken is configured, every API call must carry
-            it (controller does via X-Caravan-Token; the pairing form may put
-            it into the body instead). No token configured = open (LAN mode)."""
-            expected = agent.controller_token()
-            if not expected:
-                return True
-            import hmac as _hmac
-            got = self.headers.get("X-Caravan-Token") or ""
-            if not got and isinstance(body, dict):
-                got = str(body.get("token") or "")
-            if _hmac.compare_digest(got, expected):
-                return True
-            self.send_json({"error": "fleet token required (X-Caravan-Token)"}, 401)
-            return False
+    def _start(self, body) -> tuple[Any, int]:
+        result = self.scout.cells.start(body())
+        return result, 200 if result.get("ok") else 400
 
-        def do_GET(self) -> None:
-            try:
-                if self.path in ("/", "/index.html"):
-                    from caravan_scout.webui import pair_page_bytes
-                    data = pair_page_bytes()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.send_header("Content-Length", str(len(data)))
-                    self.send_header("Cache-Control", "no-cache")
-                    self.end_headers()
-                    self.wfile.write(data)
-                    return
-                if self.path == "/api/health":
-                    self.send_json({"ok": True, "service": "caravan-scout", "version": APP_VERSION,
-                                    "tokenRequired": bool(agent.controller_token()), "time": int(time.time())})
-                    return
-                if not self._token_ok():
-                    return
-                if self.path == "/api/state":
-                    self.send_json(agent.public_state())
-                    return
-                if self.path == "/api/llama-node/status":
-                    self.send_json({"ok": True, "nodes": agent.llama_nodes_public()})
-                    return
-                if self.path.startswith("/api/agent-config"):
-                    from urllib.parse import urlparse as _urlparse, parse_qs as _parse_qs
-                    _q = _parse_qs(_urlparse(self.path).query or "")
-                    _id = (_q.get("id") or [""])[0].strip()
-                    self.send_json(agent.agent_openclaw_config(_id))
-                    return
-                if self.path == "/api/monitor/nvidia-smi":
-                    self.send_json(agent.monitor_nvidia_smi())
-                    return
-                if self.path == "/api/host/listeners":
-                    # What is listening on this box, so the controller's port
-                    # picker stops offering numbers something else already
-                    # owns. The controller can only see its OWN host; a client
-                    # squatter was invisible until now.
-                    self.send_json(agent.host_listeners())
-                    return
-                if self.path == "/api/llama-node/configs":
-                    self.send_json({"ok": True, "configs": agent.list_llama_node_configs()})
-                    return
-                if self.path == "/api/llama-node/update-status":
-                    self.send_json(agent.llama_update_status())
-                    return
-                if self.path == "/api/llama-node/builds":
-                    self.send_json(agent.llama_builds_list())
-                    return
-                if self.path == "/api/llama-node/list-cache":
-                    self.send_json({"ok": True, "models": agent.list_cached_models()})
-                    return
+    def _restore(self, body) -> tuple[Any, int]:
+        b = body()
+        return self.scout.builds.start_update({"restoreId": str(b.get("id") or b.get("restoreId") or "")}), 200
+
+    def _delete_config(self, body) -> tuple[Any, int]:
+        self.scout.configs.delete(str(body().get("filename") or ""))
+        return {"ok": True}, 200
+
+    def handler(self) -> type[BaseHTTPRequestHandler]:
+        """The request handler class for this scout's server."""
+        return type("Handler", (ScoutHandler,), {"api": self})
+
+
+class ScoutHandler(BaseHTTPRequestHandler):
+    """One request to the scout, answered from its Api's tables."""
+
+    api: Api
+    server_version = f"caravan-scout/{APP_VERSION}"
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        print(f"{self.address_string()} - {fmt % args}")
+
+    def send_json(self, payload: Any, status: int = 200) -> None:
+        data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_page(self, data: bytes) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def read_body(self) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        raw = self.rfile.read(length) if length else b"{}"
+        payload = json.loads(raw.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise AppError("body must be a JSON object")
+        return payload
+
+    def token_ok(self, body: dict[str, Any] | None = None) -> bool:
+        """When a controllerToken is configured, every API call must carry
+        it (controller does via X-Caravan-Token; the pairing form may put
+        it into the body instead). No token configured = open (LAN mode)."""
+        expected = self.api.scout.config.token()
+        if not expected:
+            return True
+        got = self.headers.get("X-Caravan-Token") or ""
+        if not got and isinstance(body, dict):
+            got = str(body.get("token") or "")
+        return hmac.compare_digest(got, expected)
+
+    def refuse(self) -> None:
+        self.send_json({"error": "fleet token required (X-Caravan-Token)"}, 401)
+
+    def do_GET(self) -> None:
+        api = self.api
+        try:
+            if self.path in ("/", "/index.html"):
+                self.send_page(PairingPage.body())
+                return
+            if self.path in api.open_get:
+                self.send_json(api.open_get[self.path]())
+                return
+            if not self.token_ok():
+                self.refuse()
+                return
+            route = api.get.get(self.path)
+            if route is None:
                 self.send_json({"error": "not found"}, 404)
-            except AppError as exc:
-                self.send_json({"error": str(exc)}, exc.status)
-            except Exception as exc:
-                self.send_json({"error": str(exc)}, 500)
+                return
+            self.send_json(route())
+        except AppError as exc:
+            self.send_json({"error": str(exc)}, exc.status)
+        except Exception as exc:
+            self.send_json({"error": str(exc)}, 500)
 
-        def do_POST(self) -> None:
-            try:
-                body_probe = None
-                if self.path == "/api/controller-url":
-                    body_probe = self.read_body()
-                if not self._token_ok(body_probe):
+    def do_POST(self) -> None:
+        api = self.api
+        try:
+            if self.path == "/api/controller-url":
+                # The pairing form may carry the token in the body, so the
+                # body is read before the gate on this one path — and a token
+                # the scout does not hold yet may pass it: see
+                # Heartbeat.takes_new_token.
+                body = self.read_body()
+                url, token = str(body.get("url") or ""), str(body.get("token") or "")
+                if not self.token_ok(body) and not api.scout.heartbeat.takes_new_token(url, token):
+                    self.refuse()
                     return
-                if self.path == "/api/controller-url":
-                    self.send_json(agent.set_controller_url(
-                        str(body_probe.get("url") or ""), str(body_probe.get("token") or "")))
-                    return
-                if self.path == "/api/routing/apply":
-                    self.send_json(agent.apply_assignments(self.read_body()))
-                    return
-                if self.path == "/api/heartbeat":
-                    self.send_json(agent.heartbeat_once())
-                    return
-                if self.path == "/api/llama-node/start":
-                    result = agent.llama_node_start(self.read_body())
-                    self.send_json(result, 200 if result.get("ok") else 400)
-                    return
-                if self.path in ("/api/host/reboot", "/api/host/poweroff"):
-                    # The controller asks; this host power-cycles itself. Cells
-                    # are not stopped first — systemd takes them down with the
-                    # machine and autostart brings back what should come back.
-                    #
-                    # poweroff is the one-way door: nothing on the board can
-                    # switch this box on again, so it is separated from reboot by
-                    # its own path rather than a flag in a body. A path cannot be
-                    # reached by accident the way a mistyped field can, and an old
-                    # scout answers 404 to it instead of silently doing the wrong
-                    # one of the two.
-                    _action = "poweroff" if self.path.endswith("poweroff") else "reboot"
-                    print(f"[host] {_action} requested by the controller")
-                    try:
-                        _r = subprocess.run(["sudo", "-n", "systemctl", _action],
-                                            capture_output=True, text=True, timeout=10)
-                        if _r.returncode != 0:
-                            _err = (_r.stderr or _r.stdout or "").strip() or f"exit {_r.returncode}"
-                            _hint = (f" — passwordless sudo for `systemctl {_action}` is required"
-                                     if "password" in _err.lower() else "")
-                            self.send_json({"ok": False, "error": f"{_action} refused: {_err}{_hint}"}, 500)
-                            return
-                    except subprocess.TimeoutExpired:
-                        pass   # the box is already going down; that is success
-                    except Exception as exc:  # noqa: BLE001
-                        self.send_json({"ok": False, "error": f"{_action} failed: {exc}"}, 500)
-                        return
-                    self.send_json({"ok": True, "detail": f"{_action} issued"})
-                    return
-                if self.path == "/api/llama-node/stop":
-                    body = self.read_body()
-                    _p = body.get("port")
-                    _ports = [int(_p)] if _p else [pp for pp, _ in agent._slots_snapshot()]
-                    _results = []
-                    _purge_any = False
-                    for pp in _ports:
-                        _sl = agent._slot(pp)
-                        _res = _sl.node.stop()
-                        # "not running" from a node with no handles means it
-                        # consulted NOTHING — the port may still be served by a
-                        # process this agent lost track of (that is precisely how
-                        # a stop once reported success while 10.7 GB stayed
-                        # occupied). Verify the port; kill only what we can
-                        # recognize as ours, never an arbitrary listener.
-                        if _res.get("detail") == "not running":
-                            _lpid = agent._port_listener_pid(pp)
-                            if _lpid:
-                                _cmd = agent._pid_cmdline(_lpid)
-                                _rec = (agent.state.get("cells") or {}).get(str(pp)) or {}
-                                _mark = str(_rec.get("marker") or "")
-                                _bin = str(agent.config.get("llamaServerBin") or "")
-                                if (_mark and agent._marker_matches(_mark, _cmd)) or                                         (_bin and _bin in _cmd):
-                                    try:
-                                        os.kill(_lpid, signal.SIGTERM)
-                                        _dl = time.time() + 10
-                                        while time.time() < _dl and agent._pid_cmdline(_lpid):
-                                            time.sleep(0.3)
-                                        if agent._pid_cmdline(_lpid):
-                                            os.kill(_lpid, signal.SIGKILL)
-                                        _res = {"ok": True, "reclaimed": True, "pid": _lpid}
-                                    except Exception as exc:  # noqa: BLE001
-                                        _res = {"ok": False, "error": f"reclaim failed: {exc}",
-                                                "listenerPid": _lpid}
-                                else:
-                                    _res = {"ok": False, "listenerPid": _lpid,
-                                            "error": f"port {pp} is held by an unrecognized "
-                                                     f"process (pid {_lpid}) — not killing it"}
-                        _results.append(_res)
-                        if not _res.get("ok"):
-                            # A stop that could not verify must not erase the
-                            # registry entry — that would turn a recoverable cell
-                            # into a genuinely unowned process.
-                            continue
-                        agent._set_llama_startup(pp, phase="idle", error="",
-                                                 downloadedBytes=0, totalBytes=0)
-                        # Don't keep models on client disks (unless caching is on).
-                        if not _sl.cache_models:
-                            _purge_any = True
-                        agent._drop_slot(pp)   # a stopped slot disappears from the fleet view
-                        agent._unregister_cell(pp)
-                    # Purge once, after the stopped slots are dropped, via the SAFE
-                    # variant so a model still served by another running slot isn't
-                    # evicted (stopping whisper must not delete the translator gguf).
-                    if _purge_any:
-                        try:
-                            agent.purge_model_cache_safe()
-                        except Exception:
-                            pass
-                    self.send_json(_results[0] if len(_results) == 1
-                                   else {"ok": True, "results": _results})
-                    return
-                if self.path == "/api/llama-node/update":
-                    self.send_json(agent.llama_update_start(self.read_body()))
-                    return
-                if self.path == "/api/llama-node/restore":
-                    body = self.read_body()
-                    self.send_json(agent.llama_update_start(
-                        {"restoreId": str(body.get("id") or body.get("restoreId") or "")}))
-                    return
-                if self.path == "/api/llama-node/purge-cache":
-                    self.send_json({"ok": True, **agent.purge_model_cache_safe()})
-                    return
-                if self.path == "/api/llama-node/configs/delete":
-                    body = self.read_body()
-                    agent.delete_llama_node_config(str(body.get("filename") or ""))
-                    self.send_json({"ok": True})
-                    return
+                self.send_json(api.scout.heartbeat.pair(url, token))
+                return
+            if not self.token_ok():
+                self.refuse()
+                return
+            route = api.post.get(self.path)
+            if route is None:
                 self.send_json({"error": "not found"}, 404)
-            except AppError as exc:
-                self.send_json({"error": str(exc)}, exc.status)
-            except Exception as exc:
-                self.send_json({"error": str(exc)}, 500)
-
-    return Handler
-
-
+                return
+            payload, status = route(self.read_body)
+            self.send_json(payload, status)
+        except AppError as exc:
+            self.send_json({"error": str(exc)}, exc.status)
+        except Exception as exc:
+            self.send_json({"error": str(exc)}, 500)

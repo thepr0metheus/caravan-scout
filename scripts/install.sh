@@ -9,7 +9,7 @@
 #   --skip-whisper        skip faster-whisper ASR server provisioning
 #   --llama-tag <tag>     pin a specific llama.cpp release tag, e.g. b9101
 #                         (default: latest release)
-#   --admin-url <url>     Llama.cpp Easy Admin URL for model downloads
+#   --admin-url <url>     LAMA CARAVAN controller URL, e.g. http://<ip>:7990
 #                         (required unless ADMIN_URL is set in the env)
 #
 # The script is idempotent — safe to re-run.
@@ -40,7 +40,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$ADMIN_URL" ]; then
-  err "--admin-url is required (e.g. --admin-url http://<controller-ip>:8090)"
+  err "--admin-url is required (e.g. --admin-url http://<controller-ip>:7990)"
   exit 1
 fi
 
@@ -143,9 +143,12 @@ fi  # on_linux
 if [[ $SKIP_WHISPER -eq 1 ]]; then
   warn "Skipping whisper (--skip-whisper)"
 elif on_linux; then
-  # shellcheck source=scripts/install-whisper.sh
-  source "$INSTALL_DIR/scripts/install-whisper.sh"
-  install_whisper "$INSTALL_DIR" "${HOME}/wsr"
+  # Run, never source: install-whisper.sh is a script of its own that exits
+  # early on a host with no NVIDIA GPU. Sourced, that `exit 0` ended this
+  # installer before its summary; on a GPU host the function called after it,
+  # install_whisper, never existed, and `set -e` failed the install at the end.
+  VENV="${HOME}/wsr" bash "$INSTALL_DIR/scripts/install-whisper.sh" \
+    || warn "whisper provisioning failed — see the output above"
 fi
 
 # ── 4. done ───────────────────────────────────────────────────────────────────
@@ -167,6 +170,5 @@ else
   echo "    launchctl start com.caravan-scout"
 fi
 echo ""
-echo "  Once running, open Llama.cpp Easy Admin → Topology"
-echo "  This host will appear automatically and you can launch"
-echo "  llama-server on its GPU from the UI."
+echo "  Once running, open the LAMA CARAVAN board: this machine appears"
+echo "  as a node within a minute, and cells can be started on it from there."

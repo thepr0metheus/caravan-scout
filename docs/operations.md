@@ -7,7 +7,7 @@ One-liner on a fresh client host (Linux or macOS):
 ```sh
 git clone <your-remote>/caravan-scout.git ~/projects/caravan-scout
 cd ~/projects/caravan-scout
-bash scripts/install.sh --admin-url http://<controller-ip>:8090
+bash scripts/install.sh --admin-url http://<controller-ip>:7990
 ```
 
 `install.sh` is idempotent: writes `config.json` (host id, controller URL),
@@ -49,16 +49,16 @@ controller's board (their configs are saved). Plan deploys accordingly.
 ## Config
 
 `config.json` next to the launcher (see the README for the full field table).
-The essentials: `hostId`, `controllerUrl`, `agents` (or `registryUrl` to derive
-them from the fleet registry), `llamaServerBin`, `modelsBasePath`,
-`applyCommand`.
+The essentials: `hostId`, `controllerUrl`, `llamaServerBin`, `modelsBasePath`,
+and `controllerToken` when the controller has sign-in enabled.
 
 `controllerUrl` can also be set from a browser: open `http://<host>:8092/`
 and use the Pair form — it rewrites `config.json` atomically and fires an
 immediate heartbeat (no restart needed).
 
-Runtime files (never in git): `state.json` (assignments, apply/heartbeat
-status), `llama-node-configs/`, `var/server-cells/<port>/`, the model cache
+Runtime files (never in git): `state.json` (heartbeat status and the `cells`
+registry; a 1.x state's `assignments`/`applyStatus` are dropped once at
+start), `llama-node-configs/`, `var/server-cells/<port>/`, the model cache
 (`~/llama-model-cache` by default).
 
 ## Known quirks
@@ -73,7 +73,7 @@ status), `llama-node-configs/`, `var/server-cells/<port>/`, the model cache
 
 - **Cell crash root causes live on the client**, in
   `<modelsBasePath>/llama-server.log` — rotated on every start (15 kept). All
-  slots share that file; command cells log to `command-cell.log` next to it.
+  cells share that file; command cells log to `command-cell.log` next to it.
   The agent extracts the crash reason (OOM / corrupt GGUF / mmproj mismatch)
   into the heartbeat, so the board shows it.
 - **`sudo -n ufw allow <port>`** on cell start is best-effort: without
@@ -82,5 +82,5 @@ status), `llama-node-configs/`, `var/server-cells/<port>/`, the model cache
   purged on stop; with caching on, only the active models are kept.
 - **No auth on `:8092`** and command cells execute controller-supplied shell —
   the trusted-LAN assumption is explicit. Do not expose the port beyond it.
-- The heartbeat drops to a fast cadence while any slot is
+- The heartbeat drops to a fast cadence while any cell is
   resolving/downloading/loading, so board progress is near-live.

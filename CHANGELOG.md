@@ -1,5 +1,75 @@
 # Changelog
 
+## 2.0.0 — 2026-09-24
+
+- **Rewritten into classes, each with one job.** The scout was one class
+  assembled from mixins that shared a single `self`. Now: `Machine` (the
+  host's probes and their caches), `Cells` with `Cell`, `CellRecords` and
+  `LlamaProbe`, `CellProcess`/`CellLog`/`HostProcesses`, the starts
+  (`LlamaStart` + `LlamaLaunch`, `CommandStart`, `CellArtifacts`),
+  `LlamaBuilds`, `SavedConfigs`, `Report`, `Heartbeat`, `Api` with its route
+  tables and `Power`, `PairingPage`, `CellAssets`; `Scout` only puts them
+  together. The HTTP surface is the same: every stage was checked against the
+  snapshot (over 800 pins, output identical line for line) and against
+  mutants of the moved code. `scripts/check_oop.py` keeps the shape — no
+  mixins, no modules of loose functions beyond three named exceptions, no
+  abstract method left unimplemented — with a self-test that plants each
+  breakage, in CI.
+- **The report's shape is one sample for both sides.**
+  `docs/report-sample.json` is the heartbeat and `/api/state` of an imagined
+  machine, built from the real report code; the scout's tests check it still
+  produces it, and the controller keeps a byte-identical copy and checks it
+  reads every field.
+- **The scout knows its machine, and nothing about agents.** It reported the
+  AI agents on its host — from a static list, a fleet registry, docker and
+  libvirt — read their OpenClaw configs, and applied routes the controller
+  sent it, re-pointing each agent at a proxy port. The controller stopped
+  reading all of that: its clients are records the operator makes by hand,
+  and a client needs nothing installed.
+  - Gone: the agent list and the fleet registry (`agents`, `registryUrl`),
+    `openclaw.py`, `apply-routes.py` and `applyCommand`,
+    `GET /api/agent-config` and `POST /api/routing/apply` (both answer 404
+    now), the report's `agents`, `candidates`, `assignments` and
+    `applyStatus`, the docker/libvirt/runtime probes, and the pairing page's
+    "Local agents detected" row.
+  - A state.json written by 1.x drops its `assignments` and `applyStatus`
+    once at start, with a line in the log.
+- A model download retries again when the controller does not answer. The
+  retry reported its progress without the cell's port, so it raised
+  TypeError on the first blip: the promised waits of 5, 15 and 30 s never
+  came, and the board showed the TypeError.
+- A cell with a draft model and no mmproj starts. The draft's path was read
+  from a list position that only exists with an mmproj: both files
+  downloaded, then "list index out of range" and no process.
+- The pairing page works on a scout that has a fleet token. It read
+  `/api/state`, which the token closes, so the page for pasting the token
+  stayed blank. It reads `GET /api/pairing` now: open, and only what the page
+  shows — no controller reply. Its hints name the controller's port 7990.
+- A pairing address with no host is refused. `http://` lost its trailing
+  slash first, became `http:`, gained a second `http://` and was saved as the
+  host "http".
+- The heartbeat carries the llama.cpp update status and the scout's own
+  version, both under the names `/api/state` uses (`llamaUpdate`,
+  `scoutVersion`; the report's `version` became `scoutVersion`). The
+  controller keeps whichever report arrived last, so a field only one of
+  them carried was erased by the other every minute — "building…" blinked
+  on the board.
+- `install.sh` finishes. It sourced `install-whisper.sh` — a script of its
+  own — and then called `install_whisper`, which never existed: on a host
+  without an NVIDIA GPU the helper's `exit 0` ended the installer before its
+  summary, and on a GPU host the missing function failed the install at its
+  last step. The helper runs as its own process now, and a test reads the
+  installer for the rule. Its hints name the controller's port, 7990.
+- **A new fleet token is taken from the pairing page.** After the token was
+  regenerated on the controller, a paired scout still held the old one, and
+  the page — the way to hand it the new one — checked the new token against
+  the old and refused; the way back was editing config.json on the machine.
+  A pairing with the same controller address now takes a token the scout does
+  not hold once that controller accepts a heartbeat carrying it. Pointing the
+  scout at another controller still needs the token it holds.
+- The whole surface is pinned by value in `scripts/test_scout_*.py`, with
+  processes, signals and the network shut in the harness, and runs in CI.
+
 ## 1.3.8 — 2026-07-30
 
 - `POST /api/host/poweroff`, beside the reboot that was already here. Its own

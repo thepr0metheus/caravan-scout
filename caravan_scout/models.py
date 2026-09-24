@@ -1,44 +1,49 @@
-"""ModelsMixin: model cache — download from the controller, verify, purge."""
+"""ModelFetcher: the model cache on this machine — files downloaded from the
+controller, verified, and purged."""
 from __future__ import annotations
 
-import json
-import os
-import re
-import signal
-import shlex
-import socket
-import subprocess
-import sys
-import threading
 import time
-import urllib.error
+import urllib.parse
 import urllib.request
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
 from caravan_scout.errors import AppError
 
 
-class ModelsMixin:
-    def _model_cache_dir(self) -> Path:
+class ModelFetcher:
+    """The model cache: where downloaded files live, how they arrive from the
+    controller, and how they go.
+
+    It knows the config (the cache dir, the controller and its token) and
+    reports a download's progress through `report(port, **fields)` — the
+    startup state of the cell being started — and nothing else about cells.
+    Which files a RUNNING cell holds is the scout's to say (purge_safely).
+    """
+
+    def __init__(self, config, report: Callable[..., None]):
+        self.config = config
+        self.report = report
+
+    def cache_dir(self) -> Path:
         base = str(self.config.get("modelsBasePath") or "").strip()
         if base:
             return Path(base).expanduser()
         return Path.home() / ".llama-model-cache"
 
     # Error patterns that indicate a cached file is truncated / corrupted.
-    _CORRUPT_PATTERNS = (
+    CORRUPT_PATTERNS = (
         "not within the file bounds",
         "corrupted or incomplete",
         "unexpected end of file",
     )
 
     @classmethod
-    def _is_corruption_error(cls, text: str) -> bool:
+    def is_corruption_error(cls, text: str) -> bool:
         low = (text or "").lower()
-        return any(p in low for p in cls._CORRUPT_PATTERNS)
+        return any(p in low for p in cls.CORRUPT_PATTERNS)
 
-    def _ensure_model(self, model_path_raw: str, report: bool = True,
+    def ensure(self, model_path_raw: str, report: bool = True,
                       report_label: str = "", use_cache: bool = False,
                       port: int = 0) -> Path:
         """Return a local Path to the model file.
@@ -56,7 +61,7 @@ class ModelsMixin:
         if mp.is_absolute() and mp.exists():
             return mp
 
-        cache_dir = self._model_cache_dir()
+        cache_dir = self.cache_dir()
         local = cache_dir / model_path_raw
         if use_cache and local.exists():
             return local
@@ -66,7 +71,6 @@ class ModelsMixin:
         if not controller:
             raise AppError(f"model not found locally and controllerUrl not set: {model_path_raw}", 404)
 
-        import urllib.parse
         label = report_label or Path(model_path_raw).name
         url = f"{controller}/api/models/download?path={urllib.parse.quote(model_path_raw)}"
         local.parent.mkdir(parents=True, exist_ok=True)
@@ -77,11 +81,11 @@ class ModelsMixin:
         last_exc: Exception = RuntimeError("no attempts made")
         for attempt, _ in enumerate((*_RETRY_DELAYS, None)):
             try:
-                req = urllib.request.Request(url, headers=self.controller_headers())
+                req = urllib.request.Request(url, headers=self.config.headers())
                 with urllib.request.urlopen(req, timeout=3600) as resp, open(tmp, "wb") as fh:
                     total = int(resp.headers.get("Content-Length") or 0)
                     if report:
-                        self._set_llama_startup(port, phase="downloading", downloadedBytes=0,
+                        self.report(port, phase="downloading", downloadedBytes=0,
                                                 totalBytes=total, downloadingFile=label)
                     done = 0
                     last_report = 0
@@ -94,9 +98,9 @@ class ModelsMixin:
                         # Throttle progress updates to ~every 32 MiB to limit lock churn.
                         if report and done - last_report >= (32 << 20):
                             last_report = done
-                            self._set_llama_startup(port, downloadedBytes=done)
+                            self.report(port, downloadedBytes=done)
                     if report:
-                        self._set_llama_startup(port, downloadedBytes=done)
+                        self.report(port, downloadedBytes=done)
                 # Guard against silent truncation: server closes TCP without error
                 # but before sending all bytes (network blip, restart mid-stream).
                 if total and done != total:
@@ -125,16 +129,15 @@ class ModelsMixin:
                 delay = _RETRY_DELAYS[attempt]
                 print(f"[llama-node] download transient error (attempt {attempt + 1}): {exc} — retrying in {delay}s…")
                 if report:
-                    self._set_llama_startup(
-                        downloadingFile=f"{label} (retry {attempt + 1} in {delay}s…)")
+                    # The port was missing here: the call raised TypeError on
+                    # the first blip, so a download that should have waited 5,
+                    # 15 and 30 s for a restarting controller failed at once.
+                    self.report(
+                        port, downloadingFile=f"{label} (retry {attempt + 1} in {delay}s…)")
                 time.sleep(delay)
         raise AppError(f"model download failed: {last_exc}", 500)
 
-    @staticmethod
-    def _truthy(value: Any) -> bool:
-        return str(value).strip().lower() in ("1", "true", "yes", "on")
-
-    def _cleanup_old_models(self, keep_paths: Any) -> None:
+    def cleanup_old(self, keep_paths: Any) -> None:
         """Delete .gguf files from modelsBasePath except the kept ones (model +
         mmproj + spec draft).
 
@@ -142,7 +145,7 @@ class ModelsMixin:
         Only touches files inside our own model cache dir — never touches files
         the user placed elsewhere.
         """
-        cache_dir = self._model_cache_dir()
+        cache_dir = self.cache_dir()
         if not cache_dir.is_dir():
             return
         if isinstance(keep_paths, (str, Path)):
@@ -168,12 +171,12 @@ class ModelsMixin:
         if deleted:
             print(f"[llama-node] cleanOldModels: removed {len(deleted)} file(s): {deleted}")
 
-    def _purge_model_cache(self, keep: Any = None) -> dict[str, Any]:
+    def purge(self, keep: Any = None) -> dict[str, Any]:
         """Delete downloaded .gguf/.tmp from the model cache dir (except `keep`).
 
         Called on stop when caching is off, and on demand via the purge-cache
         endpoint. Returns {removed, freedBytes}."""
-        cache_dir = self._model_cache_dir()
+        cache_dir = self.cache_dir()
         if not cache_dir.is_dir():
             return {"removed": 0, "freedBytes": 0}
         if isinstance(keep, (str, Path)):
@@ -202,21 +205,9 @@ class ModelsMixin:
             print(f"[llama-node] purge cache: removed {len(deleted)} file(s), freed {freed} bytes")
         return {"removed": len(deleted), "freedBytes": freed}
 
-    def purge_model_cache_safe(self) -> dict[str, Any]:
-        """On-demand cache purge. Keeps the currently running model's files so a
-        live server isn't broken."""
-        keep = []
-        for _p, slot in self._slots_snapshot():
-            if slot.node.status().get("running"):
-                cfg = slot.node._cfg if hasattr(slot.node, "_cfg") else {}
-                for k in ("modelPath", "mmprojPath", "specPath"):
-                    if cfg.get(k):
-                        keep.append(cfg[k])
-        return self._purge_model_cache(keep=keep)
-
-    def list_cached_models(self) -> list[dict[str, Any]]:
+    def listing(self) -> list[dict[str, Any]]:
         """Return .gguf files currently stored in the model cache dir."""
-        cache_dir = self._model_cache_dir()
+        cache_dir = self.cache_dir()
         if not cache_dir.is_dir():
             return []
         result = []
@@ -230,7 +221,7 @@ class ModelsMixin:
                 pass
         return result
 
-    def _download_all_model_files(self, model_path_raw: str, mmproj_raw: str,
+    def download_all(self, model_path_raw: str, mmproj_raw: str,
                                    spec_raw: str, use_cache: bool, port: int = 0) -> tuple:
         """Download model + aux files, reporting progress for all of them.
 
@@ -248,16 +239,16 @@ class ModelsMixin:
         for idx, (raw, _) in enumerate(files):
             short = Path(raw).name
             label = f"{short} ({idx + 1}/{n})" if n > 1 else short
-            local = self._ensure_model(raw, report=True, report_label=label,
+            local = self.ensure(raw, report=True, report_label=label,
                                        use_cache=use_cache, port=port)
             results.append(str(local))
+        # In the order they were downloaded: the model, then mmproj if any,
+        # then the draft if any. Positions counted by hand read results[2]
+        # for a draft without an mmproj — an IndexError, so such a cell never
+        # started, after downloading both files.
+        rest = iter(results[1:])
         mp = results[0]
-        mmproj_abs = results[1] if mmproj_raw else ""
-        spec_abs = results[2] if spec_raw else (results[1] if spec_raw and not mmproj_raw else "")
-        # Correct the spec index when mmproj is absent
-        if spec_raw and not mmproj_raw:
-            spec_abs = results[1]
-        elif spec_raw and mmproj_raw:
-            spec_abs = results[2]
+        mmproj_abs = next(rest) if mmproj_raw else ""
+        spec_abs = next(rest) if spec_raw else ""
         return mp, mmproj_abs, spec_abs
 

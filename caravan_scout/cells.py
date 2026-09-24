@@ -1,168 +1,122 @@
-"""CellsMixin: llama/command server cells — build args, artifacts, start/stop, apply routes."""
+"""The cells of this machine: each one on its port, the table of them, what
+they look like from outside, and what outlives a scout restart."""
 from __future__ import annotations
 
 import json
 import os
-import re
 import signal
-import shlex
-import socket
 import subprocess
-import sys
 import threading
 import time
-import urllib.error
 import urllib.request
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from caravan_scout.paths import LLAMA_PATH_PLACEHOLDER_MMPROJ, LLAMA_PATH_PLACEHOLDER_MODEL, LLAMA_PATH_PLACEHOLDER_SPEC, SERVER_CELLS_DIR
-from caravan_scout.cell_assets import sync_for_command
-from caravan_scout.errors import AppError
+
+from caravan_scout.models import ModelFetcher
+from caravan_scout.process import CellProcess, HostProcesses
+from caravan_scout.starts import CellStart
+
+class Cell:
+    """One cell on one port: its process, how its start is going, and whether
+    its model files stay cached when it stops.
+
+    A machine can hold several cells at once — a translator and a whisper
+    cell, say; each keeps its own process, startup record, lock and flag.
+    """
+
+    def __init__(self, port: int):
+        self.port = int(port)
+        self.process = CellProcess()
+        self.startup: dict[str, Any] = {"phase": "idle"}
+        self.lock = threading.Lock()
+        self.cache_models = False
 
 
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+class LlamaProbe:
+    """What a llama-server says about itself over HTTP, per port: token rates
+    and its queue from /metrics (kept ~2 s), the context window it was
+    launched with from /props (kept ~30 s).
+
+    A server that does not answer says nothing: no metrics, a window of 0 —
+    and that silence is kept as long as an answer would be.
+    """
+
+    def __init__(self):
+        self._metrics: dict[Any, tuple[float, dict[str, Any]]] = {}
+        self._ctx: dict[Any, tuple[float, int]] = {}
+
+    def metrics(self, port) -> dict[str, Any]:
+        """Scrape the local llama-server /metrics (Prometheus) for live token
+        rates. Cached ~2s. Returns {promptTps, genTps, requestsProcessing}."""
+        now = time.time()
+        hit = self._metrics.get(port)
+        if hit and now - hit[0] < 2:
+            return hit[1]
+        out: dict[str, Any] = {}
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{int(port)}/metrics", timeout=1) as r:
+                for line in r.read().decode("utf-8", "replace").splitlines():
+                    if line.startswith("#") or " " not in line:
+                        continue
+                    key, _, val = line.partition(" ")
+                    try:
+                        num = float(val.split()[0])
+                    except (ValueError, IndexError):
+                        continue
+                    if key == "llamacpp:prompt_tokens_seconds":
+                        out["promptTps"] = round(num, 2)
+                    elif key == "llamacpp:predicted_tokens_seconds":
+                        out["genTps"] = round(num, 2)
+                    elif key == "llamacpp:requests_processing":
+                        out["requestsProcessing"] = int(num)
+                    elif key == "llamacpp:kv_cache_usage_ratio":
+                        out["_kvRatio"] = num
+        except Exception:
+            out = {}
+        # Context window the server launched with + live KV-cache occupancy.
+        ctx_max = self.ctx_max(port)
+        ratio = out.pop("_kvRatio", None)
+        if ctx_max:
+            out["ctxMax"] = ctx_max
+            if ratio is not None:
+                out["ctxUsed"] = int(round(ratio * ctx_max))
+        self._metrics[port] = (now, out)
+        return out
+
+    def ctx_max(self, port) -> int:
+        """n_ctx the llama-server was launched with, from /props. Cached ~30s
+        PER PORT (same single-slot thrash as Machine.firewall — see its note)."""
+        now = time.time()
+        hit = self._ctx.get(port)
+        if hit and now - hit[0] < 30:
+            return hit[1]
+        ctx = 0
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{int(port)}/props", timeout=1) as r:
+                props = json.loads(r.read().decode("utf-8", "replace"))
+            gen = props.get("default_generation_settings") or {}
+            ctx = int(gen.get("n_ctx") or props.get("n_ctx") or 0)
+        except Exception:
+            ctx = 0
+        self._ctx[port] = (now, ctx)
+        return ctx
 
 
-class CellsMixin:
-    # ── llama.cpp update job ──────────────────────────────────────────────────
-    # Runs scripts/update-llama.sh (a synced copy of the controller's
-    # install-llama.sh: release-tag/commit checkout -f, stale-build-dir guard,
-    # probe-gated Blackwell workaround, cmake build) as a background thread and
-    # streams its output into a ring buffer. Running cells keep the OLD binary
-    # (they hold its inode) until restarted — deliberately never automatic.
-    # The slim status rides every heartbeat so the controller UI can show
-    # "building…" without extra calls.
+class CellRecords:
+    """What was started on this machine, kept in state.json under "cells" so
+    the next scout start can find it again: one record per port — the pid,
+    the marker its command line carries, the config, where it logs.
 
-    def _llama_update_job(self) -> dict:
-        job = getattr(self, "_llama_update_state", None)
-        if job is None:
-            job = {"running": False, "startedAt": 0, "tag": "", "lines": [],
-                   "done": False, "rc": None, "error": ""}
-            self._llama_update_state = job
-            self._llama_update_lock = threading.Lock()
-        return job
+    Written under the state's one lock, saved at once.
+    """
 
-    def llama_update_status(self) -> dict:
-        job = self._llama_update_job()
-        with self._llama_update_lock:
-            snap = {k: v for k, v in job.items() if k != "lines"}
-            snap["lines"] = list(job["lines"])[-200:]
-            return snap
+    def __init__(self, state):
+        self.state = state
 
-    def llama_update_status_slim(self) -> dict:
-        job = self._llama_update_job()
-        with self._llama_update_lock:
-            return {"running": job["running"], "done": job["done"], "rc": job["rc"],
-                    "startedAt": job["startedAt"], "tag": job["tag"],
-                    "lastLine": (job["lines"][-1] if job["lines"] else "")}
-
-    def llama_builds_list(self) -> dict:
-        """Archived build snapshots on THIS host (newest first) — the update
-        script writes one per successful build and prunes to 5 by default."""
-        root = Path(os.environ.get("LLAMA_BUILDS_DIR")
-                    or Path.home() / ".local" / "share" / "lama-caravan" / "llama-builds")
-        rows = []
-        if root.is_dir():
-            for entry in sorted(root.iterdir(), reverse=True):
-                meta = entry / "meta.json"
-                if not meta.is_file():
-                    continue
-                try:
-                    row = json.loads(meta.read_text(encoding="utf-8"))
-                except Exception:
-                    continue
-                row["id"] = entry.name
-                rows.append(row)
-        return {"ok": True, "builds": rows}
-
-    def llama_update_start(self, body: dict) -> dict:
-        """POST /api/llama-node/update {tag?} — empty tag = latest release; a
-        commit sha works too (checkout -f accepts either), which is how the
-        controller converges a client onto its own build. With {restoreId} the
-        same job restores an archived build instead of building."""
-        job = self._llama_update_job()
-        script = Path(__file__).resolve().parent.parent / "scripts" / "update-llama.sh"
-        if not script.exists():
-            raise AppError(f"update script not found: {script}", 500)
-        tag = str((body or {}).get("tag") or "").strip()
-        restore_id = str((body or {}).get("restoreId") or "").strip()
-        if restore_id:
-            cmd = ["bash", str(script), "--restore", restore_id]
-            tag = f"restore:{restore_id}"
-        else:
-            cmd = ["bash", str(script), "--force", "--no-restart"]
-            if tag:
-                cmd += ["--llama-tag", tag]
-        with self._llama_update_lock:
-            if job["running"]:
-                raise AppError("a llama.cpp update is already running", 409)
-            job.update({"running": True, "startedAt": int(time.time()), "tag": tag,
-                        "lines": [], "done": False, "rc": None, "error": ""})
-        env = dict(os.environ)
-        env["PATH"] = "/usr/local/cuda/bin:" + env.get("PATH", "/usr/bin:/bin")
-        # Clients keep a SHORT archive (default 2: current + one-step undo) —
-        # client snapshots are big and a client rollback is never urgent: cells
-        # keep serving their old binary through any rebuild. config.json
-        # `llamaBuildsKeep` overrides.
-        env.setdefault("LLAMA_BUILDS_KEEP",
-                       str(int(self.config.get("llamaBuildsKeep") or 2)))
-
-        def _run():
-            rc, error = -1, ""
-            try:
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                        stderr=subprocess.STDOUT, text=True, env=env)
-                for line in proc.stdout:
-                    clean = _ANSI_RE.sub("", line.rstrip())
-                    with self._llama_update_lock:
-                        job["lines"].append(clean)
-                        if len(job["lines"]) > 500:
-                            del job["lines"][:100]
-                rc = proc.wait()
-            except Exception as exc:
-                error = str(exc)
-            finally:
-                with self._llama_update_lock:
-                    job.update({"running": False, "done": True, "rc": rc, "error": error})
-
-        threading.Thread(target=_run, daemon=True, name="llama-update").start()
-        return self.llama_update_status()
-
-    def _server_cell_dir(self, port: int) -> Path:
-        return SERVER_CELLS_DIR / str(int(port))
-
-    def _write_llama_cell_artifacts(self, port: int, bin_path: str, args: list[str],
-                                    config: dict[str, Any], runtime_cfg: dict[str, Any]) -> dict[str, Any]:
-        cell_dir = self._server_cell_dir(port)
-        cell_dir.mkdir(parents=True, exist_ok=True)
-        start_path = cell_dir / "start.sh"
-        json_path = cell_dir / "cell.json"
-        cmd = [str(Path(bin_path).expanduser()), *[str(a) for a in args]]
-        script = "#!/usr/bin/env bash\nset -euo pipefail\n\nexec " + " ".join(shlex.quote(x) for x in cmd) + " \"$@\"\n"
-        tmp_start = start_path.with_suffix(".sh.tmp")
-        tmp_json = json_path.with_suffix(".json.tmp")
-        tmp_start.write_text(script, encoding="utf-8")
-        tmp_start.chmod(0o755)
-        tmp_start.replace(start_path)
-        payload = {
-            "hostId": str(self.config.get("hostId") or ""),
-            "port": int(port),
-            "config": config,
-            "runtime": runtime_cfg,
-            "cmd": cmd,
-            "generatedAt": int(time.time()),
-            "startScript": str(start_path),
-        }
-        tmp_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        tmp_json.replace(json_path)
-        return {"dir": str(cell_dir), "startScript": str(start_path),
-                "cellJson": str(json_path), "generatedAt": payload["generatedAt"]}
-
-    def _register_cell(self, port: int, kind: str, pid: int, marker: str,
-                       cfg: dict, log_path, cache_models: bool,
-                       health_path: str = "/health") -> None:
-        with self.lock:
+    def add(self, port: int, kind: str, pid: int, marker: str,
+            cfg: dict, log_path, cache_models: bool,
+            health_path: str = "/health") -> None:
+        with self.state.lock:
             cells = self.state.setdefault("cells", {})
             cells[str(int(port))] = {
                 "port": int(port), "kind": kind, "pid": int(pid),
@@ -170,101 +124,148 @@ class CellsMixin:
                 "cfg": {k: v for k, v in (cfg or {}).items() if k != "cmd"},
                 "log": str(log_path or ""),
                 "cacheModels": bool(cache_models),
-                # Kept because re-adoption happens at agent startup, long after
+                # Kept because re-adoption happens at scout startup, long after
                 # the controller told us where this cell answers. A vLLM cell
                 # replies on /v1/models; probing /health would bury it.
                 "healthPath": str(health_path or "/health"),
                 "startedAt": int(time.time()),
             }
-            self.save_state()
+            self.state.save()
 
-    def _unregister_cell(self, port: int) -> None:
-        with self.lock:
+    def forget(self, port) -> None:
+        with self.state.lock:
             cells = self.state.get("cells") or {}
             if cells.pop(str(int(port)), None) is not None:
-                self.save_state()
+                self.state.save()
 
-    @staticmethod
-    def _marker_matches(marker: str, cmdline: str) -> bool:
-        """The exec'd argv[0] may be a resolved binary path (python3 → .../MacOS/Python),
-        so besides the exact substring also accept the marker's argument tail."""
-        if not marker or not cmdline:
-            return False
-        if marker in cmdline:
-            return True
-        tail = " ".join(marker.split()[1:])
-        return bool(tail) and tail in cmdline
+    def items(self) -> list[tuple[str, Any]]:
+        return list((self.state.get("cells") or {}).items())
 
-    @staticmethod
-    def _pid_cmdline(pid: int) -> str:
-        try:
-            out = subprocess.run(["ps", "-p", str(int(pid)), "-o", "command="],
-                                 capture_output=True, text=True, timeout=5)
-            return out.stdout.strip()
-        except Exception:
-            return ""
+    def get(self, port) -> dict[str, Any]:
+        return (self.state.get("cells") or {}).get(str(port)) or {}
 
-    @staticmethod
-    def _port_listener_pid(port: int) -> int:
-        """PID LISTENING on <port> (any local address), via `ss`; 0 if none. Lets us
-        re-identify a cell by its port when the launch marker no longer matches: a
-        wrapper that exec's into another program (run_whisper.sh → exec python)
-        rewrites argv, so the marker is gone from ps though the port is still served."""
-        want = str(int(port))
-        try:
-            out = subprocess.run(["ss", "-ltnpH"], capture_output=True,
-                                 text=True, timeout=5).stdout
-        except FileNotFoundError:
-            # macOS has no ss; lsof answers the same question. Without this the
-            # mac client silently returned 0 here — port-based re-adoption and
-            # the stop-time port check both degraded to "nobody listening".
-            try:
-                out2 = subprocess.run(
-                    ["lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-t"],
-                    capture_output=True, text=True, timeout=5).stdout.strip()
-                return int(out2.split()[0]) if out2 else 0
-            except Exception:
-                return 0
-        except Exception:
-            return 0
-        for line in out.splitlines():
-            parts = line.split()
-            if len(parts) < 4 or parts[3].rsplit(":", 1)[-1] != want:
-                continue  # parts[3] is the Local Address:Port column
-            m = re.search(r"pid=(\d+)", line)
-            if m:
-                return int(m.group(1))
-        return 0
+    def repoint(self, rec: dict[str, Any], pid: int) -> None:
+        """The record's process was found again under another pid."""
+        with self.state.lock:
+            rec["pid"] = pid
+            self.state.save()
 
-    @staticmethod
-    def _port_health_ok(port: int, timeout: float = 2.0, attempts: int = 1,
-                        health_path: str = "/health") -> bool:
-        """True if the server on <port> answers its health endpoint with 2xx —
-        confirming a real, healthy cell serves the port before we adopt whatever
-        pid owns it.
 
-        The path is NOT always /health: the controller computes it per cell (a
-        vLLM cell answers on /v1/models, a command cell can declare its own) and
-        sends it with the start request. Probing a hardcoded /health would call a
-        perfectly healthy vLLM cell dead.
+class Cells:
+    """The cells of this machine by port, and how each looks from outside.
 
-        Retries because this runs at agent startup, which is exactly when the host
-        is busiest — a single 2 s probe on a loaded box times out on a cell that is
-        perfectly alive."""
-        path = str(health_path or "/health").strip() or "/health"
-        if not path.startswith("/"):
-            path = "/" + path
-        for i in range(max(1, int(attempts))):
-            try:
-                with urllib.request.urlopen(
-                        f"http://127.0.0.1:{int(port)}{path}", timeout=timeout) as resp:
-                    return 200 <= int(getattr(resp, "status", 200) or 200) < 300
-            except Exception:
-                if i + 1 < attempts:
-                    time.sleep(1.0)
-        return False
+    A cell comes into being the first time anything starts, reports or asks
+    about its port, and goes when it is stopped (drop). Its identity is the
+    cancellation token of a start: a start that finds its Cell replaced knows
+    it was stopped while it worked.
+    """
 
-    def adopt_or_reap_strays(self) -> None:
+    def __init__(self, machine, config, state):
+        self.machine = machine
+        self.config = config
+        self.by_port: dict[int, Cell] = {}
+        self._lock = threading.Lock()
+        self.probe = LlamaProbe()
+        self.records = CellRecords(state)
+        self.processes = HostProcesses()
+        # The model files are the cells': downloads report into a cell's
+        # startup record, and a purge keeps what a running cell holds.
+        self.models = ModelFetcher(config, self.report)
+
+    def at(self, port) -> Cell:
+        """The cell on `port`, made on first use."""
+        port = int(port)
+        with self._lock:
+            cell = self.by_port.get(port)
+            if cell is None:
+                cell = self.by_port[port] = Cell(port)
+            return cell
+
+    def all(self) -> list[tuple[int, Cell]]:
+        """(port, cell) pairs in the order the cells came — a copy."""
+        with self._lock:
+            return list(self.by_port.items())
+
+    def drop(self, port) -> None:
+        with self._lock:
+            self.by_port.pop(int(port), None)
+
+    def holds(self, port, cell) -> bool:
+        """True while `cell` is still THE cell of this port.
+
+        A stop request replaces/removes the cell object, so identity is the
+        cheapest possible cancellation token for the startup worker: no flags,
+        no epochs — if the object changed, someone stopped or re-created the
+        cell while we were downloading. Checked WITHOUT at(), which would
+        re-create an empty cell as a side effect.
+        """
+        with self._lock:
+            return self.by_port.get(int(port)) is cell
+
+    def report(self, port, **fields: Any) -> None:
+        """A start says how it is going: fields merged into the cell's record."""
+        cell = self.at(port)
+        with cell.lock:
+            cell.startup.update(fields)
+
+    def startup(self, port) -> dict[str, Any]:
+        """A copy of the cell's startup record."""
+        cell = self.at(port)
+        with cell.lock:
+            return dict(cell.startup)
+
+    def view(self, cell: Cell) -> dict[str, Any]:
+        """The process's status merged with its start's phase and progress, so
+        the admin sees downloading/loading state before the server is up."""
+        port = cell.port
+        st = cell.process.status()
+        with cell.lock:
+            startup = dict(cell.startup)
+        phase = startup.get("phase")
+        if st.get("running"):
+            p = st.get("port") or port
+            metrics = self.probe.metrics(p) if p else {}
+            return {**st, "port": p, "phase": "running", **metrics,
+                    "firewall": self.machine.firewall(p) if p else {}}
+        # Crashed shortly after start (non-zero exit) — surface as error even if
+        # the startup worker already marked it "running".
+        if st.get("crashed"):
+            return {**st, "phase": "error", "port": startup.get("port") or port,
+                    "modelPath": startup.get("modelPath", ""),
+                    "lastError": st.get("lastError") or f"exited (code {st.get('exitCode')})"}
+        if phase in ("resolving", "downloading", "loading"):
+            return {
+                **st, "running": False, "phase": phase,
+                "modelPath": startup.get("modelPath", ""),
+                "port": startup.get("port") or port,
+                "downloadedBytes": startup.get("downloadedBytes", 0),
+                "totalBytes": startup.get("totalBytes", 0),
+                "downloadingFile": startup.get("downloadingFile", ""),
+                "startedAt": startup.get("startedAt"),
+            }
+        if phase == "error":
+            return {**st, "port": port, "phase": "error",
+                    "lastError": startup.get("error") or st.get("lastError", "")}
+        return {**st, "port": port}
+
+    def views(self) -> list[dict[str, Any]]:
+        return [self.view(cell) for _port, cell in self.all()]
+
+    def first_view(self) -> dict[str, Any]:
+        """The single-cell view older controllers read: the first cell's."""
+        nodes = self.views()
+        return nodes[0] if nodes else {"running": False, "phase": "idle"}
+
+    def held_files(self) -> list[str]:
+        """The model files the running cells hold: what a cache purge keeps."""
+        keep: list[str] = []
+        for _port, cell in self.all():
+            keep.extend(cell.process.held_files())
+        return keep
+
+    # ── what outlives a scout restart ───────────────────────────────────────
+
+    def adopt_survivors(self) -> None:
         """Re-attach cells that survived the agent restart, then reap only the
         truly orphaned llama-server processes.
 
@@ -277,27 +278,27 @@ class CellsMixin:
         serving the cell's port. Anything matching llamaServerBin that was NOT
         adopted is a real stray and gets reaped as before."""
         adopted_pids = set()
-        for key, rec in list((self.state.get("cells") or {}).items()):
+        for key, rec in self.records.items():
             try:
                 port = int(rec.get("port") or key)
                 rec_pid = int(rec.get("pid") or 0)
             except (TypeError, ValueError):
                 continue
             marker = str(rec.get("marker") or "")
-            cmdline = self._pid_cmdline(rec_pid) if rec_pid > 1 else ""
-            if rec_pid > 1 and self._marker_matches(marker, cmdline):
+            cmdline = self.processes.cmdline(rec_pid) if rec_pid > 1 else ""
+            if rec_pid > 1 and self.processes.marker_matches(marker, cmdline):
                 pid = rec_pid
             else:
                 # Marker gone (an exec-chained wrapper like run_whisper.sh → exec
                 # python rewrote argv) or the recorded pid was clobbered by a failed
                 # restart. Identify the cell by its real contract instead: whoever
                 # is healthily serving the cell's PORT right now IS the cell.
-                pid = self._port_listener_pid(port)
+                pid = self.processes.listener(port)
                 if not pid:
-                    self._unregister_cell(port)   # nothing serves it — really gone
+                    self.records.forget(port)   # nothing serves it — really gone
                     continue
-                if not self._port_health_ok(port, timeout=4.0, attempts=3,
-                                            health_path=rec.get("healthPath") or "/health"):
+                if not self.processes.healthy(port, timeout=4.0, attempts=3,
+                                              health_path=rec.get("healthPath") or "/health"):
                     # Something owns the port but stayed quiet. On a loaded host
                     # that is a timeout, not a death — and unregistering here
                     # stranded a live cell as "stopped" forever while its process
@@ -307,25 +308,23 @@ class CellsMixin:
                           f"{rec.get('healthPath') or '/health'} stayed quiet — "
                           f"adopting anyway rather than forgetting it")
                 if pid != rec_pid:            # re-discovered by port → keep registry honest
-                    with self.lock:
-                        rec["pid"] = pid
-                        self.save_state()
-            slot = self._slot(port)
+                    self.records.repoint(rec, pid)
+            cell = self.at(port)
             log = rec.get("log") or ""
-            slot.node.adopt(pid, dict(rec.get("cfg") or {}),
-                            log_path=Path(log) if log else None,
-                            started_at=int(rec.get("startedAt") or 0))
-            slot.cache_models = bool(rec.get("cacheModels"))
-            self._set_llama_startup(port, phase="running", error="")
+            cell.process.adopt(pid, dict(rec.get("cfg") or {}),
+                               log_path=Path(log) if log else None,
+                               started_at=int(rec.get("startedAt") or 0))
+            cell.cache_models = bool(rec.get("cacheModels"))
+            self.report(port, phase="running", error="")
             adopted_pids.add(pid)
             print(f"[llama-node] adopted running cell :{port} (pid {pid})")
-        self.reap_stray_llama_servers(keep_pids=adopted_pids)
+        self.reap_strays(keep_pids=adopted_pids)
 
-    def reap_stray_llama_servers(self, keep_pids=None) -> None:
+    def reap_strays(self, keep_pids=None) -> None:
         """Kill any llama-server left from a previous agent run.
 
         With KillMode=process / AbandonProcessGroup the children survive the
-        unit restart on purpose — adopt_or_reap_strays() re-attaches the ones
+        unit restart on purpose — adopt_survivors() re-attaches the ones
         recorded in the registry and passes their pids in `keep_pids`; whatever
         llama-server remains unmatched is a genuine orphan holding the GPU and
         the port, and is terminated here."""
@@ -358,400 +357,84 @@ class CellsMixin:
                 pass
         if not keep:
             try:
-                self._purge_model_cache()
+                self.models.purge()
             except Exception:
                 pass
 
-    def save_llama_node_config(self, model_path: str, port: int,
-                               gpu_layers: int, ctx_size: int) -> None:
-        """Save a timestamped JSON backup of the launch parameters."""
-        self._configs_dir.mkdir(parents=True, exist_ok=True)
-        now = int(time.time())
-        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
-        model_name = Path(model_path).name
-        data = {
-            "savedAt": stamp,
-            "savedAtTs": now,
-            "modelPath": model_path,
-            "modelName": model_name,
-            "port": port,
-            "gpuLayers": gpu_layers,
-            "ctxSize": ctx_size,
-        }
-        filename = f"llama-node.bak.{stamp}.json"
-        target = self._configs_dir / filename
-        tmp = target.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(target)
+    # ── stopping ────────────────────────────────────────────────────────────
 
-    def list_llama_node_configs(self) -> list[dict[str, Any]]:
-        """Return saved launch configs, newest first (max 20)."""
-        if not self._configs_dir.is_dir():
-            return []
-        rows = []
-        for p in sorted(self._configs_dir.glob("llama-node.bak.*.json"), reverse=True)[:20]:
-            try:
-                data = json.loads(p.read_text(encoding="utf-8"))
-                data["filename"] = p.name
-                rows.append(data)
-            except Exception:
+    def stop(self, port=None) -> dict[str, Any]:
+        """Stop one cell (`port`) or every cell (no port), and say how each went.
+
+        A stopped cell leaves the table and the registry, and the model cache
+        loses what no running cell holds — unless the cell keeps its models
+        cached. A stop that could not verify must not erase the registry
+        entry: that would turn a recoverable cell into a genuinely unowned
+        process."""
+        ports = [int(port)] if port else [p for p, _ in self.all()]
+        results = []
+        purge_any = False
+        for p in ports:
+            cell = self.at(p)
+            res = cell.process.stop()
+            if res.get("detail") == "not running":
+                res = self._reclaim(p, res)
+            results.append(res)
+            if not res.get("ok"):
                 continue
-        return rows
-
-    def delete_llama_node_config(self, filename: str) -> None:
-        """Delete a saved config backup by filename (no path traversal)."""
-        filename = Path(filename).name  # strip any path components
-        if not filename.startswith("llama-node.bak.") or not filename.endswith(".json"):
-            raise AppError("invalid backup filename", 400)
-        target = self._configs_dir / filename
-        if not target.exists():
-            raise AppError(f"backup not found: {filename}", 404)
-        target.unlink()
-
-    def host_listeners(self) -> dict[str, Any]:
-        """TCP ports LISTENing on this host, with the owning process where the
-        OS will say.
-
-        The controller's cell-port picker can only see its own box, so a
-        listener on a CLIENT — someone's dev server, a leftover service — was
-        invisible: the picker painted the number free, the cell reserved fine
-        and then failed to bind. This is the client half of that answer.
-
-        `ss -ltnp` only reveals pids for our own processes without root; an
-        unknown owner still reports the port, with an empty proc. Knowing the
-        number is taken matters more than knowing by whom.
-        """
-        rows: list[dict[str, Any]] = []
-        try:
-            res = subprocess.run(["ss", "-ltnpH"], text=True, capture_output=True, timeout=6)
-            for line in (res.stdout or "").splitlines():
-                parts = line.split()
-                if len(parts) < 4:
-                    continue
-                _, _, port = parts[3].rpartition(":")
-                if not port.isdigit():
-                    continue
-                m = re.search(r'\("([^"]+)",pid=(\d+)', line)
-                rows.append({"port": int(port),
-                             "proc": m.group(1) if m else "",
-                             "pid": int(m.group(2)) if m else 0})
-        except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "error": str(exc)[:160], "ports": []}
-        # One row per port: a socket bound on both v4 and v6 is one listener.
-        best: dict[int, dict[str, Any]] = {}
-        for r in rows:
-            cur = best.get(r["port"])
-            if cur is None or (not cur.get("proc") and r.get("proc")):
-                best[r["port"]] = r
-        return {"ok": True, "ports": sorted(best.values(), key=lambda r: r["port"])}
-
-    def monitor_nvidia_smi(self) -> dict[str, Any]:
-        """Run nvidia-smi and return raw text output for the admin monitor panel."""
-        try:
-            result = subprocess.run(
-                ["nvidia-smi"], text=True, capture_output=True, timeout=5
-            )
-            ok = result.returncode == 0
-            output = (result.stdout if ok else result.stderr or result.stdout).strip()
-        except FileNotFoundError:
-            ok, output = False, "nvidia-smi not found"
-        except Exception as exc:
-            ok, output = False, str(exc)
-        return {
-            "kind": "nvidia-smi",
-            "ok": ok,
-            "output": output,
-            "source": self.config.get("hostId") or self.config.get("displayName") or "remote",
-            "time": int(time.time()),
-        }
-
-    def llama_node_start(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Kick off model resolve (local or download) + llama-server start in a
-        background thread and return immediately.
-
-        Downloading a multi-GB model can take minutes, far longer than the
-        admin's HTTP client timeout, so the heavy work runs off the request
-        thread. Progress is reported via llamaNode (phase + bytes) in the
-        heartbeat / /api/state.
-        """
-        req_config = payload.get("config") if isinstance(payload.get("config"), dict) else {}
-        cell_kind = str(payload.get("cellKind") or req_config.get("CELL_KIND") or "").strip().lower()
-        if cell_kind == "command":
-            return self._command_cell_start(payload, req_config)
-
-        bin_path = str(self.config.get("llamaServerBin") or "").strip()
-        if not bin_path:
-            raise AppError("llamaServerBin not configured in config.json — run install.sh first", 400)
-
-        # Full admin form config (all llama.cpp flags). Falls back to a minimal
-        # config synthesised from the legacy individual fields for older callers.
-        config = payload.get("config") if isinstance(payload.get("config"), dict) else {}
-        model_path_raw = str(payload.get("modelPath") or config.get("MODEL_FILE") or "").strip()
-        if not model_path_raw:
-            raise AppError("modelPath is required", 400)
-        if not config:
-            config = {
-                "MODEL_FILE": model_path_raw,
-                "PORT": payload.get("port"),
-                "N_GPU_LAYERS": payload.get("gpuLayers"),
-                "CTX_SIZE": payload.get("ctxSize"),
-            }
-
-        port = int(config.get("PORT") or payload.get("port") or self.config.get("llamaNodeDefaultPort") or 8180)
-        config["PORT"] = port
-        config.setdefault("HOST", "0.0.0.0")
-        slot = self._slot(port)
-        if slot.node.status().get("running"):
-            return {"ok": False, "error": f"a server is already running on port {port}"}
-        phase = self._get_llama_startup(port).get("phase")
-        if phase in ("resolving", "downloading", "loading"):
-            return {"ok": False, "error": f"startup already in progress on port {port} ({phase})", "phase": phase}
-
-        mmproj_raw = str(config.get("MMPROJ_FILE") or "").strip()
-        spec_raw = str(config.get("SPEC_DRAFT_MODEL_FILE") or "").strip()
-        cache_models = bool(payload.get("cacheModels", self.config.get("cacheModels", False)))
-        slot.cache_models = cache_models
-
-        # Variant 2: the controller supplies the argument list (with path
-        # placeholders) and this agent only substitutes the real paths.
-        incoming_args = payload.get("args") if isinstance(payload.get("args"), list) else None
-
-        self._set_llama_startup(
-            port, phase="resolving", modelPath=model_path_raw,
-            downloadedBytes=0, totalBytes=0, error="", startedAt=int(time.time()),
-        )
-
-        # Open the port in ufw so the admin server can reach llama-server.
-        # Silently skips if ufw is inactive or passwordless sudo is not set up.
-        try:
-            import subprocess as _sp
-            _sp.run(["sudo", "-n", "ufw", "allow", str(port)],
-                    capture_output=True, timeout=5)
-        except Exception:
-            pass
-        threading.Thread(
-            target=self._llama_startup_worker,
-            args=(port, bin_path, config, model_path_raw, mmproj_raw, spec_raw, cache_models, incoming_args),
-            daemon=True,
-        ).start()
-        return {"ok": True, "status": "starting", "phase": "resolving", "port": port}
-
-    def _command_cell_start(self, payload: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-        """Start a generic command cell (CELL_KIND="command") on this host.
-
-        Runs an arbitrary managed process (e.g. whisper-server) in the same
-        single-process slot as a llama node — no model download, no
-        llama-server binary. SECURITY: this executes a controller-supplied shell
-        command on this host; only the trusted-LAN admin can reach this endpoint.
-        """
-        command = re.sub(r"^\s*exec\s+", "",
-                         str(payload.get("command") or config.get("COMMAND") or "").strip()).strip()
-        if not command:
-            raise AppError("command is required for a command cell", 400)
-        port = int(config.get("PORT") or payload.get("port")
-                   or self.config.get("llamaNodeDefaultPort") or 8180)
-        slot = self._slot(port)
-        if slot.node.status().get("running"):
-            return {"ok": False, "error": f"a server is already running on port {port}"}
-        phase = self._get_llama_startup(port).get("phase")
-        if phase in ("resolving", "downloading", "loading"):
-            return {"ok": False, "error": f"startup already in progress on port {port} ({phase})", "phase": phase}
-
-        # Open the port in ufw so the admin/clients can reach the cell.
-        try:
-            import subprocess as _sp
-            _sp.run(["sudo", "-n", "ufw", "allow", str(port)], capture_output=True, timeout=5)
-        except Exception:
-            pass
-
-        # The controller sends the whole start line — shell flags, exports,
-        # workdir, exec. This agent used to rebuild it from `command` plus the
-        # config, mirroring the controller's script renderer, and the mirror had
-        # already lost `set -euo pipefail`: one config, two behaviours depending
-        # on which host ran the cell. Refusing beats guessing.
-        shell_line = str(payload.get("shellLine") or "").strip()
-        if not shell_line:
-            raise AppError(
-                "controller sent no shellLine for this command cell — it is older "
-                "than this agent (needs lama-caravan v1.3.115+)", 400)
-        log_path = self._model_cache_dir() / f"command-cell.{int(port)}.log"
-        # A command cell used to mean "no model, ever". The transcribe runner
-        # broke that: its model is a GGUF PATH like a llama cell's, and the
-        # command the controller sends names it under the models dir. So a
-        # download CAN be needed here — and without one the failure was quiet:
-        # the cell came up healthy on its port and only said "model file not
-        # found" inside its own log.
-        #
-        # modelPath is filled in for a second reason. purge_model_cache_safe()
-        # keeps the files of RUNNING slots by reading exactly this key; left
-        # empty, a cache purge deletes the weights out from under a running
-        # recognizer — the kind of bug that surfaces weeks later.
-        model_raw = str(config.get("MODEL_FILE") or "").strip()
-        model_abs = ""
-        if model_raw:
-            self._set_llama_startup(port, phase="resolving", modelPath=model_raw,
-                                    downloadedBytes=0, totalBytes=0, error="",
-                                    startedAt=int(time.time()))
+            self.report(p, phase="idle", error="", downloadedBytes=0, totalBytes=0)
+            # Don't keep models on client disks (unless caching is on).
+            if not cell.cache_models:
+                purge_any = True
+            self.drop(p)   # a stopped cell disappears from the fleet view
+            self.records.forget(p)
+        # Purge once, after the stopped cells are dropped, via the SAFE variant
+        # so a model still served by another running cell isn't evicted
+        # (stopping whisper must not delete the translator gguf).
+        if purge_any:
             try:
-                model_abs = str(self._ensure_model(model_raw, report=True,
-                                                   use_cache=True, port=port))
-            except Exception as exc:  # noqa: BLE001
-                self._set_llama_startup(port, phase="error", error=str(exc))
-                return {"ok": False, "error": f"model not available: {exc}"}
-        cfg = {"modelPath": model_abs, "port": port, "cellKind": "command", "command": command}
-        # Whatever else a command cell runs is not downloadable, so its cache is
-        # never purged on stop.
-        slot.cache_models = True
-        self._set_llama_startup(port, phase="loading", modelPath=command[:80],
-                                downloadedBytes=0, totalBytes=0, error="",
-                                startedAt=int(time.time()))
-        # The controller owns the cell servers; pick up its current copy before
-        # running the launcher this command names. Never fatal — see cell_assets.
-        try:
-            synced = sync_for_command(
-                command,
-                str(self.config.get("controllerUrl") or ""),
-                self.controller_headers(),
-                log=lambda m: print(f"[llama-node] {m}"))
-            if synced:
-                print(f"[llama-node] cell-assets :{port} — " +
-                      ", ".join(f"{k}={v}" for k, v in synced.items()))
-        except Exception as exc:  # noqa: BLE001
-            print(f"[llama-node] cell-assets :{port} skipped ({exc})")
-        result = slot.node.start_command(shell_line, cfg, log_path=log_path)
-        self._set_llama_startup(port, phase="running" if result.get("ok") else "error",
-                                error="" if result.get("ok") else (result.get("error") or "start failed"))
-        if result.get("ok"):
-            # Marker for re-adoption: the exec'd command line with $PORT expanded
-            # (the shell resolves it before exec, so ps shows the resolved form).
-            marker = command.replace("$PORT", str(port)).replace("~/", "")[:120]
-            self._register_cell(port, "command", result.get("pid") or 0, marker,
-                                cfg, log_path, slot.cache_models,
-                                health_path=str(payload.get("healthPath") or "/health"))
-        return result
+                self.purge_models_safely()
+            except Exception:
+                pass
+        return results[0] if len(results) == 1 else {"ok": True, "results": results}
 
-    @staticmethod
-    def _resolve_arg_paths(args: list[str], model_abs: str, mmproj_abs: str,
-                           spec_abs: str) -> list[str]:
-        """Swap the controller's path placeholders for the real downloaded paths."""
-        subst = {
-            LLAMA_PATH_PLACEHOLDER_MODEL: str(model_abs),
-            LLAMA_PATH_PLACEHOLDER_MMPROJ: str(mmproj_abs or ""),
-            LLAMA_PATH_PLACEHOLDER_SPEC: str(spec_abs or ""),
-        }
-        return [subst.get(a, a) for a in args]
-
-    def _llama_startup_worker(self, port: int, bin_path: str, config: dict[str, Any],
-                              model_path_raw: str, mmproj_raw: str, spec_raw: str,
-                              cache_models: bool = False,
-                              incoming_args: list[str] | None = None) -> None:
-        slot = self._slot(port)
-        try:
-            mp, mmproj_abs, spec_abs = self._download_all_model_files(
-                model_path_raw, mmproj_raw, spec_raw, use_cache=cache_models, port=port)
-        except Exception as exc:
-            self._set_llama_startup(port, phase="error", error=str(exc))
-            return
-
-        def build_args() -> list[str]:
-            # The controller builds the arg list; this agent only substitutes the
-            # paths of files it downloaded. It used to carry its own builder as a
-            # fallback — a 130-line mirror of the admin's, already 23 flags behind
-            # (no --api-key, --embeddings, --context-shift, --ssl-*…). A cell
-            # started through it looked configured on the board and ran without
-            # half of that config. Refusing is the honest answer.
-            if not incoming_args:
-                raise AppError(
-                    "controller sent no args for this llama cell — it is older "
-                    "than this agent (needs lama-caravan v1.3.115+)", 400)
-            return self._resolve_arg_paths(incoming_args, str(mp), mmproj_abs, spec_abs)
-
-        self._set_llama_startup(port, phase="loading")
-        gpu_layers = int(config.get("N_GPU_LAYERS") or 999)
-        ctx_size = int(config.get("CTX_SIZE") or 4096)
-        args = build_args()
-        # Per PORT, not one file for the whole host. Every llama cell used to
-        # write to llama-server.log and each new start renamed it away, while a
-        # running cell's fd followed the old inode — so a crashed cell's card
-        # quoted whichever cell had spawned last. That is how :8011's "Model
-        # loading failed" ended up showing a benign tokenizer warning from the
-        # Qwen cell on :8006 instead of its own out-of-VRAM error.
-        log_path = self._model_cache_dir() / f"llama-server.{int(port)}.log"
-        # Expose specType in the heartbeat so the UI can show the MTP badge
-        # even for built-in MTP (where specPath is empty).
-        _spec_type_raw = str(config.get("SPEC_TYPE") or "").strip().lower()
-        if _spec_type_raw == "mtp":
-            _spec_type_raw = "draft-mtp"
-        cfg = {"modelPath": str(mp), "mmprojPath": mmproj_abs, "specPath": spec_abs,
-               "specType": _spec_type_raw, "port": port,
-               "gpuLayers": gpu_layers, "ctxSize": ctx_size}
-        artifact = self._write_llama_cell_artifacts(port, bin_path, args, config, cfg)
-        cfg["artifact"] = artifact
-        # A Stop that arrived while we were downloading has already dropped the
-        # slot and unregistered the cell. Starting now would resurrect a process
-        # nobody owns — exactly how a llama-server once survived with 10.7 GB of
-        # VRAM while the board showed its port as stopped. Identity is the check:
-        # _drop_slot removed OUR object, so a fresh lookup no longer returns it.
-        if not self._slot_current(port, slot):
-            print(f"[llama-node] :{port} start cancelled — the cell was stopped mid-download")
-            return
-        result = slot.node.start(bin_path, args, cfg, log_path=log_path)
-
-        # Auto-recovery: if the error looks like a truncated/corrupted cached
-        # file, delete the bad files and re-download once before giving up.
-        # NOTE: result["error"] may be the generic "exiting due to model loading error"
-        # last line — also scan the log directly for corruption patterns.
-        if not result.get("ok") and cache_models:
-            err = result.get("error") or ""
-            log_err = slot.node._read_log_error(log_path)
-            if self._is_corruption_error(err) or self._is_corruption_error(log_err):
-                print(f"[llama-node] corruption detected in cached file(s), deleting and retrying…")
-                for p in [mp, mmproj_abs, spec_abs]:
-                    if p:
-                        try:
-                            Path(p).unlink(missing_ok=True)
-                            print(f"[llama-node]   deleted: {p}")
-                        except Exception as del_err:
-                            print(f"[llama-node]   delete failed for {p}: {del_err}")
-                self._set_llama_startup(port, phase="downloading", downloadedBytes=0, totalBytes=0,
-                                        downloadingFile="re-downloading…")
-                try:
-                    mp, mmproj_abs, spec_abs = self._download_all_model_files(
-                        model_path_raw, mmproj_raw, spec_raw, use_cache=False, port=port)
-                except Exception as exc:
-                    self._set_llama_startup(port, phase="error", error=str(exc))
-                    return
-                self._set_llama_startup(port, phase="loading")
-                args = build_args()
-                cfg = {"modelPath": str(mp), "mmprojPath": mmproj_abs, "specPath": spec_abs,
-                       "specType": _spec_type_raw, "port": port,
-                       "gpuLayers": gpu_layers, "ctxSize": ctx_size}
-                artifact = self._write_llama_cell_artifacts(port, bin_path, args, config, cfg)
-                cfg["artifact"] = artifact
-                result = slot.node.start(bin_path, args, cfg, log_path=log_path)
-
-        if result.get("ok") and not self._slot_current(port, slot):
-            # Stopped between our start and here (the corruption retry keeps this
-            # window open for a re-download). Registering would re-add the cell
-            # http.py just deleted; letting the process live would orphan it.
-            print(f"[llama-node] :{port} stopped during startup — terminating the fresh process")
+    def _reclaim(self, port: int, res: dict[str, Any]) -> dict[str, Any]:
+        """"not running" from a process with no handles means it consulted
+        NOTHING — the port may still be served by a process this scout lost
+        track of (that is precisely how a stop once reported success while
+        10.7 GB stayed occupied). Verify the port; kill only what we can
+        recognize as ours, never an arbitrary listener."""
+        lpid = self.processes.listener(port)
+        if not lpid:
+            return res
+        cmd = self.processes.cmdline(lpid)
+        mark = str(self.records.get(port).get("marker") or "")
+        bin_path = str(self.config.get("llamaServerBin") or "")
+        if (mark and self.processes.marker_matches(mark, cmd)) or (bin_path and bin_path in cmd):
             try:
-                slot.node.stop()
+                os.kill(lpid, signal.SIGTERM)
+                deadline = time.time() + 10
+                while time.time() < deadline and self.processes.cmdline(lpid):
+                    time.sleep(0.3)
+                if self.processes.cmdline(lpid):
+                    os.kill(lpid, signal.SIGKILL)
+                return {"ok": True, "reclaimed": True, "pid": lpid}
             except Exception as exc:  # noqa: BLE001
-                print(f"[llama-node] :{port} cleanup stop failed: {exc}")
-            return
-        if result.get("ok"):
-            self._set_llama_startup(port, phase="running", error="")
-            self._register_cell(port, "llama", result.get("pid") or 0, bin_path,
-                                cfg, log_path, cache_models)
-            # Manual snapshots only — no auto-save of launch params on start.
-            # Caching on ⇒ keep only the active model (don't accumulate on disk).
-            # Caching off ⇒ files get purged on stop anyway, no cleanup needed here.
-            if cache_models:
-                try:
-                    self._cleanup_old_models([str(mp), mmproj_abs, spec_abs])
-                except Exception:
-                    pass
-        else:
-            self._set_llama_startup(port, phase="error", error=result.get("error") or "start failed")
+                return {"ok": False, "error": f"reclaim failed: {exc}", "listenerPid": lpid}
+        return {"ok": False, "listenerPid": lpid,
+                "error": f"port {port} is held by an unrecognized "
+                         f"process (pid {lpid}) — not killing it"}
+
+    # ── starting ────────────────────────────────────────────────────────────
+
+    def start(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Start a cell as the controller asks: a llama cell or a command cell,
+        whichever the payload names (starts.py)."""
+        return CellStart.of(self, payload).run()
+
+    def purge_models_safely(self) -> dict[str, Any]:
+        """On-demand cache purge. Keeps the currently running cells' files so a
+        live server isn't broken: which files those are is the cells' to say,
+        the fetcher only deletes."""
+        return self.models.purge(keep=self.held_files())
 

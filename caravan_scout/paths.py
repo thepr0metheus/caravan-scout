@@ -1,22 +1,9 @@
 """Env-driven constants, controller-contract placeholders, config defaults."""
 from __future__ import annotations
 
-import json
 import os
-import re
-import signal
-import shlex
 import socket
-import subprocess
-import sys
-import threading
-import time
-import urllib.error
-import urllib.request
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SERVER_CELLS_DIR = Path(os.environ.get("LAMA_CARAVAN_SERVER_CELLS_DIR", str(PROJECT_ROOT / "var/server-cells"))).expanduser()
@@ -38,14 +25,6 @@ DEFAULT_CONFIG = {
     # The LAMA CARAVAN admin URL; empty = heartbeat stays off until configured.
     "controllerUrl": "",
     "heartbeatIntervalSeconds": 60,
-    # Fleet registry (single source of truth for agent identity). When set, this host's
-    # VM/docker agents are derived from <registryUrl>/api/agents instead of being hand-listed
-    # in "agents" below. Empty string = legacy behaviour (static "agents" list only).
-    "registryUrl": "",
-    "agents": [],
-    "applyCommand": "",
-    "openclawConfigPath": "",
-    "openclawAgentId": "openclaw",
     # llama-node: run a local llama-server on this host's GPU
     "llamaServerBin": "",      # path to llama-server binary
     "modelsBasePath": "",      # local cache dir for downloaded models (~/.llama-model-cache)

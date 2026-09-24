@@ -1,8 +1,16 @@
-"""Built-in pairing page served on GET / — lets a novice point this host at a
-LAMA CARAVAN controller from a browser instead of editing config.json."""
+"""The pairing page on GET /."""
 from __future__ import annotations
 
-PAIR_PAGE = """<!doctype html>
+
+class PairingPage:
+    """The page on GET / that lets a novice point this host at a LAMA CARAVAN
+    controller from a browser instead of editing config.json.
+
+    It reads /api/pairing, which stays open when a fleet token closes the
+    rest: the page for pasting the token must work before the token does.
+    """
+
+    HTML = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -61,7 +69,6 @@ PAIR_PAGE = """<!doctype html>
     <div class="row"><span class="k">Hostname / IP</span><span class="v" id="hostAddr">…</span></div>
     <div class="row"><span class="k">Platform</span><span class="v" id="platform">…</span></div>
     <div class="row"><span class="k">GPUs</span><span class="v" id="gpus">…</span></div>
-    <div class="row"><span class="k">Local agents detected</span><span class="v" id="agents">…</span></div>
     <div class="row"><span class="k">llama server cells</span><span class="v" id="cells">…</span></div>
   </div>
 
@@ -70,17 +77,19 @@ PAIR_PAGE = """<!doctype html>
     <div class="row"><span class="k">Paired with</span><span class="v" id="controller">—</span></div>
     <div class="row"><span class="k">Heartbeat</span><span class="v" id="hb"><span class="pill off">not configured</span></span></div>
     <form id="pairForm">
-      <input type="text" id="urlInput" placeholder="http://controller-ip:8090"
+      <input type="text" id="urlInput" placeholder="http://controller-ip:7990"
              autocomplete="off" spellcheck="false">
       <button type="submit" id="pairBtn">Pair</button>
     </form>
     <input type="password" id="tokenInput" placeholder="fleet token — only if the controller requires sign-in"
            autocomplete="off" spellcheck="false" style="margin-top:8px;width:100%">
     <p class="hint">Enter the address of the machine running the LAMA CARAVAN
-      admin (default port <b>8090</b>). This host will start sending heartbeats
+      admin (default port <b>7990</b>). This host will start sending heartbeats
       and appear on its topology board within a minute. If the controller has
       accounts enabled, paste its <b>fleet token</b> too (shown in the admin's
-      System → Security panel).</p>
+      System → Security panel). After the token was regenerated there, pair
+      again with the same address and the new token: this host takes it once
+      the controller accepts it.</p>
     <p class="msg" id="msg"></p>
   </div>
 
@@ -95,23 +104,14 @@ PAIR_PAGE = """<!doctype html>
   function esc(s) { var d = document.createElement("div"); d.textContent = s == null ? "" : String(s); return d.innerHTML; }
 
   function render(st) {
-    var host = st.host || {};
-    $("hostId").textContent = host.id || "?";
+    $("hostId").textContent = st.hostId || "?";
     if (st.version) $("ver").textContent = "caravan-scout v" + st.version;
-    $("hostAddr").textContent = (host.hostname || "?") + " / " + (host.ip || "?");
+    $("hostAddr").textContent = (st.hostname || "?") + " / " + (st.ip || "?");
     $("platform").textContent = st.platform || "?";
     var gpus = st.gpus || [];
-    $("gpus").textContent = gpus.length
-      ? gpus.map(function (g) { return g.name || g.model || "GPU"; }).join(", ")
-      : "none (CPU host)";
-    var agents = st.agents || [];
-    $("agents").textContent = agents.length
-      ? agents.length + " (" + agents.slice(0, 4).map(function (a) { return a.name || a.id; }).join(", ")
-        + (agents.length > 4 ? ", …" : "") + ")"
-      : "none";
-    var nodes = st.llamaNodes || [];
-    var running = nodes.filter(function (n) { return n.running; }).length;
-    $("cells").textContent = nodes.length ? running + " running / " + nodes.length : "none";
+    $("gpus").textContent = gpus.length ? gpus.join(", ") : "none (CPU host)";
+    var cells = st.cells || {};
+    $("cells").textContent = cells.total ? cells.running + " running / " + cells.total : "none";
 
     var ctl = st.controllerUrl || "";
     boardUrl = ctl;
@@ -136,7 +136,7 @@ PAIR_PAGE = """<!doctype html>
   }
 
   function refresh() {
-    fetch("/api/state").then(function (r) { return r.json(); }).then(render).catch(function () {});
+    fetch("/api/pairing").then(function (r) { return r.json(); }).then(render).catch(function () {});
   }
 
   $("pairForm").addEventListener("submit", function (ev) {
@@ -183,6 +183,6 @@ PAIR_PAGE = """<!doctype html>
 </html>
 """
 
-
-def pair_page_bytes() -> bytes:
-    return PAIR_PAGE.encode("utf-8")
+    @classmethod
+    def body(cls) -> bytes:
+        return cls.HTML.encode("utf-8")
