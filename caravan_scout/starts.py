@@ -87,6 +87,28 @@ class CellStart:
     def run(self) -> dict[str, Any]:
         raise NotImplementedError
 
+    def hints(self) -> dict[str, Any]:
+        """Where the controller reads each model file, keyed by the path this
+        scout is sent (ModelFetcher.in_place)."""
+        hints = self.payload.get("inPlace")
+        return hints if isinstance(hints, dict) else {}
+
+    @staticmethod
+    def models_root(model_raw: str, model_abs: str) -> dict[str, str]:
+        """LLAMA_MODELS_DIR for a command that names its model as
+        ${LLAMA_MODELS_DIR:-…}/<path>: the folder the model really sits under
+        here — read in place, or in this scout's cache. The command used to
+        fall back to ~/llama.cpp/models while the download went to the cache,
+        and the two never met. A value the operator set is exported by the
+        start line itself and wins."""
+        raw = str(model_raw or "").strip().strip("/")
+        if not raw or not model_abs or Path(model_raw).is_absolute():
+            return {}
+        path = str(model_abs).rstrip("/")
+        if not path.endswith("/" + raw):
+            return {}
+        return {"LLAMA_MODELS_DIR": path[: -len(raw) - 1] or "/"}
+
     def port(self) -> int:
         return int(self.config.get("PORT") or self.payload.get("port")
                    or self.cells.config.get("llamaNodeDefaultPort") or 8180)
@@ -164,7 +186,8 @@ class LlamaStart(CellStart):
         )
         self.open_firewall(port)
         launch = LlamaLaunch(self.cells, port, bin_path, config, model_path_raw,
-                             mmproj_raw, spec_raw, cache_models, incoming_args)
+                             mmproj_raw, spec_raw, cache_models, incoming_args,
+                             hints=self.hints())
         threading.Thread(target=launch.run, daemon=True).start()
         return {"ok": True, "status": "starting", "phase": "resolving", "port": port}
 
@@ -176,7 +199,9 @@ class LlamaLaunch:
 
     def __init__(self, cells, port: int, bin_path: str, config: dict[str, Any],
                  model: str, mmproj: str = "", spec: str = "",
-                 cache_models: bool = False, args: list[str] | None = None):
+                 cache_models: bool = False, args: list[str] | None = None,
+                 hints: dict[str, Any] | None = None):
+        self.hints = dict(hints or {})   # where the controller reads each file
         self.cells = cells
         self.port = port
         self.bin_path = bin_path
@@ -205,7 +230,8 @@ class LlamaLaunch:
         cell = cells.at(port)
         try:
             mp, mmproj_abs, spec_abs = models.download_all(
-                self.model, self.mmproj, self.spec, use_cache=cache_models, port=port)
+                self.model, self.mmproj, self.spec, use_cache=cache_models, port=port,
+                hints=self.hints)
         except Exception as exc:
             cells.report(port, phase="error", error=str(exc))
             return
@@ -294,7 +320,8 @@ class LlamaLaunch:
                              downloadingFile="re-downloading…")
                 try:
                     mp, mmproj_abs, spec_abs = models.download_all(
-                        self.model, self.mmproj, self.spec, use_cache=False, port=port)
+                        self.model, self.mmproj, self.spec, use_cache=False, port=port,
+                        hints=self.hints)
                 except Exception as exc:
                     cells.report(port, phase="error", error=str(exc))
                     return
@@ -389,7 +416,8 @@ class CommandStart(CellStart):
                          startedAt=int(time.time()))
             try:
                 model_abs = str(cells.models.ensure(model_raw, report=True,
-                                                    use_cache=True, port=port))
+                                                    use_cache=True, port=port,
+                                                    hint=self.hints().get(model_raw)))
             except Exception as exc:  # noqa: BLE001
                 cells.report(port, phase="error", error=str(exc))
                 return {"ok": False, "error": f"model not available: {exc}"}
@@ -412,7 +440,8 @@ class CommandStart(CellStart):
                       ", ".join(f"{k}={v}" for k, v in synced.items()))
         except Exception as exc:  # noqa: BLE001
             print(f"[llama-node] cell-assets :{port} skipped ({exc})")
-        result = cell.process.start_command(shell_line, cfg, log_path=log_path)
+        result = cell.process.start_command(shell_line, cfg, log_path=log_path,
+                                            extra_env=self.models_root(model_raw, model_abs))
         cells.report(port, phase="running" if result.get("ok") else "error",
                      error="" if result.get("ok") else (result.get("error") or "start failed"))
         if result.get("ok"):

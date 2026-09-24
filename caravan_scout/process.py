@@ -231,7 +231,8 @@ class CellProcess:
                 return {"ok": False, "error": str(exc)}
 
     def start_command(self, shell_command: str, cfg: dict[str, Any],
-                      log_path: Path | None = None) -> dict[str, Any]:
+                      log_path: Path | None = None,
+                      extra_env: dict[str, str] | None = None) -> dict[str, Any]:
         """Launch a generic command cell via bash. `shell_command` is a full
         shell line that sets $PORT and `exec`s the real process, so the tracked
         PID is the server itself, not bash. Managed exactly like a llama-server
@@ -251,7 +252,7 @@ class CellProcess:
                     stdout=log_fh,
                     stderr=subprocess.STDOUT if log_path else subprocess.DEVNULL,
                     close_fds=True,
-                    env=HostProcesses.cell_env(cfg.get("port")),
+                    env={**HostProcesses.cell_env(cfg.get("port")), **(extra_env or {})},
                 )
                 self._cfg = {**cfg, "cmd": cmd}
                 self._started_at = int(time.time())

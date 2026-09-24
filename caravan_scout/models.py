@@ -119,11 +119,79 @@ class ModelFetcher:
         low = (text or "").lower()
         return any(p in low for p in cls.CORRUPT_PATTERNS)
 
+    # How long a look at a hinted path may take: a library is an NFS mount, and
+    # a dead NFS server makes stat() wait instead of failing.
+    PROBE_SECONDS = 3.0
+
+    @staticmethod
+    def _stat(path: Path, want_dir: bool) -> Any:
+        """True/False for a folder; the size (0 when absent) for a file."""
+        if want_dir:
+            return path.is_dir()
+        return path.stat().st_size if path.is_file() else 0
+
+    def look(self, path: Path, want_dir: bool) -> Any:
+        """_stat with a deadline: None when the path did not answer in time."""
+        box: dict[str, Any] = {}
+
+        def probe() -> None:
+            try:
+                box["hit"] = self._stat(path, want_dir)
+            except OSError:
+                box["hit"] = None
+
+        worker = threading.Thread(target=probe, daemon=True)
+        worker.start()
+        worker.join(self.PROBE_SECONDS)
+        if worker.is_alive():
+            print(f"[llama-node] {path} did not answer in {self.PROBE_SECONDS:g} s — not reading it in place")
+            return None
+        return box.get("hit")
+
+    def in_place(self, raw: str, hint: Any) -> Path | None:
+        """The file where the controller reads it, when this machine has the
+        same one at that path — the scout on the controller's own machine, a
+        library mounted at the same path. Read there: no copy, not written
+        down as downloaded, never deleted. None when the hint names nothing
+        here, or another file (its size differs)."""
+        if not isinstance(hint, dict) or not str(hint.get("path") or "").strip():
+            return None
+        path = Path(str(hint["path"])).expanduser()
+        if not path.is_absolute():
+            return None
+        want_dir = bool(hint.get("dir"))
+        hit = self.look(path, want_dir)
+        if not hit:
+            return None
+        size = int(hint.get("size") or 0)
+        if not want_dir and size and hit != size:
+            print(f"[llama-node] {raw}: {path} is here, but it is not the controller's file "
+                  f"({hit:,} bytes, not {size:,}) — not reading it in place")
+            return None
+        return path
+
+    @staticmethod
+    def refuse_unreachable(raw: str, hint: Any) -> None:
+        """A download from the controller cannot bring a library's file or a
+        folder: say what this machine lacks instead of failing on a 404."""
+        if not isinstance(hint, dict):
+            return
+        where = str(hint.get("path") or raw)
+        if hint.get("library"):
+            raise AppError(f"the model is in the library {hint['library']} ({where}), which this machine "
+                           f"does not have there — mount the library at the same path, or bring the model "
+                           f"back to the controller", 409)
+        if hint.get("dir"):
+            raise AppError(f"the model is a folder ({where}) and this machine does not have it there — a "
+                           f"folder cannot be downloaded; put it there, or mount the library that holds it", 409)
+
     def ensure(self, model_path_raw: str, report: bool = True,
                       report_label: str = "", use_cache: bool = False,
-                      port: int = 0) -> Path:
+                      port: int = 0, hint: Any = None) -> Path:
         """Return a local Path to the model file.
 
+        When `hint` — where the controller reads it — names the same file on
+        this machine, read it there (in_place).
         If model_path_raw is absolute and exists — use it directly.
         If use_cache and a local copy exists — reuse it. Otherwise (the default)
         re-download from the admin into the working dir; with caching off the
@@ -133,6 +201,10 @@ class ModelFetcher:
         report_label is the short filename shown in the UI during download
         (defaults to the basename of model_path_raw).
         """
+        here = self.in_place(model_path_raw, hint)
+        if here is not None:
+            print(f"[llama-node] {Path(model_path_raw).name}: read in place — {here}")
+            return here
         mp = Path(model_path_raw).expanduser()
         if mp.is_absolute() and mp.exists():
             return mp
@@ -141,6 +213,7 @@ class ModelFetcher:
         local = cache_dir / model_path_raw
         if use_cache and local.exists():
             return local
+        self.refuse_unreachable(model_path_raw, hint)
 
         # Download from admin
         controller = str(self.config.get("controllerUrl") or "").rstrip("/")
@@ -292,7 +365,8 @@ class ModelFetcher:
         return result
 
     def download_all(self, model_path_raw: str, mmproj_raw: str,
-                                   spec_raw: str, use_cache: bool, port: int = 0) -> tuple:
+                                   spec_raw: str, use_cache: bool, port: int = 0,
+                                   hints: Any = None) -> tuple:
         """Download model + aux files, reporting progress for all of them.
 
         Returns (mp, mmproj_abs, spec_abs) as strings/Paths.
@@ -310,7 +384,8 @@ class ModelFetcher:
             short = Path(raw).name
             label = f"{short} ({idx + 1}/{n})" if n > 1 else short
             local = self.ensure(raw, report=True, report_label=label,
-                                       use_cache=use_cache, port=port)
+                                       use_cache=use_cache, port=port,
+                                       hint=(hints or {}).get(raw) if isinstance(hints, dict) else None)
             results.append(str(local))
         # In the order they were downloaded: the model, then mmproj if any,
         # then the draft if any. Positions counted by hand read results[2]

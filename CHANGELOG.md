@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.3.0 — 2026-09-24
+
+- **Models are read where they are.** The controller now says, for every
+  model file of a cell it starts, where it reads that file itself — its
+  disk, a library, a folder (`inPlace`). A scout that has the same file at
+  that path — the scout on the controller's own machine, one that mounts a
+  library at the same path — reads it there, with no copy in its cache and
+  nothing to purge. The size tells the same file from another at that path;
+  a path that does not answer in 3 s (a dead NFS mount) counts as absent.
+  - A library's model or a folder model (seamless) that this machine does
+    not have is refused (409) naming the library or the folder and what to
+    do — a download from the controller could only answer 404.
+  - A command cell gets `LLAMA_MODELS_DIR` pointing where its model really
+    is. Its command reads `${LLAMA_MODELS_DIR:-~/llama.cpp/models}/<file>`
+    while the download went to the scout's cache, and the two never met: a
+    transcribe cell on a scout found no model unless its config said where.
+    A value set in the cell's config still wins.
+
 ## 2.2.0 — 2026-09-24
 
 - **The scout touches only what it started and what it downloaded.** On a

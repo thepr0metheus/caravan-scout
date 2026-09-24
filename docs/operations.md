@@ -102,6 +102,15 @@ start), `llama-node-configs/`, `var/server-cells/<port>/`, the model cache
   purged on stop; with caching on they stay. `cleanOldModels=true` (off by
   default) removes the other cached models after a start, keeping what the
   running cells hold.
+- **Models are read in place when this machine has them.** The controller
+  says where it reads each model file (`inPlace` in the start request). The
+  scout on the controller's own machine, or one that mounts a library at the
+  same path, reads the file there — the same size, or it is another file —
+  instead of copying it into its cache; a look at a path that does not answer
+  in 3 s (a dead NFS mount) counts as absent. A library's file or a folder
+  model (seamless) that this machine lacks is refused with what to do. A
+  command cell gets `LLAMA_MODELS_DIR` pointing where its model really is — in
+  place or in the cache; a value set in the cell's config wins.
 - **The scout deletes only what it downloaded.** Each download is written down
   in `.caravan-downloads.json` in the cache; the purge, the old-model cleanup
   and the corrupt-model retry delete only those files. A cache dir set to a

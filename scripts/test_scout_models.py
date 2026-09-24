@@ -36,6 +36,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -560,6 +561,89 @@ def test_purge_models_safely():
     check(res == {"removed": 5, "freedBytes": 29}, "negative: работающих ячеек нет — удаляется всё")
 
 
+def test_in_place():
+    lib = TMP / "lib-in-place"
+    lay(lib, {"org/model-q4.gguf": BODIES[MODEL], "seam/FP32/weights.bin": 3})
+    model = lib / "org" / "model-q4.gguf"
+    hint = {"path": str(model), "size": len(BODIES[MODEL])}
+    cached = lambda s: s.models.cache_dir() / MODEL  # noqa: E731
+
+    s = make_scout({"controllerUrl": CONTROLLER})
+    with Rig(web=models_served()) as rig:
+        got, err = attempt(lambda: s.models.ensure(MODEL, report=True, port=22301, hint=hint))
+    check(err is None and got == model and rig.web.calls == [] and written_down(s) == []
+          and f"[llama-node] model-q4.gguf: read in place — {model}" in rig.journal,
+          "тот же файл по пути контроллера (скаут на его машине, библиотека по тому же пути) — читается на "
+          "месте: без закачки и без записи в скачанное, значит, никогда не удаляется")
+
+    s = make_scout({"controllerUrl": CONTROLLER})
+    with Rig(web=models_served()) as rig:
+        got, _ = attempt(lambda: s.models.ensure(MODEL, report=False, hint={**hint, "size": 999}))
+    check(got == cached(s) and len(rig.web.calls) == 1
+          and f"[llama-node] {MODEL}: {model} is here, but it is not the controller's file "
+              f"({len(BODIES[MODEL]):,} bytes, not 999) — not reading it in place" in rig.journal,
+          "negative: по тому пути другой файл (размер не тот) — не читается, модель качается как раньше")
+
+    s = make_scout({"controllerUrl": CONTROLLER})
+    with Rig(web=models_served()) as rig:
+        got, _ = attempt(lambda: s.models.ensure(MODEL, report=False,
+                                                 hint={"path": str(TMP / "elsewhere" / "m.gguf"), "size": 13}))
+    check(got == cached(s) and len(rig.web.calls) == 1,
+          "negative: файла по пути контроллера здесь нет (другая машина) — кэш и закачка, как без подсказки")
+
+    seam = lib / "seam" / "FP32"
+    s = make_scout({"controllerUrl": CONTROLLER})
+    with Rig(web=models_served()) as rig:
+        got, err = attempt(lambda: s.models.ensure("seam/FP32", report=False, hint={"path": str(seam), "dir": True}))
+    check(err is None and got == seam and rig.web.calls == [], "модель-папка (seamless) на месте — читается там")
+
+    gone = TMP / "no-such-lib" / "org" / "model-q4.gguf"
+    with Rig(web=models_served()) as rig:
+        _, err = attempt(lambda: s.models.ensure(MODEL, report=False,
+                                                 hint={"path": str(gone), "library": "NAS", "size": 13}))
+    check(err_is(err, 409, f"the model is in the library NAS ({gone}), which this machine does not have there — "
+                           f"mount the library at the same path, or bring the model back to the controller")
+          and rig.web.calls == [],
+          "модели из библиотеки здесь нет — отказ 409 с именем библиотеки и путём, без закачки, которая могла "
+          "ответить только 404")
+    s = make_scout({"controllerUrl": CONTROLLER})
+    lay(s.models.cache_dir(), {MODEL: BODIES[MODEL]})
+    with Rig(web=models_served()) as rig:
+        got, err = attempt(lambda: s.models.ensure(MODEL, report=False, use_cache=True,
+                                                   hint={"path": str(gone), "library": "NAS", "size": 13}))
+    check(err is None and got == cached(s) and rig.web.calls == [],
+          "negative: библиотеки здесь нет, но модель уже в кэше скаута (скачана раньше) — берётся из кэша, "
+          "а не отказ")
+    folder = lib / "seam" / "gone"
+    with Rig(web=models_served()) as rig:
+        _, err = attempt(lambda: s.models.ensure("seam/gone", report=False, hint={"path": str(folder), "dir": True}))
+    check(err_is(err, 409, f"the model is a folder ({folder}) and this machine does not have it there — a folder "
+                           f"cannot be downloaded; put it there, or mount the library that holds it")
+          and rig.web.calls == [],
+          "модели-папки здесь нет — отказ 409: папку не скачать")
+
+    s = make_scout({"controllerUrl": CONTROLLER})
+    release = threading.Event()
+
+    def hung(_path, _want_dir):
+        release.wait(2)
+        return len(BODIES[MODEL])
+    with patched(s.models, _stat=hung, PROBE_SECONDS=0.05), Rig(web=models_served()) as rig:
+        got, _ = attempt(lambda: s.models.ensure(MODEL, report=False, hint=hint))
+    release.set()
+    check(got == cached(s) and len(rig.web.calls) == 1
+          and f"[llama-node] {model} did not answer in 0.05 s — not reading it in place" in rig.journal,
+          "путь не ответил вовремя (мёртвый NFS заставляет stat ждать) — его не ждут: закачка, как без подсказки")
+
+    s = make_scout({"controllerUrl": CONTROLLER})
+    with Rig(web=models_served()) as rig:
+        got, err = attempt(lambda: s.models.download_all(MODEL, MMPROJ, "", use_cache=False, port=22303,
+                                                         hints={MODEL: hint}))
+    check(err is None and got == (str(model), str(s.models.cache_dir() / MMPROJ), "")
+          and [urllib.parse.unquote(c["url"].split("path=", 1)[1]) for c in rig.web.calls] == [MMPROJ],
+          "подсказка по каждому файлу: модель читается на месте, mmproj без подсказки качается")
+
+
 def test_list_cached_models():
     s = make_scout()
     check(s.models.listing() == [], "папки кэша нет — пустой список")
@@ -825,7 +909,7 @@ def test_sync_malformed_manifest():
 TESTS = [
     test_model_cache_dir, test_is_corruption_error, test_ensure_model_local, test_ensure_model_download,
     test_ensure_model_progress_throttle, test_ensure_model_truncation, test_ensure_model_retries,
-    test_cleanup_old_models, test_purge_model_cache, test_purge_models_safely, test_list_cached_models,
+    test_cleanup_old_models, test_purge_model_cache, test_purge_models_safely, test_in_place, test_list_cached_models,
     test_download_all_model_files,
     test_launcher_and_runner, test_sync_nothing_to_do, test_sync_runner_resolution, test_sync_files,
     test_sync_requests, test_sync_malformed_manifest,

@@ -366,7 +366,7 @@ def worker_scout(**config):
 
 
 def worker(s, port, config, model=MODEL, mmproj="", spec="", cache=False, args=...,
-           popen=None, web=None, kill=None, bin_path=None, make_cache_dir=True):
+           popen=None, web=None, kill=None, bin_path=None, make_cache_dir=True, hints=None):
     """Run the llama startup worker synchronously under a Rig. The cache dir
     is made first unless asked not to: the worker opens its per-port log there."""
     if args is ...:
@@ -376,7 +376,8 @@ def worker(s, port, config, model=MODEL, mmproj="", spec="", cache=False, args=.
     rig = Rig(popen=popen or FakePopen({"pid": 4242}), web=web or models_served(), kill=kill)
     with rig:
         rig.res, rig.err = attempt(lambda: LlamaLaunch(
-            s.cells, port, str(bin_path or LLAMA_BIN), config, model, mmproj, spec, cache, args).run())
+            s.cells, port, str(bin_path or LLAMA_BIN), config, model, mmproj, spec, cache, args,
+            hints=hints).run())
     return rig
 
 
@@ -1771,6 +1772,57 @@ def test_worker_cancelled_mid_download():
           "as-is: ДЕФЕКТ — новый старт на этом порту отказан «уже стартует», пока не придёт ещё один Stop")
 
 
+def test_models_in_place():
+    lib = TMP / "lib-cells-in-place"
+    here = lib / MODEL          # a root plus the path the scout is sent — as the controller hints it
+    here.parent.mkdir(parents=True, exist_ok=True)
+    here.write_bytes(BODIES[MODEL])
+    hints = {MODEL: {"path": str(here), "size": len(BODIES[MODEL])}}
+
+    def look_directly(s):
+        # This rig holds every thread, the in-place probe's too; the deadline
+        # around the look is pinned in test_scout_models.
+        s.models.look = lambda path, want_dir: s.models._stat(path, want_dir)
+
+    r = start_llama({"modelPath": MODEL, "port": 22091, "args": llama_args(22091), "inPlace": hints,
+                     "config": {"MODEL_FILE": MODEL, "PORT": 22091}})
+    t = r.threads.made[0] if r.threads.made else None
+    launch = getattr(getattr(t, "target", None), "__self__", None)
+    check(isinstance(launch, LlamaLaunch) and launch.hints == hints,
+          "запуск llama-ячейки получает подсказки контроллера: где он читает каждый файл")
+
+    port = 22092
+    s = worker_scout()
+    look_directly(s)
+    popen = FakePopen({"pid": 4949})
+    r = worker(s, port, {"MODEL_FILE": MODEL, "PORT": port}, popen=popen, hints=hints)
+    argv = popen.calls[0]["argv"] if popen.calls else []
+    check(r.web.calls == [] and str(here) in argv and str(s.models.cache_dir() / MODEL) not in argv,
+          "модель на месте — llama-server получает путь контроллера, ничего не скачано и не скопировано в кэш")
+
+    def command(payload_extra, prep=None):
+        return start_command({"cellKind": "command", "command": "exec bash ~/run_transcribe.sh $PORT",
+                              "shellLine": "exec bash ~/run_transcribe.sh $PORT", "healthPath": "/health",
+                              **payload_extra}, config={"controllerUrl": CONTROLLER}, prep=prep or look_directly,
+                             web=models_served())
+    def downloads(r):
+        return [c for c in r.web.calls if "/api/models/download" in c["url"]]
+    r = command({"inPlace": hints, "config": {"PORT": 22093, "MODEL_FILE": MODEL}})
+    penv = (r.popen.calls[0].get("env") or {}) if r.popen.calls else {}
+    check(penv.get("LLAMA_MODELS_DIR") == str(lib) and downloads(r) == [],
+          "командная ячейка с моделью на месте — LLAMA_MODELS_DIR = папка, под которой модель лежит "
+          "(команда читает ${LLAMA_MODELS_DIR:-…}/<путь>)")
+    r = command({"config": {"PORT": 22094, "MODEL_FILE": MODEL}})
+    penv = (r.popen.calls[0].get("env") or {}) if r.popen.calls else {}
+    check(penv.get("LLAMA_MODELS_DIR") == str(r.s.models.cache_dir()) and len(downloads(r)) == 1,
+          "defect-history: скачанная модель — LLAMA_MODELS_DIR = кэш скаута; команда падала обратно на "
+          "~/llama.cpp/models, а закачка шла в кэш, и они не встречались")
+    r = command({"config": {"PORT": 22095}})
+    penv = (r.popen.calls[0].get("env") or {}) if r.popen.calls else {}
+    check("LLAMA_MODELS_DIR" not in penv or penv.get("LLAMA_MODELS_DIR") == os.environ.get("LLAMA_MODELS_DIR"),
+          "negative: у ячейки нет модели — LLAMA_MODELS_DIR не задаётся")
+
+
 def test_worker_stopped_during_start():
     port = 22106
     s = worker_scout()
@@ -1917,6 +1969,7 @@ TESTS = [
     test_worker_success, test_worker_download_error, test_worker_log_dir_missing, test_worker_refuses_without_args,
     test_worker_gpu_layers_and_spec, test_worker_cancelled_mid_download, test_worker_stopped_during_start,
     test_worker_corruption_retry, test_worker_corruption_only_own, test_worker_cleanup_when_caching,
+    test_models_in_place,
 ]
 
 
