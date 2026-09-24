@@ -92,6 +92,8 @@ class Api:
             "/api/llama-node/stop": lambda body: (s.cells.stop(body().get("port")), 200),
             "/api/llama-node/update": lambda body: (s.builds.start_update(body()), 200),
             "/api/llama-node/restore": self._restore,
+            # The operator hid the "fresh build, crashing cells" banner: for this build.
+            "/api/llama-node/suspect-dismiss": lambda body: (s.suspect.dismiss(), 200),
             "/api/llama-node/purge-cache": lambda body: ({"ok": True, **s.cells.purge_models_safely()}, 200),
             "/api/llama-node/configs/delete": self._delete_config,
         }

@@ -239,7 +239,7 @@ class Cells:
         # Crashed shortly after start (non-zero exit) — surface as error even if
         # the startup worker already marked it "running".
         if st.get("crashed"):
-            reason = st.get("lastError") or f"exited (code {st.get('exitCode')})"
+            reason = st.get("lastError") or Watchdog.how(st)
             if crash and crash.get("gaveUp"):
                 # Said on the card: the watchdog stopped trying, and why.
                 reason = (f"crashed {crash['count']} times in {Watchdog.WINDOW_SEC // 60} minutes — "

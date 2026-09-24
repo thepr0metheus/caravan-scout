@@ -1,6 +1,7 @@
 """Watchdog: a crashed cell comes back, as systemd brings the controller's."""
 from __future__ import annotations
 
+import signal
 import time
 from typing import Any, Callable
 
@@ -13,9 +14,15 @@ class Watchdog:
     and says why. A clean exit (code 0) is not a crash.
 
     Each cell carries its crash note (Cell.crash): how many times it has
-    crashed since the operator last started it by hand, when, and the
-    reason — the 💥 on the board. A start by hand clears it; a stop drops
+    crashed since the operator last started it by hand, when, the reason,
+    and the last lines of its log — the 💥 on the board, and the lines under
+    it on hover. The lines are read when the crash is seen: the relaunch
+    moves that log aside. A start by hand clears it; a stop drops
     the cell and the note with it.
+
+    Each crash is also told to the machine's CrashSuspect, with its words:
+    crashes soon after a fresh llama.cpp build make the board offer a
+    rollback.
 
     `tick()` is called every couple of seconds by the scout (start());
     `clock` is a parameter so a test can move time.
@@ -25,9 +32,27 @@ class Watchdog:
     BURST = 3
     WINDOW_SEC = 600
 
-    def __init__(self, cells, clock: Callable[[], float] = time.time):
+    def __init__(self, cells, suspect, clock: Callable[[], float] = time.time):
         self.cells = cells
+        self.suspect = suspect
         self.clock = clock
+
+    @staticmethod
+    def how(st: dict[str, Any]) -> str:
+        """How the process ended, in words — the card's and the crash note's
+        alike: a signal by its name ("died of SIGSEGV" says what "exited
+        (code -11)" hides, and the build's suspect reads it), the exit code,
+        or that the code is not known: a process adopted after a scout
+        restart is not this scout's child, and its exit code is lost."""
+        code = st.get("exitCode")
+        if code is None:
+            return "ended with an unknown exit code (adopted after a scout restart)"
+        if isinstance(code, int) and code < 0:
+            try:
+                return f"died of {signal.Signals(-code).name}"
+            except ValueError:
+                pass
+        return f"exited (code {code})"
 
     @staticmethod
     def when(ts: float) -> str:
@@ -51,10 +76,13 @@ class Watchdog:
         note = dict(note or {"count": 0, "restarts": []})
         note["count"] += 1
         note["at"] = self.when(now)
-        note["reason"] = str(st.get("lastError") or f"exited (code {st.get('exitCode')})")[:300]
+        how = self.how(st)
+        note["reason"] = str(st.get("lastError") or how)[:300]
+        note["tail"] = cell.process.log_tail()
         self._schedule(port, note, now)
         with cell.lock:
             cell.crash = note
+        self.suspect.crashed("\n".join((note["reason"], how, note["tail"])))
 
     def _schedule(self, port: int, note: dict[str, Any], now: float) -> None:
         recent = [t for t in note.get("restarts", []) if now - t < self.WINDOW_SEC]
@@ -87,6 +115,7 @@ class Watchdog:
         if not note or int(note.get("count") or 0) <= 0:
             return None
         return {"count": int(note["count"]), "at": note.get("at", ""), "reason": note.get("reason", ""),
+                **({"tail": note["tail"]} if note.get("tail") else {}),
                 **({"gaveUp": True} if note.get("gaveUp") else {})}
 
     def run(self, interval: float = 2.0, sleep: Callable[[float], None] = time.sleep) -> None:

@@ -61,8 +61,11 @@ class ReportSample:
                               started_at=self.NOW - 600)
         scout.cells.report(22001, phase="running", error="")
         # It crashed once and its watchdog brought it back (2.5): the note the
-        # board shows as 💥 rides the cell's view.
+        # board shows as 💥 rides the cell's view, with the last lines of the
+        # crashed run's log under it (2.6).
         running.crash = {"count": 1, "at": "2026-09-24T09:00:00+0000", "reason": "CUDA error: out of memory",
+                         "tail": "0.01.200.000 I srv  load_model: loading model\n"
+                                 "0.01.900.000 E ggml_cuda: CUDA error: out of memory",
                          "restarts": [self.NOW - 700], "due": None}
         # And it starts with the machine (2.4): its port rides "autostart".
         scout.autostart.set(22001, True, {"modelPath": "models/org/model-q4.gguf", "port": 22001,
@@ -73,8 +76,19 @@ class ReportSample:
         machine = {"gpus": lambda: [dict(self.GPU)], "compute_apps": lambda: [dict(self.APP)],
                    "cpu_ram": lambda: json.loads(json.dumps(self.CPU)), "address": lambda: "10.0.0.5",
                    "firewall": lambda port: {"state": "open", "allowedFrom": []}}
-        builds = {"binary_version": lambda: "version: 9947 (abc1234)",
-                  "binary_mtime": lambda: "2026-09-01T10:00:00", "status_slim": lambda: dict(self.UPDATE)}
+        # Its cells crash since a build made an hour ago (2.6): the board's
+        # banner offers the archived build before it.
+        built_at = self.NOW - 3600
+        scout.state["llamaSuspect"] = {"key": f"abc1234:{built_at}", "commit": "abc1234", "builtAt": built_at,
+                                       "firstSeenAt": self.NOW - 900, "lastSeenAt": self.NOW - 120, "crashes15m": 3}
+        archive = {"ok": True, "builds": [
+            {"id": "20260924-090000-abc1234", "commit": "abc1234", "version": "version: 9947 (abc1234)",
+             "builtAt": built_at, "sizeMb": 88},
+            {"id": "20260920-090000-def5678", "commit": "def5678", "version": "version: 9900 (def5678)",
+             "builtAt": self.NOW - 400_000, "sizeMb": 87}]}
+        builds = {"binary_version": lambda: "version: 9947 (abc1234)", "binary_built_at": lambda: built_at,
+                  "binary_mtime": lambda: "2026-09-01T10:00:00", "status_slim": lambda: dict(self.UPDATE),
+                  "archive": lambda: archive}
         with patched(scout.machine, **machine), patched(scout.builds, **builds), \
                 patched(scout.cells.probe, metrics=lambda port: dict(self.METRICS)), \
                 patched(CellProcess, pid_alive=staticmethod(lambda pid: pid == 4242)), \

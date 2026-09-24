@@ -499,9 +499,11 @@ def test_node_public_views():
     sl.process.adopt(5252, {"port": 22018}, started_at=NOW)
     with Rig(kill=FakeKill()):
         view = s.cells.view(sl)
-    check(view == {"running": False, "exitCode": None, "lastError": "exited (code None)", "crashed": True,
+    check(view == {"running": False, "exitCode": None,
+                   "lastError": "ended with an unknown exit code (adopted after a scout restart)", "crashed": True,
                    "phase": "error", "port": 22018, "modelPath": ""},
-          "as-is: код выхода усыновлённой ячейки неизвестен, а причина гласит «exited (code None)» — None напечатан как код")
+          "defect-history: код выхода усыновлённой ячейки неизвестен — так и сказано (было «exited (code None)», "
+          "None напечатан как код)")
 
     sl = s.cells.at(22019)
     with Rig(popen=FakePopen({"running": False, "rc": 1, "pid": 6060})):
@@ -509,6 +511,12 @@ def test_node_public_views():
     check(s.cells.view(sl) == {"running": False, "exitCode": 1, "lastError": "exited (code 1)",
                                         "crashed": True, "phase": "error", "port": 22019, "modelPath": ""},
           "упавший дочерний процесс без строки в логе — «exited (code 1)»")
+    sl = s.cells.at(22031)
+    with Rig(popen=FakePopen({"running": False, "rc": -11, "pid": 6262})):
+        sl.process.start(str(LLAMA_BIN), ["--port", "22031"], {"port": 22031})
+    check(s.cells.view(sl).get("lastError") == "died of SIGSEGV",
+          "defect-history (живая проверка 2026-09-24): убит сигналом — карточка говорит «died of SIGSEGV», те же слова, "
+          "что заметка сторожа; было «exited (code -11)» — одна причина двумя словами")
     sl = s.cells.at(22020)
     with Rig(popen=FakePopen({"running": False, "rc": 0, "pid": 6161})):
         sl.process.start(str(LLAMA_BIN), ["--port", "22020"], {"port": 22020})

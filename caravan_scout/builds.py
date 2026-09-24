@@ -51,16 +51,20 @@ class LlamaBuilds:
         except Exception:
             return ""
 
-    def binary_mtime(self) -> str:
-        """Return ISO-8601 mtime of the llama-server binary (date it was built/replaced)."""
+    def binary_built_at(self) -> int:
+        """When the llama-server binary was built or replaced (epoch s), 0 when there is none."""
         bin_path = str(self.config.get("llamaServerBin") or "").strip()
         if not bin_path or not os.path.isfile(bin_path):
-            return ""
+            return 0
         try:
-            mtime = os.path.getmtime(bin_path)
-            return datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%dT%H:%M:%S")
-        except Exception:
-            return ""
+            return int(os.path.getmtime(bin_path))
+        except OSError:
+            return 0
+
+    def binary_mtime(self) -> str:
+        """Return ISO-8601 mtime of the llama-server binary (date it was built/replaced)."""
+        built_at = self.binary_built_at()
+        return datetime.datetime.fromtimestamp(built_at).strftime("%Y-%m-%dT%H:%M:%S") if built_at else ""
 
     def status(self) -> dict:
         job = self._job

@@ -1,5 +1,37 @@
 # Changelog
 
+## 2.6.0 — 2026-09-24
+
+- **Memory limits, as the controller's cells have.** On Linux a cell is
+  launched in its own systemd user scope with `MemoryHigh=70%`,
+  `MemoryMax=80%` and `MemorySwapMax=2G` — the values of the controller's
+  `lama-cell@.service`: a model that eats the RAM is slowed, then killed
+  alone, not the machine with the scout on it. The scout asks once, by
+  launching a scope and reading its `memory.max` (systemd accepts the limit
+  even where nothing would enforce it), and says the answer in one `[cells]`
+  line of its log. macOS and hosts without a user systemd run cells as
+  before, and the line says why.
+- **The last lines of a crashed cell's log.** The crash note carries the last
+  8 lines of the crashed run's log (`crash.tail`), read when the crash is
+  seen — the relaunch moves that log aside. The board shows them on hover, as
+  a cell of the controller shows its journal. Keys are scrubbed out of
+  whatever leaves the machine from a cell's log, the crash reason included:
+  a key's prefix (`lcv1_`, `sk-`, `hf_`, `ghp_`, `glpat-`), a `Bearer` value,
+  whatever follows `api_key` / `password` / `secret`, a long value after
+  `token` — `EOS token = 151645` stays.
+- **A fresh llama.cpp build that crashes cells.** With the binary younger
+  than 6 hours, 3 engine crashes in 15 minutes (the controller's words:
+  `CUDA error`, `GGML_ABORT`, `SIGSEGV`, `SIGABRT`, a core dump) raise an
+  incident, kept in `state.json` under the build until it is dismissed for
+  that build (`POST /api/llama-node/suspect-dismiss`) or the build changes.
+  Both reports carry it as `llamaSuspect`, with the newest archived build of
+  another commit to offer; the board's banner offers the rollback, and only
+  the operator restores.
+- **A cell's end in one set of words.** A cell killed by a signal says which
+  (`died of SIGSEGV`, not `exited (code -11)`), the fresh-build suspect hears
+  it, and the card and the crash note say the same; an adopted cell's exit
+  code, which the scout cannot know, reads as unknown instead of `None`.
+
 ## 2.5.0 — 2026-09-24
 
 - **A crashed cell comes back.** The controller's cells are systemd units

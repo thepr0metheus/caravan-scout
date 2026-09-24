@@ -93,13 +93,14 @@ systemd/launchd units); the code lives in the package:
 | `paths.py` | Env-driven constants, the `{{…}}` placeholder contract, `DEFAULT_CONFIG` |
 | `errors.py` | `AppError` (HTTP-visible failures) |
 | `machine.py` | `Machine` — the host as its OS tells it: NVIDIA GPUs and the processes on them, CPU/RAM, who ufw lets in, listening ports, raw `nvidia-smi`, the address facing the controller; the caches that keep polling cheap |
-| `process.py` | `CellProcess` — one cell's process: start, adopt, stop, status; `CellLog` — the log kept across runs and read for a crash reason; `HostProcesses` — a process found again by its command line or by the port it serves |
+| `process.py` | `CellProcess` — one cell's process: start, adopt, stop, status; `CellLog` — the log kept across runs and read for a crash reason; `HostProcesses` — a process found again by its command line or by the port it serves; `MemoryScope` — the memory limits a cell is launched with (the controller's cell unit values, in a systemd user scope) |
 | `report.py` | `Report` — what the scout says about its machine: `public()` for /api/state, `heartbeat()` for the beat (same facts, same names), `pairing()` for the scout's page and the controller's first look |
 | `heartbeat.py` | `Heartbeat` — one beat to the controller, the loop of beats, and pairing; each outcome written to state.json |
 | `models.py` | `ModelFetcher` — the model cache: download from the controller with retries, verify, clean up, purge; reports progress through a callback |
 | `cells.py` | `Cell` (one port); `Cells` — the table by port, startup records, the views the controller reads, re-adoption after a restart, stray reaping, stop, the safe purge, and the model cache the cells own; `CellRecords` (state.json `cells`); `LlamaProbe` (a server's /metrics and /props) |
 | `autostart.py` | `Autostart` — the cells that start when the machine boots: the kept start requests, refreshed on each start, started on the first scout start of a boot |
 | `watchdog.py` | `Watchdog` — a crashed cell launched again the same way after 10 s, at most 3 times in 10 minutes, and the crash note the board shows |
+| `suspect.py` | `CrashSuspect` — cells crashing soon after a fresh llama.cpp build: the incident kept per build, dismissed per build, and the archived build to offer |
 | `builds.py` | `LlamaBuilds` — llama.cpp on this machine: the binary's version and date, the update/restore job and its ring buffer, the archive of earlier builds |
 | `saved_configs.py` | `SavedConfigs` — launch parameters saved by hand as `llama-node.bak.<stamp>.json` |
 | `cell_assets.py` | `CellAssets` — before a command cell starts, the files its launcher runs are brought up to the controller's copies (by sha256); never blocks a start |

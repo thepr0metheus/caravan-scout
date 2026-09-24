@@ -413,6 +413,60 @@ def test_read_log_error_window():
     same(read(raw), "�� error: bad header", "boundary: битые байты не роняют чтение — заменяются")
 
 
+# ── CellLog.tail / scrub ────────────────────────────────────────────────────
+
+def test_log_tail():
+    CHECKS.section("последние строки лога — для карточки:")
+    same(outcome(CellLog(None).tail), "", "negative: лога нет (None) — пусто")
+    same(outcome(CellLog(fresh_dir() / "gone.log").tail), "", "negative: файла нет — пусто, без исключения")
+    lines = [f"step {i}" for i in range(12)]
+    got = outcome(CellLog(log_with(*lines[:6], "", "   ", *lines[6:], "last   ")).tail)
+    same(got, "\n".join(lines[5:] + ["last"]),
+         "8 последних непустых строк (как у ячеек контроллера из журнала), без хвостовых пробелов")
+    same(outcome(CellLog(log_with("one", "two")).tail), "one\ntwo", "boundary: строк меньше 8 — все")
+    wide = [f"{i}" + "x" * 399 for i in range(8)]
+    got = outcome(CellLog(log_with(*wide)).tail)
+    same(got, "\n".join(wide)[-1500:], "boundary: длиннее 1500 символов — остаётся конец, где причина")
+    big = fresh_dir() / "llama-server.22001.log"
+    big.write_text("".join(f"early line {i}\n" for i in range(20000)) + "E final: CUDA error\n", encoding="utf-8")
+    got = outcome(CellLog(big).tail)
+    same(got.splitlines()[-1] if isinstance(got, str) else got, "E final: CUDA error",
+         "лог в сотни КБ: читается конец файла, последняя строка на месте")
+    same(outcome(CellLog(log_with("main: --api-key lcv1_abcdef1234567890 --port 22001", "E boom")).tail),
+         "main: --api-key … --port 22001\nE boom", "ключи вычищены — хвост уходит на доску")
+
+
+SCRUBBED = [
+    ("route key", "key lcv1_abcdef1234567890 refused", "key lcv1_… refused"),
+    ("OpenAI key", "upstream said: sk-proj-abcdefghijklmn", "upstream said: sk-…"),
+    ("HF token", "HF_TOKEN=hf_AbCdEfGhIjKlMnOp", "HF_TOKEN=hf_…"),
+    ("GitHub token", "clone with ghp_abcdefghij0123456789", "clone with ghp_…"),
+    ("Bearer", "Authorization: Bearer abc.def-ghi", "Authorization: Bearer …"),
+    ("--api-key", "--api-key mykey --port 22001", "--api-key … --port 22001"),
+    ("api_key in JSON", '{"api_key": "0123", "x": 1}', '{"api_key": "…", "x": 1}'),
+    ("password", "password: hunter2", "password: …"),
+    ("secret", "CLIENT_SECRET=s3cr3t", "CLIENT_SECRET=…"),
+    ("long token", "X-Token: 0a1b2c3d4e5f6a7b8c9d", "X-Token: …"),
+]
+KEPT = [
+    ("EOS token", "print_info: EOS token        = 151645 '<|im_end|>'"),
+    ("control token", "load: control token: 151643 '<|endoftext|>' is not marked as EOG"),
+    ("token_type", "llama_model_loader: - kv  23: tokenizer.ggml.token_type arr[i32,151936]"),
+    ("n_tokens", "slot update_slots: id  0 | task 12 | n_tokens = 512, tokens per second = 41.3"),
+    ("word inside", "task-1234567 finished; desk-top"),
+]
+
+
+def test_log_scrub():
+    CHECKS.section("ключи не уходят с машины:")
+    for what, line, want in SCRUBBED:
+        same(CellLog.scrub(line), want, f"{what}: значение вычищено, имя осталось")
+    for what, line in KEPT:
+        same(CellLog.scrub(line), line, f"negative: {what} — не ключ, строка как была")
+    same(read(log_with("error: auth failed for lcv1_abcdef1234567890")), "error: auth failed for lcv1_…",
+         "причина падения — тоже вычищена: она уходит на доску той же дорогой")
+
+
 # ── CellLog.rotate ──────────────────────────────────────────────────────────
 
 def test_rotate_log():
@@ -921,7 +975,7 @@ def test_slot_defaults():
 
 TESTS = (test_read_log_error_absent, test_read_log_error_priority, test_read_log_error_markers,
          test_read_log_error_levels, test_read_log_error_catastrophes, test_read_log_error_window,
-         test_rotate_log, test_pid_alive, test_adopt, test_adopted_death, test_start, test_start_command,
+         test_log_tail, test_log_scrub, test_rotate_log, test_pid_alive, test_adopt, test_adopted_death, test_start, test_start_command,
          test_stop_own, test_stop_adopted, test_status, test_slot_defaults)
 
 for test in TESTS:

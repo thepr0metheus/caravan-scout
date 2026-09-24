@@ -95,7 +95,12 @@ start), `llama-node-configs/`, `var/server-cells/<port>/`, the model cache
   `<modelsBasePath>/llama-server.<port>.log`, and `command-cell.<port>.log`
   for command cells — the previous run's log is moved aside on every start
   (15 kept), never truncated. The scout extracts the crash reason (OOM /
-  corrupt GGUF / mmproj mismatch) into the heartbeat, so the board shows it.
+  corrupt GGUF / mmproj mismatch) into the heartbeat, so the board shows it,
+  and since 2.6 the last 8 lines of the crashed run's log too (on hover).
+  Both leave the machine with keys scrubbed out: a value with a key's prefix
+  (`lcv1_`, `sk-`, `hf_`, `ghp_`, `glpat-`), a `Bearer` value, whatever
+  follows a name like `api_key` / `password` / `secret`, and a long value
+  after `token` — `EOS token = 151645` stays as llama.cpp wrote it.
 - **`sudo -n ufw allow <port>`** on cell start is best-effort: without
   passwordless sudo the port silently stays closed to the LAN.
 - **`cacheModels=false` (default)**: models re-download on every start and are
@@ -106,10 +111,30 @@ start), `llama-node-configs/`, `var/server-cells/<port>/`, the model cache
   stopped — a non-zero exit, or gone while adopted — is launched again the same
   way 10 s later (the launch its record keeps, also after a scout restart), at
   most 3 times in 10 minutes; then it stays down and its error says the
-  watchdog gave up and why. A clean exit (code 0) is not a crash. The crash
-  note (`crash` on the cell: count since the last start by hand, time, reason)
-  is the 💥 on the board; a start by hand clears it. A cell launched by a scout
+  watchdog gave up and why. A clean exit (code 0) is not a crash; a process
+  killed by a signal says which (`died of SIGSEGV`, 2.6+). The crash
+  note (`crash` on the cell: count since the last start by hand, time, reason,
+  and the last lines of the log, read when the crash is seen — the relaunch
+  moves that log aside) is the 💥 on the board; a start by hand clears it. A cell launched by a scout
   older than 2.5 has no launch kept and is reported, not restarted.
+- **A fresh build that crashes (2.6+).** With the llama-server binary younger
+  than 6 hours, 3 engine crashes in 15 minutes (the watchdog's crash words
+  say `CUDA error`, `GGML_ABORT`, `SIGSEGV`, `SIGABRT` or `Aborted (core
+  dumped)` — the words the controller reads in its own journal) raise an
+  incident: `llamaSuspect` in both reports, and the board's banner offers the
+  newest archived build of another commit. It is kept in `state.json` under
+  the build (commit and binary time) until dismissed for that build or the
+  build changes. Nothing is restored without the operator.
+- **Memory limits (2.6+).** On Linux a cell is launched in its own systemd
+  user scope with the limits of the controller's cells (`lama-cell@.service`):
+  `MemoryHigh=70%`, `MemoryMax=80%`, `MemorySwapMax=2G` of this machine's RAM.
+  A model that eats the memory is slowed and then killed alone, not the
+  machine with the scout on it. The scout asks once per run, launching a scope
+  and reading its `memory.max`; the answer is one `[cells] …` line in the
+  scout's log. Where there is no user systemd (the scout started by hand from
+  an ssh session), no memory controller for it, or on macOS, cells run without
+  limits and that line says why. A cell already running keeps what it was
+  launched with until its next start.
 - **Autostart (2.4+).** A cell with ↟ on the board starts when the machine
   boots: the scout keeps the start request the controller sent (refreshed on
   every start and when the cell's settings are saved) and starts those cells on

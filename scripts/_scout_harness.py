@@ -220,3 +220,11 @@ class Served:
 
     def post(self, path, body=None, headers=None, raw=None):
         return self.request("POST", path, body=body, headers=headers, raw=raw)
+
+
+# The memory-limit probe launches systemd-run: a door to the host like the
+# others, and on a Linux runner it would be reached. A snapshot sees a host
+# whose cells get no limits; a pin about the limits sets the answer itself.
+from caravan_scout.process import MemoryScope  # noqa: E402
+
+MemoryScope._usable = False

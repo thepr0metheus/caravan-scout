@@ -23,19 +23,23 @@ class Report:
     other every minute.
     """
 
-    def __init__(self, config, state, machine, cells, builds, autostart):
+    def __init__(self, config, state, machine, cells, builds, autostart, suspect):
         self.config = config
         self.state = state
         self.machine = machine
         self.cells = cells
         self.builds = builds
         self.autostart = autostart
+        self.suspect = suspect
 
     def public(self) -> dict[str, Any]:
         """Everything this scout reports, for /api/state."""
         gpus = self.machine.gpus()
         compute_apps = self.machine.compute_apps()
         cpu_ram = self.machine.cpu_ram()
+        version = self.builds.binary_version()
+        # Before the state's lock: the verdict takes it itself.
+        suspect = self.suspect.verdict(version)
         with self.state.lock:
             return {
                 "service": "caravan-scout",
@@ -43,9 +47,12 @@ class Report:
                 # controller keeps whichever arrived last, and a field only one
                 # of them carries is erased by the other every minute.
                 "scoutVersion": APP_VERSION,
-                "llamaBinaryVersion": self.builds.binary_version(),
+                "llamaBinaryVersion": version,
                 "llamaBinaryMtime": self.builds.binary_mtime(),
                 "llamaUpdate": self.builds.status_slim(),
+                # Cells crashing soon after a fresh llama.cpp build (2.6+):
+                # the board's banner offers a rollback.
+                "llamaSuspect": suspect,
                 "host": {
                     "id": self.config.get("hostId"),
                     "name": self.config.get("displayName"),
@@ -114,6 +121,7 @@ class Report:
             # controller reads between heartbeats; each heartbeat then replaced
             # the host record without it, and "building…" blinked on the board.
             "llamaUpdate": state["llamaUpdate"],
+            "llamaSuspect": state["llamaSuspect"],
             "scoutVersion": state["scoutVersion"],
             "autostart": state["autostart"],
             "agentUrl": f"http://{state['host']['ip']}:{self.config.get('listenPort')}",

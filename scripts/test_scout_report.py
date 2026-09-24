@@ -200,8 +200,8 @@ def test_public_state():
         check(fresh.report.public().get("heartbeat") == {"state": "pending"},
               "negative: до первого пульса — «pending», а не пусто")
     check(sorted(state) == sorted(["service", "scoutVersion", "llamaBinaryVersion", "llamaBinaryMtime", "llamaUpdate",
-                                   "host", "controllerUrl", "gpus", "computeApps", "cpu", "platform", "heartbeat",
-                                   "llamaNode", "llamaNodes", "autostart", "time"]),
+                                   "llamaSuspect", "host", "controllerUrl", "gpus", "computeApps", "cpu", "platform",
+                                   "heartbeat", "llamaNode", "llamaNodes", "autostart", "time"]),
           "ровно эти поля — только машина: ни агентов, ни найденных VM, ни назначений")
     check(state["host"] == {"id": "box-a", "name": "Box A", "hostname": "box-a.lan", "ip": "10.0.0.5"},
           "машина: id и имя из конфига, hostname системы, адрес — тот, что видит контроллер")
@@ -229,8 +229,8 @@ def test_heartbeat_payload():
         except Exception as exc:  # noqa: BLE001 — a crash is a red pin, not a stopped run
             payload = {"__raised__": repr(exc), "agentUrl": None}
     check(sorted(payload) == sorted(["host", "gpus", "computeApps", "cpu", "platform", "llamaNode", "llamaNodes",
-                                     "llamaBinaryVersion", "llamaBinaryMtime", "llamaUpdate", "scoutVersion",
-                                     "autostart", "agentUrl", "time"]),
+                                     "llamaBinaryVersion", "llamaBinaryMtime", "llamaUpdate", "llamaSuspect",
+                                     "scoutVersion", "autostart", "agentUrl", "time"]),
           "ровно эти поля — только машина")
     check(payload["agentUrl"] == "http://10.0.0.5:18099", "адрес скаута — его IP и порт, на котором он слушает")
     check(payload.get("llamaUpdate") == {"running": False, "done": False, "rc": None, "startedAt": 0, "tag": "",
@@ -385,10 +385,18 @@ def test_binary_version():
               "llama-server печатает версию в stderr — берётся оттуда")
     with patched(subprocess, run=answers("from stdout\n", "from stderr\n")):
         check(scout.builds.binary_version() == "from stdout", "boundary: есть и stdout, и stderr — первым stdout")
-    os.utime(binary, (1_700_000_000, 1_700_000_000))
+    os.utime(binary, (1_700_000_000.7, 1_700_000_000.7))
     mtime = scout.builds.binary_mtime()
     check(len(mtime) == 19 and mtime[4] == "-" and mtime[10] == "T",
           "дата бинаря — ISO без часового пояса, по местному времени")
+    built = scout.builds.binary_built_at()
+    check(built == 1_700_000_000 and type(built) is int,
+          "когда сделан бинарь — целые секунды: из них ключ сборки, под которым держится баннер подозрения")
+    check(make_scout().builds.binary_built_at() == 0 and make_scout().builds.binary_mtime() == "",
+          "negative: бинаря нет — 0 и пустая дата, не «1970-01-01»")
+    folder = make_scout({"llamaServerBin": str(binary.parent)})
+    check(folder.builds.binary_built_at() == 0,
+          "negative: в конфиге папка вместо бинаря — её время не выдаётся за сборку")
 
 
 def test_live_numbers():

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -17,15 +19,64 @@ class CellLog:
     """The log a cell's process writes.
 
     A new run moves the previous run's log aside instead of truncating it,
-    and a dead process's log is read for the reason it died. A process
-    started without a log has a CellLog of nothing: nothing is kept, nothing
-    is read.
+    and a dead process's log is read for the reason it died and for its last
+    lines. A process started without a log has a CellLog of nothing: nothing
+    is kept, nothing is read.
+
+    What is read leaves the machine — the board shows it — so keys are
+    scrubbed out of it first: the value goes, its name stays, and the line
+    still reads. Only values that look like keys: llama.cpp logs
+    "EOS token = 151645", and that number is not a secret.
     """
+
+    # The last lines of a dead run, as many as the controller shows for its
+    # own cells from their journal.
+    TAIL_LINES = 8
+    TAIL_CHARS = 1500
+    SECRETS = (
+        # A key by its prefix, wherever it stands.
+        (re.compile(r"\b(lcv1_|sk-|hf_|ghp_|glpat-)[A-Za-z0-9_\-]{6,}"), r"\1…"),
+        (re.compile(r"(?i)\b(bearer)\s+[^\s\"',}]+"), r"\1 …"),
+        # A value named as secret: whatever it is.
+        (re.compile(r"(?i)\b((?:[a-z0-9]+_)*(?:api[_-]?key|password|passwd|secret))\b(\"?\s*[=:]\s*\"?|\s+)"
+                    r"[^\s\"',}]+"),
+         r"\1\2…"),
+        # A token: only a key-shaped value — "EOS token = 151645" stays.
+        (re.compile(r"(?i)\b((?:[a-z0-9]+_)*(?:token|authorization))\b(\"?\s*[=:]\s*\"?|\s+)"
+                    r"[A-Za-z0-9_\-.~+/=]{12,}"),
+         r"\1\2…"),
+    )
 
     def __init__(self, path):
         self.path = path
 
+    @classmethod
+    def scrub(cls, text: str) -> str:
+        """`text` without the keys in it."""
+        for pattern, kept in cls.SECRETS:
+            text = pattern.sub(kept, text)
+        return text
+
+    def tail(self) -> str:
+        """The last lines the process wrote, keys scrubbed — what the card
+        shows on hover. Empty when there is no log or nothing in it."""
+        if not self.path:
+            return ""
+        try:
+            with open(self.path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                fh.seek(max(0, fh.tell() - 64 * 1024))
+                text = fh.read().decode("utf-8", errors="replace")
+        except OSError:
+            return ""
+        lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()][-self.TAIL_LINES:]
+        return self.scrub("\n".join(lines))[-self.TAIL_CHARS:]
+
     def crash_reason(self) -> str:
+        """The reason the process died, keys scrubbed (see _reason)."""
+        return self.scrub(self._reason())
+
+    def _reason(self) -> str:
         """Pull a concise crash reason from the tail of the cell's log.
 
         Priority: corruption/OOM patterns first (most actionable), then any
@@ -138,6 +189,70 @@ class CellLog:
             pass
 
 
+class MemoryScope:
+    """The memory limits a cell of the controller has from its systemd unit
+    (MemoryHigh 70 %, MemoryMax 80 %, swap 2 GB — the same values as
+    systemd/lama-cell@.service in the controller): a model that eats the RAM
+    dies alone instead of taking the machine with it.
+
+    On Linux with a user systemd a cell is launched in its own transient
+    scope with those limits: `systemd-run --user --scope` registers the scope
+    for itself and then execs the command, so the pid is the cell's, its
+    environment (the scout's marker) is kept, and it lives outside the
+    scout's cgroup. Elsewhere — macOS, no user manager, no memory controller
+    for it — the cell runs as it did, without limits, and the journal says so
+    once: a limit that is not there must not read as one that is.
+
+    The probe launches what a cell would be launched with and reads the
+    scope's own memory.max: systemd accepts MemoryMax even where the memory
+    controller is not delegated to the user manager, and then nothing limits
+    the cell.
+    """
+
+    LIMITS = ("MemoryHigh=70%", "MemoryMax=80%", "MemorySwapMax=2G")
+    # Run inside the scope: the memory.max of the cgroup it runs in.
+    READ_LIMIT = 'cat "/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)/memory.max"'
+    _usable: bool | None = None
+
+    @classmethod
+    def usable(cls) -> bool:
+        """Asked once per scout run; the answer goes to the journal."""
+        if cls._usable is None:
+            cls._usable, why = cls.probe()
+            print(f"[cells] {why}", flush=True)
+        return cls._usable
+
+    @classmethod
+    def probe(cls) -> tuple[bool, str]:
+        """Whether a cell launched here gets the limits, and why, for the journal."""
+        if not sys.platform.startswith("linux"):
+            return False, "cells run without memory limits: the limits come from systemd, and this is not Linux"
+        if not shutil.which("systemd-run"):
+            return False, "cells run without memory limits: systemd-run is not installed"
+        try:
+            done = subprocess.run(cls.command(["sh", "-c", cls.READ_LIMIT]),
+                                  capture_output=True, text=True, timeout=10)
+        except Exception as exc:
+            return False, f"cells run without memory limits: systemd-run --user did not answer ({exc})"
+        said = (done.stdout or "").strip()
+        if done.returncode != 0 or not said.isdigit():
+            errors = (done.stderr or "").strip().splitlines()
+            why = errors[-1] if errors else (f"memory.max = {said}" if said else f"exit {done.returncode}")
+            return False, f"cells run without memory limits: a user scope gets none here ({why})"
+        return True, f"cells run in their own scope: {' '.join(cls.LIMITS)} (MemoryMax {int(said) / 1e9:.1f} GB)"
+
+    @classmethod
+    def command(cls, argv: list[str]) -> list[str]:
+        """`argv` in a transient user scope with the limits."""
+        limits = [arg for limit in cls.LIMITS for arg in ("-p", limit)]
+        return ["systemd-run", "--user", "--scope", "--quiet", "--collect", *limits, "--", *argv]
+
+    @classmethod
+    def wrap(cls, argv: list[str]) -> list[str]:
+        """The command as it is launched: in a limited scope when one can be made."""
+        return cls.command(argv) if cls.usable() else list(argv)
+
+
 class CellProcess:
     """The process of one cell: a llama-server, or whatever a command cell
     runs. It knows nothing of ports or phases — only its process.
@@ -218,7 +333,7 @@ class CellProcess:
             try:
                 log_fh = open(log_path, "w") if log_path else subprocess.DEVNULL
                 self._proc = subprocess.Popen(
-                    cmd,
+                    MemoryScope.wrap(cmd),
                     stdout=log_fh,
                     stderr=subprocess.STDOUT if log_path else subprocess.DEVNULL,
                     close_fds=True,
@@ -254,7 +369,7 @@ class CellProcess:
             try:
                 log_fh = open(log_path, "w") if log_path else subprocess.DEVNULL
                 self._proc = subprocess.Popen(
-                    cmd,
+                    MemoryScope.wrap(cmd),
                     stdout=log_fh,
                     stderr=subprocess.STDOUT if log_path else subprocess.DEVNULL,
                     close_fds=True,
@@ -292,7 +407,7 @@ class CellProcess:
             try:
                 log_fh = open(log_path, "w") if log_path else subprocess.DEVNULL
                 self._proc = subprocess.Popen(
-                    list(spec["argv"]),
+                    MemoryScope.wrap(list(spec["argv"])),
                     stdout=log_fh,
                     stderr=subprocess.STDOUT if log_path else subprocess.DEVNULL,
                     close_fds=True,
@@ -350,6 +465,12 @@ class CellProcess:
             self._cfg = {}
             self._started_at = 0
             return {"ok": True}
+
+    def log_tail(self) -> str:
+        """The last lines of this cell's log (CellLog.tail)."""
+        with self._lock:
+            log = self._log
+        return log.tail()
 
     def held_files(self) -> list[str]:
         """The model files this process holds while it runs — what a cache

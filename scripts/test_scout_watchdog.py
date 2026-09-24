@@ -16,12 +16,13 @@ Run: python3 scripts/test_scout_watchdog.py
 """
 import contextlib
 import io
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _scout_harness import TMP, Checks, make_scout, patched  # noqa: E402
+from _scout_harness import ROOT, TMP, Checks, make_scout, patched  # noqa: E402
 
 from caravan_scout.process import CellProcess  # noqa: E402
 from caravan_scout.starts import CellStart  # noqa: E402
@@ -39,9 +40,14 @@ class FakeProcess:
         self.state = {"running": True, "pid": 11}
         self.relaunches = 0
         self.relaunch_ok = relaunch_ok
+        self.log = ""
 
-    def crash(self, reason="CUDA error: out of memory", code=1):
+    def crash(self, reason="CUDA error: out of memory", code=1, log=""):
         self.state = {"running": False, "exitCode": code, "lastError": reason, "crashed": code != 0}
+        self.log = log
+
+    def log_tail(self):
+        return self.log
 
     def status(self):
         return dict(self.state)
@@ -51,10 +57,21 @@ class FakeProcess:
         if not self.relaunch_ok:
             return {"ok": False, "error": "llama-server binary not found"}
         self.state = {"running": True, "pid": 100 + self.relaunches}
+        self.log = "a new run"
         return {"ok": True, "pid": 100 + self.relaunches}
 
     def held_files(self):
         return []
+
+
+class Told:
+    """The machine's CrashSuspect, written down: the words of each crash."""
+
+    def __init__(self):
+        self.words = []
+
+    def crashed(self, words):
+        self.words.append(words)
 
 
 class Clock:
@@ -71,7 +88,7 @@ def rig(relaunch_ok=True):
     proc = FakeProcess(relaunch_ok)
     cell.process = proc
     clock = Clock()
-    dog = Watchdog(s.cells, clock=clock)
+    dog = Watchdog(s.cells, Told(), clock=clock)
     return s, cell, proc, clock, dog
 
 
@@ -135,6 +152,80 @@ def test_gives_up_after_three():
         clock.now += 300
     check(proc.relaunches == 5 and not cell.crash.get("gaveUp"),
           "negative: падения раз в 5 минут — окно 10 минут сдвигается, поднимает каждый раз")
+
+
+def test_the_last_lines():
+    CHECKS.section("последние строки лога — в заметке:")
+    s, cell, proc, clock, dog = rig()
+    proc.crash(log="E load: tensor data is not within the file bounds\nE main: exiting")
+    ticks(dog)
+    check(cell.crash.get("tail") == "E load: tensor data is not within the file bounds\nE main: exiting",
+          "падение — заметка берёт последние строки лога упавшего запуска")
+    clock.now += 10
+    ticks(dog)
+    with patched(s.cells.probe, metrics=lambda port: {}), patched(s.cells.machine, firewall=lambda port: {}):
+        view = s.cells.view(cell)
+    check(proc.relaunches == 1 and (view.get("crash") or {}).get("tail") == "E load: tensor data is not within the file bounds\nE main: exiting",
+          "перезапуск отодвинул лог, а строки в заметке — всё ещё того падения; карточка их читает")
+    s, cell, proc, clock, dog = rig()
+    proc.crash(log="")
+    ticks(dog)
+    check("tail" not in (s.cells.view(cell).get("crash") or {"tail": "no note at all"}),
+          "negative: лог пуст — поля нет, а не пустая строка под 💥")
+
+
+def test_the_suspect_is_told():
+    CHECKS.section("о падении узнаёт подозрение на сборку:")
+    s, cell, proc, clock, dog = rig()
+    proc.crash("CUDA error: an illegal memory access", log="E ggml_cuda: CUDA error\nE main: exiting")
+    ticks(dog)
+    clock.now += 10
+    ticks(dog)
+    ticks(dog)
+    check(dog.suspect.words == ["CUDA error: an illegal memory access\nexited (code 1)\nE ggml_cuda: CUDA error\nE main: exiting"],
+          "каждое падение — один раз, словами причины, того, как кончился процесс, и последних строк: по ним решают, "
+          "смерть ли это движка")
+    s, cell, proc, clock, dog = rig(relaunch_ok=False)
+    proc.crash()
+    for _ in range(4):
+        ticks(dog)
+        clock.now += 10
+    check(len(dog.suspect.words) == 1,
+          "negative: неудачный перезапуск — не новое падение движка: сборка тут ни при чём")
+
+
+def test_a_signal_by_its_name():
+    CHECKS.section("сигнал — по имени:")
+    s, cell, proc, clock, dog = rig()
+    proc.crash("", code=-11)
+    ticks(dog)
+    check(cell.crash["reason"] == "died of SIGSEGV" and "died of SIGSEGV" in dog.suspect.words[0],
+          "лог молчит, процесс убит сигналом 11 — причина «died of SIGSEGV», а не «exited (code -11)»; "
+          "подозрение на сборку её видит")
+    s, cell, proc, clock, dog = rig()
+    proc.crash("E ggml: something went wrong", code=-6)
+    ticks(dog)
+    check(cell.crash["reason"] == "E ggml: something went wrong" and "died of SIGABRT" in dog.suspect.words[0],
+          "в логе есть строка — она причина на карточке, а сигнал всё равно доходит до подозрения")
+    check(Watchdog.how({"exitCode": 1}) == "exited (code 1)" and Watchdog.how({"exitCode": -999}) == "exited (code -999)",
+          "negative: обычный код — как был; неизвестный номер сигнала — числом, без выдумок")
+    check(Watchdog.how({"exitCode": None}) == "ended with an unknown exit code (adopted after a scout restart)",
+          "defect-history: код усыновлённой ячейки неизвестен — так и сказано словами, а не «exited (code None)»")
+
+
+def test_the_card_knows_these_words():
+    CHECKS.section("карточка контроллера узнаёт эти слова:")
+    js = ROOT.parent / "lama-caravan" / "static" / "js" / "topology-nodes.js"
+    if not js.exists():
+        print("  (контроллера рядом нет — сверка пропущена)")
+        return
+    found = re.search(r"const SCOUT_EXIT_WORDS = /(.+)/;", js.read_text(encoding="utf-8"))
+    words = re.compile(found.group(1)) if found else None
+    said = [Watchdog.how({"exitCode": code}) for code in (-11, -6, 1, 137, -999, None)]
+    check(words is not None and all(words.match(w) for w in said),
+          f"всё, что говорит Watchdog.how, карточка называет «причины нет в логе», а не «Model loading failed» ({said})")
+    check(words is not None and not words.match("E llama_model_load: error loading model"),
+          "negative: строка лога — не эти слова")
 
 
 def test_what_is_not_a_crash():
@@ -229,7 +320,9 @@ def test_the_launcher_runs_it():
           "сторож запущен в своём потоке до того, как откроется порт; negative: без него упавшая ячейка лежит")
 
 
-for fn in (test_restart_after_ten_seconds, test_gives_up_after_three, test_what_is_not_a_crash, test_by_hand,
+for fn in (test_restart_after_ten_seconds, test_gives_up_after_three, test_the_last_lines, test_the_suspect_is_told,
+           test_a_signal_by_its_name, test_the_card_knows_these_words, test_what_is_not_a_crash,
+           test_by_hand,
            test_relaunch_itself, test_the_launcher_runs_it):
     fn()
 
