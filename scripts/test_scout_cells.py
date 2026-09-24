@@ -366,7 +366,7 @@ def worker_scout(**config):
 
 
 def worker(s, port, config, model=MODEL, mmproj="", spec="", cache=False, args=...,
-           popen=None, web=None, kill=None, bin_path=None, make_cache_dir=True, hints=None):
+           popen=None, web=None, kill=None, bin_path=None, make_cache_dir=True, hints=None, env=None):
     """Run the llama startup worker synchronously under a Rig. The cache dir
     is made first unless asked not to: the worker opens its per-port log there."""
     if args is ...:
@@ -377,7 +377,7 @@ def worker(s, port, config, model=MODEL, mmproj="", spec="", cache=False, args=.
     with rig:
         rig.res, rig.err = attempt(lambda: LlamaLaunch(
             s.cells, port, str(bin_path or LLAMA_BIN), config, model, mmproj, spec, cache, args,
-            hints=hints).run())
+            hints=hints, env=env).run())
     return rig
 
 
@@ -791,8 +791,9 @@ def test_cell_artifacts():
     cell = json.loads((d / "cell.json").read_text(encoding="utf-8"))
     check(cell == {"hostId": "box-a", "port": port, "config": config, "runtime": runtime,
                    "cmd": [bin_abs, "--model", "/models/org/model q4.gguf", "--alias", "it's", "--port", "22031"],
-                   "generatedAt": NOW, "startScript": str(d / "start.sh")},
-          "cell.json: хост, порт, конфиг формы, runtime, argv строками, время и путь start.sh")
+                   "env": {}, "generatedAt": NOW, "startScript": str(d / "start.sh")},
+          "cell.json: хост, порт, конфиг формы, runtime, argv строками, окружение движка (нет — пусто), "
+          "время и путь start.sh")
     raw = (d / "cell.json").read_text(encoding="utf-8")
     check("модель" in raw and raw.endswith("}\n") and raw.startswith("{\n  \"hostId\""),
           "cell.json читаем глазами: не-ASCII как есть, отступ 2, перевод строки в конце")
@@ -806,6 +807,30 @@ def test_cell_artifacts():
           "cell.json заменён атомарно")
     check(sorted(p.name for p in d.iterdir()) == ["cell.json", "cell.json.reader", "start.sh", "start.sh.reader"],
           "negative: временных .tmp не осталось")
+
+
+def test_cell_artifacts_env():
+    # The scout's start.sh is "the exact command, runnable by hand": the
+    # environment the engine got belongs in it, or the hand-run differs.
+    s = make_scout()
+    port = 22032
+    d = SERVER_CELLS_DIR / str(port)
+    shutil.rmtree(d, ignore_errors=True)
+    env = {"CUDA_VISIBLE_DEVICES": "", "A_B": "x 'y'"}
+    with Rig():
+        CellArtifacts(s.config).write(port, "/bin/llama-server", ["--port", port], {}, {}, env=env)
+    script = (d / "start.sh").read_text(encoding="utf-8")
+    check(script == ("#!/usr/bin/env bash\nset -euo pipefail\n\nexport CUDA_VISIBLE_DEVICES=''\n"
+                     "export A_B='x '\"'\"'y'\"'\"''\nexec /bin/llama-server --port 22032 \"$@\"\n"),
+          "start.sh экспортирует окружение движка перед exec, значения в shlex-кавычках (пустое — '')")
+    cell = json.loads((d / "cell.json").read_text(encoding="utf-8"))
+    check(cell.get("env") == env, "cell.json записывает окружение движка как есть")
+    shutil.rmtree(d, ignore_errors=True)
+    with Rig():
+        CellArtifacts(s.config).write(port, "/bin/llama-server", ["--port", port], {}, {}, env=None)
+    check("export" not in (d / "start.sh").read_text(encoding="utf-8")
+          and json.loads((d / "cell.json").read_text(encoding="utf-8")).get("env") == {},
+          "negative: окружения нет — ни одного export, в cell.json пусто")
 
 
 def test_registry():
@@ -1380,6 +1405,31 @@ def test_llama_start_misc():
           "as-is: ДЕФЕКТ — имя файла из прошлого, упавшего старта показывается в новом старте как текущее")
 
 
+def test_llama_engine_env():
+    port = 22093
+
+    def launch_env(payload):
+        r = start_llama({"modelPath": MODEL, "args": llama_args(port),
+                         "config": {"MODEL_FILE": MODEL, "PORT": port}, **payload})
+        t = r.threads.made[0] if r.threads.made else None
+        launch = getattr(getattr(t, "target", None), "__self__", None)
+        return r, (launch.env if isinstance(launch, LlamaLaunch) else "no launch")
+    r, env = launch_env({"env": {"CUDA_VISIBLE_DEVICES": ""}})
+    check((r.res or {}).get("ok") is True and env == {"CUDA_VISIBLE_DEVICES": ""},
+          "окружение движка из запроса уходит в запуск (CPU-ячейка: CUDA_VISIBLE_DEVICES пустой)")
+    check(launch_env({})[1] == {} and launch_env({"env": None})[1] == {},
+          "negative: env нет (или null) — запуск без окружения сверх своего")
+    check(launch_env({"env": {"_X9": "v"}})[1] == {"_X9": "v"}, "boundary: имя с подчёркиванием и цифрой — годится")
+    for why, bad in (("не словарь", ["CUDA_VISIBLE_DEVICES="]), ("значение не строка", {"CUDA_VISIBLE_DEVICES": 0}),
+                     ("имя с цифры", {"1X": ""}), ("дефис в имени", {"A-B": ""}), ("пустое имя", {"": ""}),
+                     ("пробел в имени", {"A B": ""}), ("строка вместо словаря", "CUDA_VISIBLE_DEVICES=")):
+        r = start_llama({"modelPath": MODEL, "args": llama_args(port), "env": bad,
+                         "config": {"MODEL_FILE": MODEL, "PORT": port}})
+        check(err_is(r.err, 400, "env must map variable names to strings")
+              and r.threads.made == [] and r.run.calls == [] and r.s.cells.by_port == {},
+              f"кривое окружение ({why}) — отказ 400 до всего: ни запуска, ни ufw, ни слота")
+
+
 def test_llama_start_then_worker():
     port = 22092
     s = make_scout({"controllerUrl": CONTROLLER, "llamaServerBin": str(LLAMA_BIN)})
@@ -1631,6 +1681,34 @@ def test_worker_success():
     check([c["url"] for c in r.web.calls] == [f"{CONTROLLER}/api/models/download?path=models/org/model-q4.gguf"],
           "модель скачана с контроллера один раз")
     check(r.web.calls and r.web.calls[0]["timeout"] == 3600, "загрузка модели с таймаутом 3600 с")
+
+
+def test_worker_engine_env():
+    port = 22103
+    s = worker_scout()
+    env = {"CUDA_VISIBLE_DEVICES": ""}
+    r = worker(s, port, {"MODEL_FILE": MODEL, "PORT": port, "N_GPU_LAYERS": "0"}, env=env)
+    spawn = r.popen.calls[0] if r.popen.calls else {}
+    got = spawn.get("env") or {}
+    check(got.get("CUDA_VISIBLE_DEVICES") == "" and got.get("CARAVAN_SCOUT_CELL") == str(port),
+          "llama-server запущен с окружением движка поверх своего — и с меткой скаута")
+    check(((disk_cells(s).get(str(port)) or {}).get("launch") or {}).get("extraEnv") == env,
+          "окружение записано с запуском: после падения ячейка поднимется так же")
+    start = (SERVER_CELLS_DIR / str(port) / "start.sh")
+    check(start.exists() and "export CUDA_VISIBLE_DEVICES=''\nexec " in start.read_text(encoding="utf-8"),
+          "start.sh ячейки экспортирует его перед exec")
+    port = 22104
+    s = worker_scout()
+    r = worker(s, port, {"MODEL_FILE": MODEL, "PORT": port})
+    got = (r.popen.calls[0] if r.popen.calls else {}).get("env") or {}
+    check(got == {**os.environ, "CARAVAN_SCOUT_CELL": str(port)},
+          "negative: без окружения движка — окружение скаута и метка, ничего сверх")
+    port = 22105
+    s = worker_scout()
+    popen = FakePopen(OSError(CORRUPT), {"pid": 4545})
+    r = worker(s, port, {"MODEL_FILE": MODEL, "PORT": port}, cache=True, popen=popen, env=env)
+    check(len(popen.calls) == 2 and all((c.get("env") or {}).get("CUDA_VISIBLE_DEVICES") == "" for c in popen.calls),
+          "повтор после битого кэша стартует с тем же окружением")
 
 
 def test_worker_download_error():
@@ -1967,18 +2045,18 @@ def test_worker_cleanup_when_caching():
 TESTS = [
     test_slot_plumbing, test_node_public_views, test_nodes_public_list,
     test_update_status_views, test_update_start_commands, test_update_job_run, test_update_conflict,
-    test_builds_list, test_cell_artifacts, test_registry, test_marker_matches, test_pid_cmdline,
+    test_builds_list, test_cell_artifacts, test_cell_artifacts_env, test_registry, test_marker_matches, test_pid_cmdline,
     test_port_listener_pid, test_port_health_ok,
     test_adopt_by_marker, test_adopt_by_port, test_adopt_by_port_stranger, test_owned,
     test_adopt_nothing_listening, test_adopt_quiet_health,
     test_adopt_bad_records, test_reap_strays,
     test_node_configs, test_delete_node_config,
     test_llama_start_refusals, test_llama_start_accepted, test_llama_start_port_order, test_llama_start_misc,
-    test_llama_start_then_worker,
+    test_llama_start_then_worker, test_llama_engine_env,
     test_command_cell_start, test_command_exec_stripping, test_command_cell_refusals, test_command_cell_model,
     test_command_cell_markers, test_command_cell_syncs_assets_first,
     test_resolve_arg_paths,
-    test_worker_success, test_worker_download_error, test_worker_log_dir_missing, test_worker_refuses_without_args,
+    test_worker_success, test_worker_engine_env, test_worker_download_error, test_worker_log_dir_missing, test_worker_refuses_without_args,
     test_worker_gpu_layers_and_spec, test_worker_cancelled_mid_download, test_worker_stopped_during_start,
     test_worker_corruption_retry, test_worker_corruption_only_own, test_worker_cleanup_when_caching,
     test_models_in_place,

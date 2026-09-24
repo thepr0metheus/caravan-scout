@@ -31,13 +31,17 @@ class CellArtifacts:
         return SERVER_CELLS_DIR / str(int(port))
 
     def write(self, port: int, bin_path: str, args: list[str],
-              config: dict[str, Any], runtime_cfg: dict[str, Any]) -> dict[str, Any]:
+              config: dict[str, Any], runtime_cfg: dict[str, Any],
+              env: dict[str, str] | None = None) -> dict[str, Any]:
         cell_dir = self.dir_of(port)
         cell_dir.mkdir(parents=True, exist_ok=True)
         start_path = cell_dir / "start.sh"
         json_path = cell_dir / "cell.json"
         cmd = [str(Path(bin_path).expanduser()), *[str(a) for a in args]]
-        script = "#!/usr/bin/env bash\nset -euo pipefail\n\nexec " + " ".join(shlex.quote(x) for x in cmd) + " \"$@\"\n"
+        env = dict(env or {})
+        exports = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in env.items())
+        script = ("#!/usr/bin/env bash\nset -euo pipefail\n\n" + exports + "exec "
+                  + " ".join(shlex.quote(x) for x in cmd) + " \"$@\"\n")
         tmp_start = start_path.with_suffix(".sh.tmp")
         tmp_json = json_path.with_suffix(".json.tmp")
         tmp_start.write_text(script, encoding="utf-8")
@@ -49,6 +53,7 @@ class CellArtifacts:
             "config": config,
             "runtime": runtime_cfg,
             "cmd": cmd,
+            "env": env,
             "generatedAt": int(time.time()),
             "startScript": str(start_path),
         }
@@ -189,6 +194,7 @@ class LlamaStart(CellStart):
         model_path_raw = str(payload.get("modelPath") or config.get("MODEL_FILE") or "").strip()
         if not model_path_raw:
             raise AppError("modelPath is required", 400)
+        env = self.engine_env()
         if not config:
             config = self.config = {
                 "MODEL_FILE": model_path_raw,
@@ -221,9 +227,29 @@ class LlamaStart(CellStart):
         self.open_firewall(port)
         launch = LlamaLaunch(self.cells, port, bin_path, config, model_path_raw,
                              mmproj_raw, spec_raw, cache_models, incoming_args,
-                             hints=self.hints())
+                             hints=self.hints(), env=env)
         threading.Thread(target=launch.run, daemon=True).start()
         return {"ok": True, "status": "starting", "phase": "resolving", "port": port}
+
+    #: What a shell accepts as a variable name.
+    ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+    def engine_env(self) -> dict[str, str]:
+        """The environment llama-server starts with over this scout's own
+        (`env`, NAME -> value) — the one the controller's start.sh exports:
+        a CPU-only cell gets CUDA_VISIBLE_DEVICES="", since a CUDA build of
+        llama.cpp still wakes the card at -ngl 0 and dies of out-of-memory
+        when a neighbour fills it. This scout used to start that cell with the
+        card in view. Refused when malformed: an engine started with a guess
+        at its environment is the wrong engine."""
+        env = self.payload.get("env")
+        if env is None:
+            return {}
+        if not isinstance(env, dict) or not all(
+                isinstance(k, str) and self.ENV_NAME.fullmatch(k) and isinstance(v, str)
+                for k, v in env.items()):
+            raise AppError("env must map variable names to strings", 400)
+        return dict(env)
 
 
 class LlamaLaunch:
@@ -234,8 +260,9 @@ class LlamaLaunch:
     def __init__(self, cells, port: int, bin_path: str, config: dict[str, Any],
                  model: str, mmproj: str = "", spec: str = "",
                  cache_models: bool = False, args: list[str] | None = None,
-                 hints: dict[str, Any] | None = None):
+                 hints: dict[str, Any] | None = None, env: dict[str, str] | None = None):
         self.hints = dict(hints or {})   # where the controller reads each file
+        self.env = dict(env or {})       # what the engine starts with (LlamaStart.engine_env)
         self.cells = cells
         self.port = port
         self.bin_path = bin_path
@@ -312,7 +339,7 @@ class LlamaLaunch:
                "specType": _spec_type_raw, "port": port,
                "gpuLayers": gpu_layers, "ctxSize": ctx_size}
         artifacts = CellArtifacts(cells.config)
-        cfg["artifact"] = artifacts.write(port, bin_path, args, config, cfg)
+        cfg["artifact"] = artifacts.write(port, bin_path, args, config, cfg, env=self.env)
         # A Stop that arrived while we were downloading has already dropped the
         # cell and unregistered it. Starting now would resurrect a process
         # nobody owns — exactly how a llama-server once survived with 10.7 GB of
@@ -321,7 +348,7 @@ class LlamaLaunch:
         if not cells.holds(port, cell):
             print(f"[llama-node] :{port} start cancelled — the cell was stopped mid-download")
             return
-        result = cell.process.start(bin_path, args, cfg, log_path=log_path)
+        result = cell.process.start(bin_path, args, cfg, log_path=log_path, extra_env=self.env)
 
         # Auto-recovery: if this start failed on a truncated/corrupted cached
         # file, delete the bad files and re-download once before giving up.
@@ -364,8 +391,8 @@ class LlamaLaunch:
                 cfg = {"modelPath": str(mp), "mmprojPath": mmproj_abs, "specPath": spec_abs,
                        "specType": _spec_type_raw, "port": port,
                        "gpuLayers": gpu_layers, "ctxSize": ctx_size}
-                cfg["artifact"] = artifacts.write(port, bin_path, args, config, cfg)
-                result = cell.process.start(bin_path, args, cfg, log_path=log_path)
+                cfg["artifact"] = artifacts.write(port, bin_path, args, config, cfg, env=self.env)
+                result = cell.process.start(bin_path, args, cfg, log_path=log_path, extra_env=self.env)
 
         if result.get("ok") and not cells.holds(port, cell):
             # Stopped between our start and here (the corruption retry keeps this

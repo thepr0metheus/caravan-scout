@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.8.1 — 2026-09-25
+
+- **A llama cell starts with the environment the controller names.** A
+  CPU-only cell (`N_GPU_LAYERS` 0) must not see the card: a CUDA build of
+  llama.cpp still wakes it at `-ngl 0` and dies of out-of-memory when a
+  neighbour fills it. The controller's own start script has always hidden
+  the card (`CUDA_VISIBLE_DEVICES=""`); this scout started the same cell
+  with the card in view. The start request now carries `env` (NAME ->
+  value): llama-server starts with it over the scout's own environment,
+  the cell's start.sh and cell.json write it down, and a restart after a
+  crash keeps it. A malformed `env` is refused (400) before anything
+  starts.
+
 ## 2.8.0 — 2026-09-24
 
 - **The machine second by second.** The controller draws its own machine

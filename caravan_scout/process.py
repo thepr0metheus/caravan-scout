@@ -311,10 +311,13 @@ class CellProcess:
         return bool(self._adopted_pid and self.pid_alive(self._adopted_pid))
 
     def start(self, bin_path: str, args: list[str], cfg: dict[str, Any],
-              log_path: Path | None = None) -> dict[str, Any]:
+              log_path: Path | None = None,
+              extra_env: dict[str, str] | None = None) -> dict[str, Any]:
         """Launch llama-server. `args` is the full token list after the binary
         (already includes --model/--host/--port). `cfg` is metadata surfaced by
-        status() (modelPath, port, gpuLayers, ctxSize)."""
+        status() (modelPath, port, gpuLayers, ctxSize). `extra_env` is set on
+        the process over the scout's own environment, and kept with the
+        launch, so a restart after a crash starts it the same way."""
         with self._lock:
             if self._running_locked():
                 return {"ok": False, "error": "llama-server is already running",
@@ -337,14 +340,15 @@ class CellProcess:
                     stdout=log_fh,
                     stderr=subprocess.STDOUT if log_path else subprocess.DEVNULL,
                     close_fds=True,
-                    env=HostProcesses.cell_env(cfg.get("port")),
+                    env={**HostProcesses.cell_env(cfg.get("port")), **(extra_env or {})},
                 )
                 self._cfg = {**cfg, "cmd": cmd}
                 self._started_at = int(time.time())
                 self._last_error = ""
                 self._log = CellLog(log_path)
                 self._exit_info = None
-                self._launch = {"argv": [str(a) for a in cmd], "extraEnv": {}, "log": str(log_path or "")}
+                self._launch = {"argv": [str(a) for a in cmd], "extraEnv": dict(extra_env or {}),
+                                "log": str(log_path or "")}
                 return {"ok": True, "pid": self._proc.pid, "port": cfg.get("port")}
             except Exception as exc:
                 self._last_error = str(exc)
