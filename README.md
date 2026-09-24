@@ -1,18 +1,29 @@
 # Caravan Scout
 
-The client-side sidecar of the [LAMA CARAVAN](https://github.com/thepr0metheus/lama-caravan)
-control plane. **Formerly known as `llm-easy-route-agent`** — if you see that
+The hardware sidecar of the [LAMA CARAVAN](https://github.com/thepr0metheus/lama-caravan)
+control plane: one small service on each machine that lends its GPU or CPU to
+the fleet. **Formerly known as `llm-easy-route-agent`** — if you see that
 name in older screenshots, configs or docs, it is this project.
 
-One small service per machine that lends its hardware to the fleet: it
-reports the machine — GPUs, CPU/RAM, running cells — and executes the
-controller's commands: run llama.cpp and command server cells locally,
-download models, update llama.cpp. It knows nothing about the AI agents or
-clients that may live on the same box: those are the controller's records,
-made by hand, and a client needs nothing installed.
+What it does, and all it does:
+
+- **reports its machine** — GPUs and what runs on them, CPU/RAM, the cells,
+  the llama.cpp build — in a heartbeat to the controller;
+- **runs cells** the controller configures: llama.cpp servers and command
+  cells (speech recognition, TTS…), models downloaded from the controller and
+  cached here, the cells re-adopted after the scout restarts;
+- **keeps llama.cpp current** — updates or rolls back the build when the
+  controller asks.
+
+It knows nothing about AI agents (since 2.0). The agents and the machines
+they run on — clients — are records the operator makes by hand on the
+controller's board; a machine that only runs agents installs nothing. A
+machine that both lends a GPU and runs agents simply appears twice: as a node
+with its hardware, and as a client card.
 
 Dependency-light on purpose: Python standard library only, one JSON config,
-a small HTTP API on `:8092`.
+a small HTTP API on `:8092`. Built as small classes with one job each, its
+whole HTTP surface pinned by value in tests that cannot reach the host.
 
 ## Why put a scout on a box
 
@@ -91,7 +102,7 @@ Machine A (any GPU or no GPU)          Machine B (controller)
 
 ## Install
 
-One-liner on a fresh client host (Linux or macOS):
+One-liner on a fresh scout host (Linux or macOS):
 
 ```sh
 git clone <your-remote>/caravan-scout.git ~/projects/caravan-scout
@@ -102,8 +113,8 @@ cd ~/projects/caravan-scout
 | Situation | What happens |
 |---|---|
 | Linux + NVIDIA GPU | Installs CUDA toolkit, builds `llama.cpp` with CUDA, sets up the model cache |
-| Linux, no GPU | Installs the agent only |
-| macOS | Installs the agent + launchd service |
+| Linux, no GPU | Installs the scout only |
+| macOS | Installs the scout + launchd service |
 
 The host appears on the controller's Topology board within one heartbeat
 (≤ 60 s). Flags: `--admin-url <url>`, `--skip-llama`, `--llama-tag <tag>`.
@@ -129,7 +140,7 @@ cache on first start.
 ## Pairing with a controller (no config editing)
 
 If you skipped `--admin-url` (or want to re-point the host later), open the
-agent's built-in page from any browser:
+scout's built-in page from any browser:
 
 ```
 http://<this-host-ip>:8092/
@@ -146,7 +157,9 @@ controller answered. No file editing, no restart.
 If the controller has sign-in enabled, paste its **fleet token** into the
 second field (the admin shows it in System → Security); it is stored as
 `controllerToken` and from then on both directions of scout ⇄ controller
-traffic authenticate with it.
+traffic authenticate with it. When the token is regenerated on the
+controller, pair again with the same address and the new token: the scout
+takes it once the controller accepts a heartbeat carrying it.
 
 Manual start:
 
@@ -160,7 +173,7 @@ python3 -m caravan_scout.app --config config.json --state state.json
 | Port | Service |
 |---|---|
 | `7990` | LAMA CARAVAN admin (controller) |
-| `8092` | this agent |
+| `8092` | this scout |
 | `8180` | llama-server on the client (default, configurable) |
 
 ## Config reference
@@ -190,7 +203,7 @@ python3 -m caravan_scout.app --config config.json --state state.json
 ## API
 
 See [docs/http-api.md](docs/http-api.md). In one line each: GET
-`health · state · llama-node/status · monitor/nvidia-smi · host/listeners ·
+`health · pairing · state · llama-node/status · monitor/nvidia-smi · host/listeners ·
 llama-node/configs · llama-node/list-cache · llama-node/update-status ·
 llama-node/builds`; POST `controller-url · heartbeat · llama-node/start ·
 llama-node/stop · llama-node/update · llama-node/restore ·
@@ -208,20 +221,22 @@ journalctl --user -u caravan-scout.service -f
 launchctl kickstart -k gui/$UID/com.caravan-scout
 ```
 
-Cells **survive agent restarts**: the units keep child processes alive
-(`KillMode=process` / `AbandonProcessGroup`) and the fresh agent re-adopts
+Cells **survive scout restarts**: the units keep child processes alive
+(`KillMode=process` / `AbandonProcessGroup`) and the fresh scout re-adopts
 them from its registry (`state.json`) — same pid, same uptime, inference
 uninterrupted. Orphans that match the llama-server binary but are not in the
 registry are reaped. Details: [docs/operations.md](docs/operations.md).
 
 ## Deployment rule
 
-Source moves through git only: `commit → push → git pull on each client host →
-restart the agent`. No `scp`. Runtime files (`state.json`, `var/`,
+Source moves through git only: `commit → push → git pull on each scout host →
+restart the scout`. No `scp`. Runtime files (`state.json`, `var/`,
 `llama-node-configs/`, the model cache) never go through git.
 
 ## Safety model
 
 Open by default on a trusted LAN; once a fleet token is configured, every
-endpoint except the pairing page and `/api/health` requires it. Command cells
-execute controller-supplied shell — do not expose the port beyond your LAN.
+endpoint except the pairing page, `/api/pairing` and `/api/health` requires
+it — and a pairing with a new token passes only when the same controller
+accepts that token. Command cells execute controller-supplied shell — do not
+expose the port beyond your LAN.

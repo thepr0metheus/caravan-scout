@@ -1,3 +1,3 @@
-"""Caravan Scout — client-side agent of the LAMA CARAVAN fleet."""
+"""Caravan Scout — the hardware sidecar of a machine in a LAMA CARAVAN fleet."""
 
 __version__ = "2.0.1"

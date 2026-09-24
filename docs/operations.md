@@ -2,7 +2,7 @@
 
 ## Install
 
-One-liner on a fresh client host (Linux or macOS):
+One-liner on a fresh scout host (Linux or macOS):
 
 ```sh
 git clone <your-remote>/caravan-scout.git ~/projects/caravan-scout
@@ -35,16 +35,16 @@ Git only — same rule as the controller:
 ```sh
 # locally
 git commit … && git push
-# on each client host
+# on each scout host
 cd ~/projects/caravan-scout && git pull --ff-only
 python3 -m py_compile caravan_scout/*.py
 systemctl --user restart caravan-scout.service   # or launchctl kickstart
 ```
 
-⚠️ **A restart kills the host's running server cells.** llama-server processes
-are children of the agent; on startup `reap_stray_llama_servers()` also
-terminates orphaned ones. After deploying, restart the affected cells from the
-controller's board (their configs are saved). Plan deploys accordingly.
+A restart does **not** stop the host's cells: the fresh scout re-adopts every
+cell in its registry (see below). What it does terminate at start is a
+llama-server that is in no record — an orphan holding a GPU and a port
+(`Cells.reap_strays`).
 
 ## Config
 
@@ -63,19 +63,20 @@ start), `llama-node-configs/`, `var/server-cells/<port>/`, the model cache
 
 ## Known quirks
 
-- **Agent restarts do not interrupt cells.** systemd (`KillMode=process`) and
+- **Scout restarts do not interrupt cells.** systemd (`KillMode=process`) and
   launchd (`AbandonProcessGroup`) leave the llama-server / command children
-  running when the agent stops; the fresh agent re-adopts them from the
-  `cells` registry in `state.json` (pid + cmdline-marker match) and reaps only
-  unmatched llama-server orphans. Adopted processes are managed by pid
+  running when the scout stops; the fresh scout re-adopts them from the
+  `cells` registry in `state.json` (pid + cmdline-marker match, or whoever
+  healthily serves the cell's port when an exec chain rewrote the command
+  line) and reaps only unmatched llama-server orphans. Adopted processes are managed by pid
   (liveness `kill(pid,0)`, stop SIGTERM→SIGKILL) — the one thing lost across
   the adopt boundary is the exit code of a crash that happens while adopted.
 
-- **Cell crash root causes live on the client**, in
-  `<modelsBasePath>/llama-server.log` — rotated on every start (15 kept). All
-  cells share that file; command cells log to `command-cell.log` next to it.
-  The agent extracts the crash reason (OOM / corrupt GGUF / mmproj mismatch)
-  into the heartbeat, so the board shows it.
+- **Cell crash root causes live on the scout host**, one log per port:
+  `<modelsBasePath>/llama-server.<port>.log`, and `command-cell.<port>.log`
+  for command cells — the previous run's log is moved aside on every start
+  (15 kept), never truncated. The scout extracts the crash reason (OOM /
+  corrupt GGUF / mmproj mismatch) into the heartbeat, so the board shows it.
 - **`sudo -n ufw allow <port>`** on cell start is best-effort: without
   passwordless sudo the port silently stays closed to the LAN.
 - **`cacheModels=false` (default)**: models re-download on every start and are

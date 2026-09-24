@@ -3,15 +3,15 @@
 > Historical note: this project was published internally as
 > `llm-easy-route-agent` before the rename to **caravan-scout**.
 
-`caravan-scout` is the client-side sidecar of the
+`caravan-scout` is the hardware sidecar of the
 [LAMA CARAVAN](../README.md#role) control plane: one small stdlib-only Python
-service per client machine. The controller (lama-caravan, `:7990`) owns the
+service per machine that lends its GPU or CPU. The controller (lama-caravan, `:7990`) owns the
 topology and builds llama-server commands; the scout executes them locally and
 reports back. It reports its machine only: the agents and clients that may
 live on the same box are the controller's records, made by hand (2.0).
 
 ```text
-client host                                   controller host
+scout host                                    controller host
 ┌────────────────────────────────┐            ┌────────────────────────────┐
 │ caravan-scout  :8092           │            │ lama-caravan admin :7990   │
 │  • heartbeat thread ───────────┼──POST────► │  /api/topology/client-     │
