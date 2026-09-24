@@ -23,12 +23,13 @@ class Report:
     other every minute.
     """
 
-    def __init__(self, config, state, machine, cells, builds):
+    def __init__(self, config, state, machine, cells, builds, autostart):
         self.config = config
         self.state = state
         self.machine = machine
         self.cells = cells
         self.builds = builds
+        self.autostart = autostart
 
     def public(self) -> dict[str, Any]:
         """Everything this scout reports, for /api/state."""
@@ -59,6 +60,9 @@ class Report:
                 "heartbeat": self.state.get("heartbeat", {}),
                 "llamaNode": self.cells.first_view(),
                 "llamaNodes": self.cells.views(),
+                # The ports that start with the machine — stopped ones too:
+                # the board shows ↟ on a parked cell as well.
+                "autostart": self.autostart.ports(),
                 "time": int(time.time()),
             }
 
@@ -111,6 +115,7 @@ class Report:
             # the host record without it, and "building…" blinked on the board.
             "llamaUpdate": state["llamaUpdate"],
             "scoutVersion": state["scoutVersion"],
+            "autostart": state["autostart"],
             "agentUrl": f"http://{state['host']['ip']}:{self.config.get('listenPort')}",
             "time": state["time"],
         }

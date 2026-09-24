@@ -201,7 +201,7 @@ def test_public_state():
               "negative: до первого пульса — «pending», а не пусто")
     check(sorted(state) == sorted(["service", "scoutVersion", "llamaBinaryVersion", "llamaBinaryMtime", "llamaUpdate",
                                    "host", "controllerUrl", "gpus", "computeApps", "cpu", "platform", "heartbeat",
-                                   "llamaNode", "llamaNodes", "time"]),
+                                   "llamaNode", "llamaNodes", "autostart", "time"]),
           "ровно эти поля — только машина: ни агентов, ни найденных VM, ни назначений")
     check(state["host"] == {"id": "box-a", "name": "Box A", "hostname": "box-a.lan", "ip": "10.0.0.5"},
           "машина: id и имя из конфига, hostname системы, адрес — тот, что видит контроллер")
@@ -230,7 +230,7 @@ def test_heartbeat_payload():
             payload = {"__raised__": repr(exc), "agentUrl": None}
     check(sorted(payload) == sorted(["host", "gpus", "computeApps", "cpu", "platform", "llamaNode", "llamaNodes",
                                      "llamaBinaryVersion", "llamaBinaryMtime", "llamaUpdate", "scoutVersion",
-                                     "agentUrl", "time"]),
+                                     "autostart", "agentUrl", "time"]),
           "ровно эти поля — только машина")
     check(payload["agentUrl"] == "http://10.0.0.5:18099", "адрес скаута — его IP и порт, на котором он слушает")
     check(payload.get("llamaUpdate") == {"running": False, "done": False, "rc": None, "startedAt": 0, "tag": "",

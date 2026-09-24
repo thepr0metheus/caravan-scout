@@ -86,6 +86,7 @@ class Api:
             # The controller lets go of this machine (its board's ✕).
             "/api/unpair": lambda body: (s.heartbeat.unpair(), 200),
             "/api/llama-node/start": self._start,
+            "/api/llama-node/autostart": self._autostart,
             "/api/host/reboot": lambda body: self.power.issue("reboot"),
             "/api/host/poweroff": lambda body: self.power.issue("poweroff"),
             "/api/llama-node/stop": lambda body: (s.cells.stop(body().get("port")), 200),
@@ -96,8 +97,15 @@ class Api:
         }
 
     def _start(self, body) -> tuple[Any, int]:
-        result = self.scout.cells.start(body())
+        payload = body()
+        result = self.scout.cells.start(payload)
+        if result.get("ok"):
+            self.scout.autostart.refresh(result.get("port"), payload)
         return result, 200 if result.get("ok") else 400
+
+    def _autostart(self, body) -> tuple[Any, int]:
+        b = body()
+        return self.scout.autostart.set(b.get("port"), b.get("enabled"), b.get("payload")), 200
 
     def _restore(self, body) -> tuple[Any, int]:
         b = body()

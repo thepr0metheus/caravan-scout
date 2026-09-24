@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from caravan_scout.autostart import Autostart
 from caravan_scout.builds import LlamaBuilds
 from caravan_scout.cells import Cells
 from caravan_scout.config import ScoutConfig
@@ -33,5 +34,6 @@ class Scout:
         self.models = self.cells.models
         self.builds = LlamaBuilds(self.config)
         self.configs = SavedConfigs(self.state.path.parent / "llama-node-configs")
-        self.report = Report(self.config, self.state, self.machine, self.cells, self.builds)
+        self.autostart = Autostart(self.state, self.cells, self.machine)
+        self.report = Report(self.config, self.state, self.machine, self.cells, self.builds, self.autostart)
         self.heartbeat = Heartbeat(self.config, self.state, self.report, self.cells)

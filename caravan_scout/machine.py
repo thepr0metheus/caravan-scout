@@ -394,6 +394,21 @@ class Machine:
             pass
         return info
 
+    # The kernel's id of this boot; a class attribute so a test can stand in for it.
+    BOOT_ID = "/proc/sys/kernel/random/boot_id"
+
+    @classmethod
+    def boot_id(cls) -> str:
+        """This boot of the machine: a string that changes on every boot and on
+        nothing else — the kernel's boot id on Linux, the boot time on macOS.
+        "" when the machine will not say."""
+        try:
+            with open(cls.BOOT_ID, encoding="utf-8") as fh:
+                return fh.read().strip()
+        except OSError:
+            pass
+        return cls.run_text(["sysctl", "-n", "kern.boottime"]).strip()
+
     @staticmethod
     def run_text(cmd: list[str], timeout: int = 4) -> str:
         """Run a command, return stdout on success, "" on any failure/non-zero."""

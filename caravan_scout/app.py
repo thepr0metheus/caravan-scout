@@ -24,6 +24,9 @@ def main(argv: list[str] | None = None) -> int:
 
     agent = Scout(Path(args.config).expanduser(), Path(args.state).expanduser())
     agent.cells.adopt_survivors()
+    # The cells that start with the machine; off the main thread, so a slow
+    # start does not keep the port closed.
+    threading.Thread(target=agent.autostart.start_all, daemon=True).start()
     heartbeat = threading.Thread(target=agent.heartbeat.loop, daemon=True)
     heartbeat.start()
 

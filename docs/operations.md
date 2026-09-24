@@ -102,6 +102,14 @@ start), `llama-node-configs/`, `var/server-cells/<port>/`, the model cache
   purged on stop; with caching on they stay. `cleanOldModels=true` (off by
   default) removes the other cached models after a start, keeping what the
   running cells hold.
+- **Autostart (2.4+).** A cell with ↟ on the board starts when the machine
+  boots: the scout keeps the start request the controller sent (refreshed on
+  every start and when the cell's settings are saved) and starts those cells on
+  its first start of a boot — `state.json` keeps the boot id (`autostartBoot`),
+  so a scout restart or update in the same boot starts nothing, as systemd's
+  `enable` does. A machine that will not say which boot it is (no
+  `/proc/sys/kernel/random/boot_id`, no `sysctl kern.boottime`) gets no
+  autostart, and the log says so.
 - **Models are read in place when this machine has them.** The controller
   says where it reads each model file (`inPlace` in the start request). The
   scout on the controller's own machine, or one that mounts a library at the

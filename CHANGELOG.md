@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.4.0 — 2026-09-24
+
+- **Cells start with the machine.** ↟ on the board now works for a scout's
+  cells: the scout keeps the request that starts the cell (the controller
+  sends it on ↟ and again when the cell's settings are saved; every start
+  refreshes it) and starts those cells when its machine boots —
+  `POST /api/llama-node/autostart`, and the ports in `autostart` of both
+  reports. On the first scout start of a boot only: the machine's boot id is
+  written down, and a scout restart or update in the same boot starts nothing
+  — a cell the operator stopped stays stopped, as with systemd's `enable`. A
+  machine that will not say which boot it is gets no autostart rather than a
+  surprise start.
+
 ## 2.3.0 — 2026-09-24
 
 - **Models are read where they are.** The controller now says, for every

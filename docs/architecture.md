@@ -98,6 +98,7 @@ systemd/launchd units); the code lives in the package:
 | `heartbeat.py` | `Heartbeat` — one beat to the controller, the loop of beats, and pairing; each outcome written to state.json |
 | `models.py` | `ModelFetcher` — the model cache: download from the controller with retries, verify, clean up, purge; reports progress through a callback |
 | `cells.py` | `Cell` (one port); `Cells` — the table by port, startup records, the views the controller reads, re-adoption after a restart, stray reaping, stop, the safe purge, and the model cache the cells own; `CellRecords` (state.json `cells`); `LlamaProbe` (a server's /metrics and /props) |
+| `autostart.py` | `Autostart` — the cells that start when the machine boots: the kept start requests, refreshed on each start, started on the first scout start of a boot |
 | `builds.py` | `LlamaBuilds` — llama.cpp on this machine: the binary's version and date, the update/restore job and its ring buffer, the archive of earlier builds |
 | `saved_configs.py` | `SavedConfigs` — launch parameters saved by hand as `llama-node.bak.<stamp>.json` |
 | `cell_assets.py` | `CellAssets` — before a command cell starts, the files its launcher runs are brought up to the controller's copies (by sha256); never blocks a start |
