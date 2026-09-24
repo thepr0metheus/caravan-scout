@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.8.0 — 2026-09-24
+
+- **The machine second by second.** The controller draws its own machine
+  from a sample a second; a scout's machine was drawn from its reports, a
+  GPU reading kept ten seconds. `Telemetry` samples the cards and the
+  processor every second while a board watches — the controller asks
+  `GET /api/telemetry?since=` about once a second while one is open — and
+  every ten seconds otherwise, and keeps ten minutes. The processor share is
+  measured from /proc/stat, as the controller measures its own (macOS: the
+  load average). Both reports say so (`telemetry`), and the controller asks
+  only a scout that does.
+
 ## 2.7.0 — 2026-09-24
 
 - **vLLM cells, ready for the move.** A start the card cannot hold is refused

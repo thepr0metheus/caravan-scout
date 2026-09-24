@@ -7,6 +7,7 @@ import subprocess
 import time
 from http.server import BaseHTTPRequestHandler
 from typing import Any, Callable
+from urllib.parse import parse_qs
 
 from caravan_scout import __version__ as APP_VERSION
 from caravan_scout.errors import AppError
@@ -79,6 +80,12 @@ class Api:
             "/api/llama-node/update-status": lambda: s.builds.status(),
             "/api/llama-node/builds": lambda: s.builds.archive(),
             "/api/llama-node/list-cache": lambda: {"ok": True, "models": s.models.listing()},
+        }
+        # Asked with a query: path -> fn(the query's first values).
+        self.get_query: dict[str, Callable[[dict[str, str]], Any]] = {
+            # What is new since `since` for the board's charts; asking marks
+            # the machine watched (Telemetry).
+            "/api/telemetry": lambda q: s.telemetry.since(q.get("since")),
         }
         # path -> fn(read_body) -> (payload, status)
         self.post: dict[str, Callable[[Callable[[], dict]], tuple[Any, int]]] = {
@@ -181,6 +188,10 @@ class ScoutHandler(BaseHTTPRequestHandler):
                 return
             if not self.token_ok():
                 self.refuse()
+                return
+            path, _, query = self.path.partition("?")
+            if path in api.get_query:
+                self.send_json(api.get_query[path]({k: v[0] for k, v in parse_qs(query).items()}))
                 return
             route = api.get.get(self.path)
             if route is None:

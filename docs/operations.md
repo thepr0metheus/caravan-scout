@@ -125,6 +125,12 @@ start), `llama-node-configs/`, `var/server-cells/<port>/`, the model cache
   newest archived build of another commit. It is kept in `state.json` under
   the build (commit and binary time) until dismissed for that build or the
   build changes. Nothing is restored without the operator.
+- **Charts a second apart (2.8+).** The scout samples its cards (nvidia-smi)
+  and processor every second while a board watches — the controller asks
+  `/api/telemetry?since=` about once a second while one is open — and every ten
+  seconds otherwise; ten minutes are kept, so an opened board has them. The
+  processor share is measured from /proc/stat as the controller measures its
+  own; on macOS the one-minute load average stands in.
 - **A cell that runs but does not listen yet (2.7+).** vLLM installs its venv
   and loads for minutes before its port opens; from the controller a silent
   port looks like a firewall. The scout asks its own OS which ports listen

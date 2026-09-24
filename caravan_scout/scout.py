@@ -13,6 +13,7 @@ from caravan_scout.report import Report
 from caravan_scout.saved_configs import SavedConfigs
 from caravan_scout.state import ScoutState
 from caravan_scout.suspect import CrashSuspect
+from caravan_scout.telemetry import Telemetry
 from caravan_scout.watchdog import Watchdog
 
 
@@ -38,7 +39,8 @@ class Scout:
         self.configs = SavedConfigs(self.state.path.parent / "llama-node-configs")
         self.autostart = Autostart(self.state, self.cells, self.machine)
         self.suspect = CrashSuspect(self.state, self.builds)
+        self.telemetry = Telemetry(self.machine)
         self.watchdog = Watchdog(self.cells, self.suspect)
         self.report = Report(self.config, self.state, self.machine, self.cells, self.builds, self.autostart,
-                             self.suspect)
+                             self.suspect, self.telemetry)
         self.heartbeat = Heartbeat(self.config, self.state, self.report, self.cells)

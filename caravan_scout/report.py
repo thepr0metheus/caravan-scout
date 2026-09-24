@@ -23,7 +23,7 @@ class Report:
     other every minute.
     """
 
-    def __init__(self, config, state, machine, cells, builds, autostart, suspect):
+    def __init__(self, config, state, machine, cells, builds, autostart, suspect, telemetry):
         self.config = config
         self.state = state
         self.machine = machine
@@ -31,6 +31,7 @@ class Report:
         self.builds = builds
         self.autostart = autostart
         self.suspect = suspect
+        self.telemetry = telemetry
 
     def public(self) -> dict[str, Any]:
         """Everything this scout reports, for /api/state."""
@@ -53,6 +54,10 @@ class Report:
                 # Cells crashing soon after a fresh llama.cpp build (2.6+):
                 # the board's banner offers a rollback.
                 "llamaSuspect": suspect,
+                # That this machine is sampled second by second, and how
+                # (2.8+): the controller asks /api/telemetry only of a scout
+                # that says so.
+                "telemetry": self.telemetry.describe(),
                 "host": {
                     "id": self.config.get("hostId"),
                     "name": self.config.get("displayName"),
@@ -122,6 +127,7 @@ class Report:
             # the host record without it, and "building…" blinked on the board.
             "llamaUpdate": state["llamaUpdate"],
             "llamaSuspect": state["llamaSuspect"],
+            "telemetry": state["telemetry"],
             "scoutVersion": state["scoutVersion"],
             "autostart": state["autostart"],
             "agentUrl": f"http://{state['host']['ip']}:{self.config.get('listenPort')}",
