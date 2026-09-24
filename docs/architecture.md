@@ -74,10 +74,14 @@ A llama cell's start answers at once and runs the slow half — download,
 artifacts, the process, the registry — as a background `LlamaLaunch`; a
 command cell starts on the request. Stopping a cell drops it from the fleet
 view and the registry and purges uncached models — via the safe purge that
-never evicts a model still served by a sibling cell. What was started is
-kept in `state.json` (`CellRecords`); after a scout restart the survivors
-are adopted again, by their command line or by the port they serve, and a
-llama-server nobody claims is reaped.
+never evicts a model still served by a sibling cell, and only files the scout
+downloaded itself (`DownloadedFiles`). What was started is kept in
+`state.json` (`CellRecords`); after a scout restart the survivors are adopted
+again, by their command line or by the port they serve, and a llama-server a
+scout started that nobody claims is reaped. A process the scout did not start
+(no `CARAVAN_SCOUT_CELL` in its environment, `HostProcesses.owned`) is never
+adopted or killed — on a machine shared with the controller, those are the
+controller's cells.
 
 ## Module layout
 

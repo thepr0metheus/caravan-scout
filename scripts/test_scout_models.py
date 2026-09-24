@@ -237,6 +237,20 @@ def tree(root):
     return sorted(str(p.relative_to(root)) for p in root.rglob("*")) if root.exists() else []
 
 
+def fetched(s, *rels):
+    """Write down files as downloaded by this scout — the only ones it may delete."""
+    for rel in rels:
+        s.models.downloaded.add(s.models.cache_dir() / rel)
+
+
+def written_down(s):
+    cache = s.models.cache_dir()
+    return [str(p.relative_to(cache)) for p in s.models.downloaded.paths()]
+
+
+RECORD = ".caravan-downloads.json"
+
+
 def sha(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -305,7 +319,7 @@ def test_ensure_model_download():
     during = []
     body = BODIES[MODEL]
     web = FakeUrlopen({"/api/models/download": served(body, on_read=lambda: during.append(
-        (tmp.exists(), local.exists(), dict(s.cells.startup(22001)))))})
+        (tmp.exists(), local.exists(), dict(s.cells.startup(22001)), written_down(s))))})
     with Rig(web=web) as rig:
         got, err = attempt(lambda: s.models.ensure(MODEL, report=True, port=22001))
     check(err is None and got == local and local.read_bytes() == body, "модель скачана в кэш: <кэш>/<путь контроллера>")
@@ -323,6 +337,8 @@ def test_ensure_model_download():
           "в конце — сколько скачано")
     check(f"[llama-node] download complete: model-q4.gguf — {len(body):,} bytes" in rig.journal,
           "журнал: загрузка завершена, байты")
+    check(during[:1] and during[0][3] == ["models/org/model-q4.tmp"] and written_down(s) == [MODEL],
+          "записано, что скачал скаут: пока идёт — .tmp, когда легла — сама модель; только это он потом удаляет")
 
     s = make_scout({"controllerUrl": CONTROLLER})
     with Rig(web=models_served()):
@@ -452,27 +468,34 @@ def test_cleanup_old_models():
     s = make_scout()
     cache = s.models.cache_dir()
     lay(cache, {MODEL: 10, "models/org/old-q4.gguf": 5, "models/other/stale.gguf": 7,
-                "models/org/partial.tmp": 3, "notes.json": 2})
+                "models/org/partial.tmp": 3, "notes.json": 2, "models/lib/library.gguf": 9})
+    fetched(s, MODEL, "models/org/old-q4.gguf", "models/other/stale.gguf", "models/org/partial.tmp")
     outside = TMP / "outside-cache" / "x.gguf"
     lay(outside.parent, {"x.gguf": 1})
     with Rig() as rig:
         _, err = attempt(lambda: s.models.cleanup_old(str(cache / MODEL)))
-    check(err is None and tree(cache) == ["models", "models/org", "models/org/model-q4.gguf",
-                                          "models/org/partial.tmp", "notes.json"],
-          "в кэше остаётся только оставленная модель; опустевшие папки убраны; не-.gguf не тронуты")
+    check(err is None and tree(cache) == [RECORD, "models", "models/lib", "models/lib/library.gguf", "models/org",
+                                          "models/org/model-q4.gguf", "models/org/partial.tmp", "notes.json"],
+          "удалены скачанные скаутом .gguf, кроме оставленной модели; опустевшие папки убраны; не-.gguf не тронуты")
+    check((cache / "models/lib/library.gguf").exists(),
+          "defect-history: .gguf, который скаут не скачивал, цел — раньше удалялся любой .gguf в папке, кроме "
+          "активного, а папка кэша — настройка и может указывать на библиотеку моделей")
+    check(written_down(s) == [MODEL, "models/org/partial.tmp"], "удалённые вычеркнуты из записи о скачанном")
     check(outside.exists(), "negative: файлы вне кэша не трогаются")
     check("[llama-node] cleanOldModels: removed 2 file(s)" in rig.journal, "журнал считает удалённые файлы")
 
     s = make_scout()
     cache = s.models.cache_dir()
     lay(cache, {"a.gguf": 1, MODEL: 1})
+    fetched(s, "a.gguf", MODEL)
     with Rig():
         attempt(lambda: s.models.cleanup_old(["", str(cache / "models" / "org" / ".." / "org" / "model-q4.gguf")]))
-    check(tree(cache) == ["models", "models/org", "models/org/model-q4.gguf"],
+    check(tree(cache) == [RECORD, "models", "models/org", "models/org/model-q4.gguf"],
           "список путей: пустые пропущены, путь сравнивается после resolve (../ не мешает)")
     with Rig():
         attempt(lambda: s.models.cleanup_old([]))
-    check(tree(cache) == [] and cache.is_dir(), "boundary: удалено всё — но сама папка кэша остаётся")
+    check(tree(cache) == [] and cache.is_dir(),
+          "boundary: удалено всё — сама папка кэша остаётся, а пустая запись о скачанном уходит вместе с файлами")
     s = make_scout()
     _, err = attempt(lambda: s.models.cleanup_old([MODEL]))
     check(err is None, "negative: папки кэша нет — тихо ничего")
@@ -482,21 +505,28 @@ def test_purge_model_cache():
     def fresh():
         s = make_scout()
         lay(s.models.cache_dir(), {MODEL: 10, MMPROJ: 5, "models/org/partial.tmp": 3,
-                                   "models/other/stale.gguf": 7, "notes.json": 2})
+                                   "models/other/stale.gguf": 7, "notes.json": 2,
+                                   "models/lib/library.gguf": 9, "models/lib/copying.tmp": 4})
+        fetched(s, MODEL, MMPROJ, "models/org/partial.tmp", "models/other/stale.gguf")
         return s, s.models.cache_dir()
 
     s, cache = fresh()
     with Rig() as rig:
         res, _ = attempt(lambda: s.models.purge(keep=[str(cache / MODEL)]))
     check(res == {"removed": 3, "freedBytes": 15}, "очистка кэша: сколько файлов удалено и сколько байт освобождено")
-    check(tree(cache) == ["models", "models/org", "models/org/model-q4.gguf", "notes.json"],
-          "удалены .gguf и .tmp, кроме оставленных; опустевшие папки убраны; прочие файлы целы")
+    check(tree(cache) == [RECORD, "models", "models/lib", "models/lib/copying.tmp", "models/lib/library.gguf",
+                          "models/org", "models/org/model-q4.gguf", "notes.json"],
+          "удалены скачанные скаутом .gguf и .tmp, кроме оставленных; опустевшие папки убраны; прочие файлы целы")
     check("[llama-node] purge cache: removed 3 file(s), freed 15 bytes" in rig.journal, "журнал: сколько и сколько байт")
     s, cache = fresh()
     with Rig():
         res, _ = attempt(lambda: s.models.purge())
-    check(res == {"removed": 4, "freedBytes": 25} and tree(cache) == ["notes.json"],
-          "negative: без keep — удалены все модели и недокачки")
+    check(res == {"removed": 4, "freedBytes": 25}
+          and tree(cache) == ["models", "models/lib", "models/lib/copying.tmp", "models/lib/library.gguf", "notes.json"],
+          "negative: без keep — удалено всё скачанное скаутом, и только оно")
+    check((cache / "models/lib/library.gguf").exists() and (cache / "models/lib/copying.tmp").exists(),
+          "defect-history: чужие .gguf и .tmp в папке кэша целы — очистка при остановке (кэш выключен) удаляла "
+          "всё по шаблону, и папка-библиотека теряла бы модели")
     s, cache = fresh()
     with Rig():
         res, _ = attempt(lambda: s.models.purge(keep=str(cache / MMPROJ)))
@@ -509,6 +539,7 @@ def test_purge_models_safely():
         s = make_scout()
         cache = s.models.cache_dir()
         lay(cache, {MODEL: 10, MMPROJ: 5, SPEC: 4, "models/other/stale.gguf": 7, "models/org/partial.tmp": 3})
+        fetched(s, MODEL, MMPROJ, SPEC, "models/other/stale.gguf", "models/org/partial.tmp")
         return s, cache
 
     s, cache = fresh()

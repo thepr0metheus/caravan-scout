@@ -56,6 +56,7 @@ from caravan_scout.cell_assets import CellAssets  # noqa: E402
 from caravan_scout.starts import CellArtifacts, LlamaLaunch  # noqa: E402
 from caravan_scout.errors import AppError  # noqa: E402
 from caravan_scout.paths import SERVER_CELLS_DIR  # noqa: E402
+from caravan_scout.process import HostProcesses  # noqa: E402
 
 CHECKS = Checks("test_scout_cells")
 check = CHECKS.check
@@ -984,7 +985,7 @@ def test_adopt_by_port():
     run = FakeRun({("ps", "-p", "4343"): (1, ""), ("ss", "-ltnpH"): (0, ss_line(port, 5151))})
     web = FakeUrlopen({f"http://127.0.0.1:{port}/": FakeResponse(status=200)})
     rig = Rig(run=run, web=web, kill=FakeKill(alive={5151}))
-    with rig:
+    with rig, patched(s.cells.processes, owned=lambda pid: True):
         s.cells.adopt_survivors()
         slot = s.cells.by_port.get(port)
         st = slot.process.status() if slot else {}
@@ -1005,12 +1006,59 @@ def test_adopt_by_port():
            "cacheModels": False, "healthPath": "/health", "startedAt": NOW}
     s = make_scout({}, {"cells": {str(port): rec}})
     run = FakeRun({("ss", "-ltnpH"): (0, ss_line(port, 6262))})
-    with Rig(run=run, web=FakeUrlopen({"http://127.0.0.1:": FakeResponse(status=200)}), kill=FakeKill(alive={6262})):
+    with Rig(run=run, web=FakeUrlopen({"http://127.0.0.1:": FakeResponse(status=200)}), kill=FakeKill(alive={6262})), \
+            patched(s.cells.processes, owned=lambda pid: True):
         s.cells.adopt_survivors()
         slot = s.cells.by_port.get(port)
         st = slot.process.status() if slot else {}
     check(not any(c[0] == "ps" for c in run.calls) and st.get("pid") == 6262,
           "boundary: записанный pid 1 у ps не спрашиваем — сразу по порту")
+
+
+def test_adopt_by_port_stranger():
+    port = 22067
+    rec = {"port": port, "kind": "llama", "pid": 4848, "marker": f"{LLAMA_BIN} --port {port}",
+           "cfg": {"port": port}, "log": "", "cacheModels": False, "healthPath": "/health", "startedAt": NOW - 60}
+    s = make_scout({}, {"cells": {str(port): rec}})
+    run = FakeRun({("ps", "-p", "4848"): (1, ""), ("ss", "-ltnpH"): (0, ss_line(port, 5959))})
+    web = FakeUrlopen()
+    asked = []
+    rig = Rig(run=run, web=web, kill=FakeKill(alive={5959}))
+    with rig, patched(s.cells.processes, owned=lambda pid: asked.append(pid) or False):
+        s.cells.adopt_survivors()
+    check(port not in s.cells.by_port and str(port) not in disk_cells(s),
+          "defect-history: порт ячейки слушает процесс, которого скаут не запускал (ячейка контроллера на "
+          "общей машине, сервер, запущенный руками), — не усыновлён, запись о своей ячейке снята")
+    check(asked == [5959] and web.calls == [] and rig.kill.calls == [],
+          "negative: спрошен только слушатель порта; здоровье чужого не проверялось; сигналов ему нет")
+    check(f"[llama-node] :{port} is served by pid 5959, which no scout started — not adopting it" in rig.journal,
+          "журнал называет порт и чужой pid")
+
+
+def test_owned():
+    proc = TMP / "proc-owned"
+    for pid, env in ((5151, b"PATH=/bin\0CARAVAN_SCOUT_CELL=22062\0HOME=/h\0"),
+                     (6161, b"PATH=/bin\0CARAVAN_SCOUT_CELLS=x\0")):
+        (proc / str(pid)).mkdir(parents=True, exist_ok=True)
+        (proc / str(pid) / "environ").write_bytes(env)
+    (proc / "7171" / "environ").mkdir(parents=True, exist_ok=True)   # unreadable as a file
+    with patched(HostProcesses, PROC=proc), Rig() as rig:
+        got = [HostProcesses.owned(p) for p in (5151, 6161, 9999, 7171, 1, "x")]
+    check(got == [True, False, False, None, None, None],
+          "Linux: метка скаута в /proc/<pid>/environ — наш; нет её (или похожая переменная) — не наш; процесса "
+          "нет — не наш; прочитать нельзя, pid 1, не число — «не знаю»")
+    check(rig.run.calls == [], "negative: на Linux ps не спрашивается")
+    answers = {"yes": (0, f"{LLAMA_BIN} --port 22062 PATH=/bin CARAVAN_SCOUT_CELL=22062\n"),
+               "no": (0, f"{LLAMA_BIN} --port 22062 PATH=/bin\n"), "gone": (1, "")}
+    got = {}
+    for name, answer in answers.items():
+        with patched(HostProcesses, PROC=TMP / "no-proc-here"), Rig(run=FakeRun({("ps", "-E"): answer})) as rig:
+            got[name] = (HostProcesses.owned(5151), rig.run.calls)
+    with patched(HostProcesses, PROC=TMP / "no-proc-here"), Rig(run=FakeRun({})):
+        got["no ps"] = HostProcesses.owned(5151)
+    ps = [["ps", "-E", "-ww", "-p", "5151", "-o", "command="]]
+    check(got == {"yes": (True, ps), "no": (False, ps), "gone": (None, ps), "no ps": None},
+          "macOS: ps -E показывает окружение — метка есть / нет; процесса нет или ps нет — «не знаю»")
 
 
 def test_adopt_nothing_listening():
@@ -1068,16 +1116,23 @@ def test_adopt_bad_records():
     check(22065 in s.cells.by_port, "negative: запись без поля port усыновлена на порт из ключа реестра")
 
 
-def reap(pgrep_out, keep=None, bin_path=None, kill=None):
+def reap(pgrep_out, keep=None, bin_path=None, kill=None, owned=None):
+    """reap_strays under a Rig. `owned(pid)` answers whether a scout started
+    the pid — every one by default; the cache holds one model the scout
+    downloaded and one placed there by hand."""
     s = make_scout({"llamaServerBin": str(LLAMA_BIN) if bin_path is None else bin_path})
     cached = s.models.cache_dir() / MODEL
     cached.parent.mkdir(parents=True, exist_ok=True)
     cached.write_bytes(b"GGUF")
+    s.models.downloaded.add(cached)
+    hand = s.models.cache_dir() / "models" / "lib" / "library.gguf"
+    hand.parent.mkdir(parents=True, exist_ok=True)
+    hand.write_bytes(b"GGUF library")
     table = {} if pgrep_out is None else {("pgrep", "-f", str(LLAMA_BIN)): (0 if pgrep_out else 1, pgrep_out)}
     rig = Rig(run=FakeRun(table), kill=kill)
-    with rig:
+    with rig, patched(s.cells.processes, owned=owned or (lambda pid: True)):
         rig.res, rig.err = attempt(lambda: s.cells.reap_strays(keep_pids=keep))
-    rig.s, rig.cached = s, cached
+    rig.s, rig.cached, rig.hand = s, cached, hand
     return rig
 
 
@@ -1096,6 +1151,17 @@ def test_reap_strays():
 
     r = reap("111\n", keep=None, kill=FakeKill(alive={111}))
     check(not r.cached.exists(), "бродяги убиты и никого не усыновили — кэш моделей вычищен")
+    check(r.hand.exists(), "negative: чистка после жатвы не трогает .gguf, которого скаут не скачивал")
+    kill = FakeKill(alive={111, 222})
+    r = reap("111\n222\n", keep=None, kill=kill, owned=lambda pid: pid == 222)
+    check(kill.calls == [(222, signal.SIGTERM), (222, 0)]
+          and "[llama-node] reaping 1 stray llama-server(s): [222]" in r.journal,
+          "defect-history: llama-server того же бинаря, которого скаут не запускал (ячейка контроллера на общей "
+          "машине), не убит — жатва брала любой процесс с этим путём")
+    kill = FakeKill(alive={111})
+    r = reap("111\n", keep=None, kill=kill, owned=lambda pid: None)
+    check(kill.calls == [] and r.cached.exists(),
+          "negative: машина не говорит, чей процесс, — он не убит, и чистки нет: своих бродяг не нашлось")
     r = reap("4242\n", keep={4242}, kill=FakeKill(alive={4242}))
     check(r.kill.calls == [] and r.sleeps == [] and r.cached.exists(),
           "negative: бродяг нет (только усыновлённые) — ни сигналов, ни паузы, ни чистки")
@@ -1330,6 +1396,9 @@ def test_command_cell_start():
     check(r.res == {"ok": True, "pid": 7070, "port": port}, "командная ячейка стартует и отвечает pid и портом")
     spawn = r.popen.calls[0] if r.popen.calls else {}
     check(spawn.get("argv") == ["bash", "-lc", shell], "запускается ровно строка контроллера через bash -lc")
+    env = spawn.get("env") or {}
+    check(env.get("CARAVAN_SCOUT_CELL") == str(port) and env.get("PATH") == os.environ.get("PATH"),
+          "ячейка несёт метку скаута с портом в окружении (переживает exec), остальное окружение унаследовано")
     check(getattr(spawn.get("stdout"), "name", None) == str(log), "лог — свой для порта: command-cell.<port>.log")
     check(disk_cells(r.s).get(str(port)) == {
         "port": port, "kind": "command", "pid": 7070, "marker": f"bash run_whisper.sh {port} --lang en",
@@ -1728,6 +1797,8 @@ def test_worker_corruption_retry():
                web=models_served(on_request=on_request))
     check(len(seen) == 2 and len(popen.calls) == 2,
           "битый кэш (corrupted or incomplete): файлы удалены, модель скачана заново, старт повторён один раз")
+    check([(c.get("env") or {}).get("CARAVAN_SCOUT_CELL") for c in popen.calls] == [str(port)] * 2,
+          "каждый запуск llama-server несёт метку скаута с портом")
     check(len(seen) == 2 and seen[1][1] is False and seen[1][0].get("phase") == "downloading"
           and seen[1][0].get("downloadingFile") == "re-downloading…" and seen[1][0].get("downloadedBytes") == 0,
           "перед перекачкой: файл удалён, на доске downloading «re-downloading…» с нуля")
@@ -1754,9 +1825,9 @@ def test_worker_corruption_retry():
           "negative: ошибка не про порчу файла — авто-ремонта нет даже с кэшем")
 
 
-def test_worker_corruption_as_is():
-    # The auto-repair trusts the port's log even when this start never reached
-    # the process: the log it reads is the PREVIOUS run's.
+def test_worker_corruption_only_own():
+    # A failed start never ran, so the log on its port is the previous run's;
+    # and a file the scout did not download is not its to delete.
     port = 22133
     s = worker_scout()
     cache = s.models.cache_dir()
@@ -1766,9 +1837,9 @@ def test_worker_corruption_as_is():
     (cache / f"llama-server.{port}.log").write_text(f"0.01.000.000 E {CORRUPT}\n", encoding="utf-8")
     missing_bin = TMP / "missing" / "llama-server"
     r = worker(s, port, {"MODEL_FILE": MODEL, "PORT": port}, cache=True, bin_path=missing_bin)
-    check(len(r.web.calls) == 1 and local.read_bytes() == BODIES[MODEL],
-          "as-is: ДЕФЕКТ — старт упал на отсутствующем бинаре, а лог ПРОШЛОГО запуска говорит «corrupted»: "
-          "хорошая модель удалена и скачана заново")
+    check(r.web.calls == [] and local.read_bytes() == b"GOOD cached copy",
+          "defect-history: старт упал на отсутствующем бинаре, а лог ПРОШЛОГО запуска говорит «corrupted» — "
+          "модель цела и не перекачана (раньше удалялась и качалась заново)")
     check(s.cells.startup(port).get("error") == f"llama-server binary not found: {missing_bin}",
           "итог — фаза error с настоящей причиной (нет бинаря)")
 
@@ -1779,44 +1850,54 @@ def test_worker_corruption_as_is():
     own.write_bytes(b"GGUF user copy")
     r = worker(s, port, {"MODEL_FILE": str(own), "PORT": port}, model=str(own), cache=True,
                popen=FakePopen(OSError(CORRUPT)))
-    check(not own.exists(),
-          "as-is: ДЕФЕКТ — авто-ремонт удалил модель ВНЕ кэша (абсолютный путь хранилища), хотя чистка кэша "
-          "обещает не трогать чужие файлы")
-    check(s.cells.startup(port).get("error") == f"model not found locally and controllerUrl not set: {own}",
-          "после удаления вернуть её неоткуда — фаза error")
+    check(own.read_bytes() == b"GGUF user copy" and r.web.calls == [],
+          "defect-history: модель вне кэша (абсолютный путь хранилища) при «битом» старте не удалена и не "
+          "перекачивается — авто-ремонт удалял её, хотя обещал не трогать чужие файлы")
+    check(s.cells.startup(port).get("phase") == "error"
+          and s.cells.startup(port).get("error") == f"the model file looks damaged: {own} — this scout did not "
+                                                   f"download it, so it left it alone; replace or delete it on this machine",
+          "фаза error называет файл, говорит, почему он не тронут, и что делать")
 
 
 def test_worker_cleanup_when_caching():
+    def with_old(s, rel="models/org/old-model.gguf", mine=True):
+        path = s.models.cache_dir() / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"GGUF old")
+        if mine:
+            s.models.downloaded.add(path)
+        return path
+
     port = 22135
     s = worker_scout(cleanOldModels=False)
-    cache = s.models.cache_dir()
-    old = cache / "models" / "org" / "old-model.gguf"
-    old.parent.mkdir(parents=True, exist_ok=True)
-    old.write_bytes(b"GGUF old")
+    old = with_old(s)
     r = worker(s, port, {"MODEL_FILE": MODEL, "PORT": port}, cache=True)
-    check(r.err is None and not old.exists() and (cache / MODEL).exists(),
-          "кэш моделей включён: после удачного старта в кэше остаётся только активная модель")
-    check(not old.exists(),
-          "as-is: cleanOldModels=false не читается — старые модели удаляются всё равно (докстрока обещает флаг)")
+    check(r.err is None and old.exists() and (s.models.cache_dir() / MODEL).exists(),
+          "defect-history: cleanOldModels=false (по умолчанию) — после старта ничего не удаляется; флаг не "
+          "читался, и в кэше оставалась только активная модель")
+
+    port = 22139
+    s = worker_scout(cleanOldModels=True)
+    old, lib = with_old(s), with_old(s, "models/lib/library.gguf", mine=False)
+    r = worker(s, port, {"MODEL_FILE": MODEL, "PORT": port}, cache=True)
+    check(r.err is None and not old.exists() and (s.models.cache_dir() / MODEL).exists() and lib.exists(),
+          "cleanOldModels=true: после старта удалены старые скачанные модели; активная цела; .gguf, которого "
+          "скаут не скачивал, цел")
 
     port = 22136
-    s = worker_scout()
-    old = s.models.cache_dir() / "models" / "org" / "old-model.gguf"
-    old.parent.mkdir(parents=True, exist_ok=True)
-    old.write_bytes(b"GGUF old")
+    s = worker_scout(cleanOldModels=True)
+    old = with_old(s)
     worker(s, port, {"MODEL_FILE": MODEL, "PORT": port}, cache=False)
     check(old.exists(), "negative: кэш выключен — чистки при старте нет (файлы уйдут при остановке)")
 
     port = 22137
-    s = worker_scout()
-    neighbour = s.models.cache_dir() / "models" / "org" / "neighbour.gguf"
-    neighbour.parent.mkdir(parents=True, exist_ok=True)
-    neighbour.write_bytes(b"GGUF neighbour")
+    s = worker_scout(cleanOldModels=True)
+    neighbour = with_old(s, "models/org/neighbour.gguf")
     s.cells.at(22138).process.adopt(5858, {"modelPath": str(neighbour), "port": 22138})
     worker(s, port, {"MODEL_FILE": MODEL, "PORT": port}, cache=True, kill=FakeKill(alive={5858}))
-    check(not neighbour.exists(),
-          "as-is: ДЕФЕКТ — чистка при старте удалила модель СОСЕДНЕЙ работающей ячейки "
-          "(purge_models_safely её бы сохранил)")
+    check(neighbour.exists(),
+          "defect-history: чистка при старте не трогает модель СОСЕДНЕЙ работающей ячейки — раньше удаляла "
+          "(оставляла только файлы стартующей)")
 
 
 TESTS = [
@@ -1824,7 +1905,8 @@ TESTS = [
     test_update_status_views, test_update_start_commands, test_update_job_run, test_update_conflict,
     test_builds_list, test_cell_artifacts, test_registry, test_marker_matches, test_pid_cmdline,
     test_port_listener_pid, test_port_health_ok,
-    test_adopt_by_marker, test_adopt_by_port, test_adopt_nothing_listening, test_adopt_quiet_health,
+    test_adopt_by_marker, test_adopt_by_port, test_adopt_by_port_stranger, test_owned,
+    test_adopt_nothing_listening, test_adopt_quiet_health,
     test_adopt_bad_records, test_reap_strays,
     test_node_configs, test_delete_node_config,
     test_llama_start_refusals, test_llama_start_accepted, test_llama_start_port_order, test_llama_start_misc,
@@ -1834,7 +1916,7 @@ TESTS = [
     test_resolve_arg_paths,
     test_worker_success, test_worker_download_error, test_worker_log_dir_missing, test_worker_refuses_without_args,
     test_worker_gpu_layers_and_spec, test_worker_cancelled_mid_download, test_worker_stopped_during_start,
-    test_worker_corruption_retry, test_worker_corruption_as_is, test_worker_cleanup_when_caching,
+    test_worker_corruption_retry, test_worker_corruption_only_own, test_worker_cleanup_when_caching,
 ]
 
 

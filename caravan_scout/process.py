@@ -217,6 +217,7 @@ class CellProcess:
                     stdout=log_fh,
                     stderr=subprocess.STDOUT if log_path else subprocess.DEVNULL,
                     close_fds=True,
+                    env=HostProcesses.cell_env(cfg.get("port")),
                 )
                 self._cfg = {**cfg, "cmd": cmd}
                 self._started_at = int(time.time())
@@ -250,6 +251,7 @@ class CellProcess:
                     stdout=log_fh,
                     stderr=subprocess.STDOUT if log_path else subprocess.DEVNULL,
                     close_fds=True,
+                    env=HostProcesses.cell_env(cfg.get("port")),
                 )
                 self._cfg = {**cfg, "cmd": cmd}
                 self._started_at = int(time.time())
@@ -361,6 +363,46 @@ class HostProcesses:
     and a marker, and these questions check that memory against the host.
     Each is one question to the OS; none of them keeps anything.
     """
+
+    # Every cell this scout starts carries it in its environment, and keeps it
+    # through `bash -lc … exec python`. A process without it was not started
+    # by a scout: on a machine the scout shares — the controller's own cells,
+    # a llama-server run by hand — it is never adopted and never killed.
+    CELL_ENV = "CARAVAN_SCOUT_CELL"
+    PROC = Path("/proc")            # a class attribute so a test can stand in for it
+
+    @classmethod
+    def cell_env(cls, port: Any) -> dict[str, str]:
+        return {**os.environ, cls.CELL_ENV: str(port or "")}
+
+    @classmethod
+    def owned(cls, pid: int) -> bool | None:
+        """Whether a scout started `pid`: True or False, or None when the
+        machine will not say (then it counts as not ours for anything that
+        kills, and as before for adopting)."""
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            return None
+        if pid <= 1:
+            return None
+        environ = cls.PROC / str(pid) / "environ"
+        if cls.PROC.is_dir():
+            try:
+                return any(v.startswith(cls.CELL_ENV.encode() + b"=")
+                           for v in environ.read_bytes().split(b"\0"))
+            except FileNotFoundError:
+                return False       # gone
+            except OSError:
+                return None
+        try:                       # macOS: ps -E adds the environment to the command
+            out = subprocess.run(["ps", "-E", "-ww", "-p", str(pid), "-o", "command="],
+                                 capture_output=True, text=True, timeout=5)
+        except Exception:
+            return None
+        if out.returncode != 0 or not out.stdout.strip():
+            return None
+        return f" {cls.CELL_ENV}=" in out.stdout
 
     @staticmethod
     def marker_matches(marker: str, cmdline: str) -> bool:

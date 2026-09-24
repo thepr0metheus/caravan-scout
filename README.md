@@ -207,7 +207,8 @@ python3 -m caravan_scout.app --config config.json --state state.json
 |---|---|
 | `controllerUrl` | The LAMA CARAVAN admin URL the heartbeat posts to — written by the controller when it adds the scout. |
 | `llamaServerBin` | Path to the `llama-server` binary (set by `install.sh`). |
-| `modelsBasePath` | Local cache dir for downloaded models. |
+| `modelsBasePath` | Local cache dir for downloaded models. The scout deletes only files it downloaded there, so it may point at a shared folder. |
+| `cleanOldModels` | After a start with caching on, delete the other cached models this scout downloaded (off by default); what running cells hold stays. |
 | `controllerToken` | The fleet token, when the controller has sign-in enabled (the controller hands it over when it adds the scout). |
 
 ## API
@@ -234,8 +235,10 @@ launchctl kickstart -k gui/$UID/com.caravan-scout
 Cells **survive scout restarts**: the units keep child processes alive
 (`KillMode=process` / `AbandonProcessGroup`) and the fresh scout re-adopts
 them from its registry (`state.json`) — same pid, same uptime, inference
-uninterrupted. Orphans that match the llama-server binary but are not in the
-registry are reaped. Details: [docs/operations.md](docs/operations.md).
+uninterrupted. Orphans a scout started (they carry `CARAVAN_SCOUT_CELL` in
+their environment) that are in no registry are reaped; anything else running
+the same binary — the controller's own cells on a shared machine — is left
+alone. Details: [docs/operations.md](docs/operations.md).
 
 ## Deployment rule
 

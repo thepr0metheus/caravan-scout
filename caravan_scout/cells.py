@@ -297,6 +297,13 @@ class Cells:
                 if not pid:
                     self.records.forget(port)   # nothing serves it — really gone
                     continue
+                if self.processes.owned(pid) is False:
+                    # Someone else serves the port now — the controller's own
+                    # cell, a hand-run server. Ours is gone; theirs stays theirs.
+                    print(f"[llama-node] :{port} is served by pid {pid}, which no scout "
+                          f"started — not adopting it")
+                    self.records.forget(port)
+                    continue
                 if not self.processes.healthy(port, timeout=4.0, attempts=3,
                                               health_path=rec.get("healthPath") or "/health"):
                     # Something owns the port but stayed quiet. On a loaded host
@@ -326,8 +333,12 @@ class Cells:
         With KillMode=process / AbandonProcessGroup the children survive the
         unit restart on purpose — adopt_survivors() re-attaches the ones
         recorded in the registry and passes their pids in `keep_pids`; whatever
-        llama-server remains unmatched is a genuine orphan holding the GPU and
-        the port, and is terminated here."""
+        llama-server a scout started and nobody adopted is a genuine orphan
+        holding the GPU and the port, and is terminated here.
+
+        Only a process a scout started (HostProcesses.owned): it used to be any
+        process running the same binary, and on a machine the scout shares
+        with the controller that is the controller's own cells."""
         keep = {int(p) for p in (keep_pids or set())}
         bin_path = str(self.config.get("llamaServerBin") or "").strip()
         if not bin_path:
@@ -340,6 +351,7 @@ class Cells:
                     and int(p) not in keep]
         except Exception:
             return
+        pids = [pid for pid in pids if self.processes.owned(pid) is True]
         if not pids:
             return
         print(f"[llama-node] reaping {len(pids)} stray llama-server(s): {pids}")

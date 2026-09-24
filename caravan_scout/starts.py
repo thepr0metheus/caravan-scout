@@ -15,7 +15,6 @@ from caravan_scout.cell_assets import CellAssets
 from caravan_scout.errors import AppError
 from caravan_scout.paths import (LLAMA_PATH_PLACEHOLDER_MMPROJ, LLAMA_PATH_PLACEHOLDER_MODEL,
                                  LLAMA_PATH_PLACEHOLDER_SPEC, SERVER_CELLS_DIR)
-from caravan_scout.process import CellLog
 
 
 class CellArtifacts:
@@ -264,22 +263,33 @@ class LlamaLaunch:
             return
         result = cell.process.start(bin_path, args, cfg, log_path=log_path)
 
-        # Auto-recovery: if the error looks like a truncated/corrupted cached
+        # Auto-recovery: if this start failed on a truncated/corrupted cached
         # file, delete the bad files and re-download once before giving up.
-        # NOTE: result["error"] may be the generic "exiting due to model loading error"
-        # last line — also scan the log directly for corruption patterns.
+        # Only this attempt's own error: a failed start never ran, so the log on
+        # the port is the PREVIOUS run's — reading it deleted a good model when
+        # the binary was missing and an old run had said "corrupted".
         if not result.get("ok") and cache_models:
             err = result.get("error") or ""
-            log_err = CellLog(log_path).crash_reason()
-            if models.is_corruption_error(err) or models.is_corruption_error(log_err):
+            if models.is_corruption_error(err):
                 print(f"[llama-node] corruption detected in cached file(s), deleting and retrying…")
-                for p in [mp, mmproj_abs, spec_abs]:
-                    if p:
-                        try:
-                            Path(p).unlink(missing_ok=True)
-                            print(f"[llama-node]   deleted: {p}")
-                        except Exception as del_err:
-                            print(f"[llama-node]   delete failed for {p}: {del_err}")
+                mine = [p for p in (mp, mmproj_abs, spec_abs) if p and models.downloaded.has(p)]
+                others = [p for p in (mp, mmproj_abs, spec_abs) if p and p not in mine]
+                if others:
+                    # Not downloaded by this scout: read in place from a library, or
+                    # in the cache from before the scout kept a record. Not its to
+                    # delete — a library's file is nobody's cache.
+                    cells.report(port, phase="error",
+                                 error=f"the model file looks damaged: {others[0]} — this scout did "
+                                       f"not download it, so it left it alone; replace or delete it "
+                                       f"on this machine")
+                    return
+                for p in mine:
+                    try:
+                        Path(p).unlink(missing_ok=True)
+                        models.downloaded.forget(p)
+                        print(f"[llama-node]   deleted: {p}")
+                    except Exception as del_err:
+                        print(f"[llama-node]   delete failed for {p}: {del_err}")
                 cells.report(port, phase="downloading", downloadedBytes=0, totalBytes=0,
                              downloadingFile="re-downloading…")
                 try:
@@ -313,9 +323,11 @@ class LlamaLaunch:
             # Manual snapshots only — no auto-save of launch params on start.
             # Caching on ⇒ keep only the active model (don't accumulate on disk).
             # Caching off ⇒ files get purged on stop anyway, no cleanup needed here.
-            if cache_models:
+            if cache_models and self.cells.config.get("cleanOldModels"):
                 try:
-                    models.cleanup_old([str(mp), mmproj_abs, spec_abs])
+                    # What the neighbours run stays too: the cleanup used to keep
+                    # only this cell's files and took a running cell's model.
+                    models.cleanup_old([str(mp), mmproj_abs, spec_abs, *cells.held_files()])
                 except Exception:
                     pass
         else:

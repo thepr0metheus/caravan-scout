@@ -1,5 +1,34 @@
 # Changelog
 
+## 2.2.0 — 2026-09-24
+
+- **The scout touches only what it started and what it downloaded.** On a
+  machine it shares — the controller's, where it is to run next — it used to
+  endanger what was not its own:
+  - At start it killed every llama-server running its binary that its
+    registry did not name — the controller's own cells included — and it
+    adopted whoever served a cell's port. Every cell now carries
+    `CARAVAN_SCOUT_CELL=<port>` in its environment (it survives `exec`), and
+    only such a process is reaped or adopted by port.
+  - It deleted model files by pattern: every `.gguf` but the active one after
+    each start with caching on (`cleanOldModels` was never read), and every
+    `.gguf`/`.tmp` on stop with caching off — a cache dir pointed at a model
+    library would have lost the library. Downloads are written down in
+    `.caravan-downloads.json`; the purge, the cleanup and the corrupt-model
+    retry delete only those. `cleanOldModels` is honoured (off by default),
+    and the cleanup keeps what the running cells hold — it took a
+    neighbour's model.
+  - The corrupt-model retry read the port's log after a start that never
+    ran — the previous run's — and deleted a good model when the binary was
+    missing. It now acts on this attempt's own error, and on a model it did
+    not download it only says the file looks damaged.
+  - `update-llama.sh` and the controller's `install-llama.sh` take one `flock`
+    next to the llama.cpp tree: two builds of one tree at once left a binary
+    of two commits.
+  - Upgrade note: a command cell started by 2.1 whose exec chain rewrote its
+    command line is not re-adopted after the update — restart it from the
+    board. Files cached before 2.2 are not in the record and stay.
+
 ## 2.1.1 — 2026-09-24
 
 - **Installing the scout again changes nothing that works.** The whisper

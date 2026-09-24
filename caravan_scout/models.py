@@ -2,6 +2,8 @@
 controller, verified, and purged."""
 from __future__ import annotations
 
+import json
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -9,6 +11,79 @@ from pathlib import Path
 from typing import Any, Callable
 
 from caravan_scout.errors import AppError
+
+
+class DownloadedFiles:
+    """The files this scout downloaded into its model cache — the only files
+    it ever deletes there.
+
+    The cache dir is a setting, and a setting can name a folder the scout
+    shares: the model library on the controller's own machine, a NAS mount.
+    Deleting by pattern (every *.gguf but the active one) there deletes the
+    library. So a download is written down as it starts (its .tmp) and when
+    it lands, and the purge, the old-model cleanup and the corruption retry
+    delete only what is written down. Files that were in the cache before
+    this record existed are not in it and stay — remove them by hand.
+    """
+
+    NAME = ".caravan-downloads.json"
+
+    def __init__(self, cache_dir: Callable[[], Path]):
+        self.cache_dir = cache_dir      # a callable: the setting can change
+        self._lock = threading.Lock()
+
+    def _file(self) -> Path:
+        return self.cache_dir() / self.NAME
+
+    def _read(self) -> set[str]:
+        try:
+            data = json.loads(self._file().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return set()
+        return {str(x) for x in data} if isinstance(data, list) else set()
+
+    def _write(self, names: set[str]) -> None:
+        target = self._file()
+        if not names:               # nothing downloaded: no bookkeeping file either
+            target.unlink(missing_ok=True)
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(target.name + ".new")
+        tmp.write_text(json.dumps(sorted(names), indent=1), encoding="utf-8")
+        tmp.replace(target)
+
+    def _key(self, path: Any) -> str | None:
+        """The path inside the cache, or None — outside it nothing is ours."""
+        try:
+            return str(Path(path).resolve().relative_to(self.cache_dir().resolve()))
+        except (ValueError, OSError, RuntimeError):
+            return None
+
+    def add(self, path: Any) -> None:
+        key = self._key(path)
+        if key is None:
+            return
+        with self._lock:
+            names = self._read()
+            if key not in names:
+                self._write(names | {key})
+
+    def forget(self, path: Any) -> None:
+        key = self._key(path)
+        if key is None:
+            return
+        with self._lock:
+            names = self._read()
+            if key in names:
+                self._write(names - {key})
+
+    def has(self, path: Any) -> bool:
+        key = self._key(path)
+        return key is not None and key in self._read()
+
+    def paths(self) -> list[Path]:
+        base = self.cache_dir()
+        return [base / name for name in sorted(self._read())]
 
 
 class ModelFetcher:
@@ -24,6 +99,7 @@ class ModelFetcher:
     def __init__(self, config, report: Callable[..., None]):
         self.config = config
         self.report = report
+        self.downloaded = DownloadedFiles(self.cache_dir)
 
     def cache_dir(self) -> Path:
         base = str(self.config.get("modelsBasePath") or "").strip()
@@ -82,6 +158,7 @@ class ModelFetcher:
         for attempt, _ in enumerate((*_RETRY_DELAYS, None)):
             try:
                 req = urllib.request.Request(url, headers=self.config.headers())
+                self.downloaded.add(tmp)
                 with urllib.request.urlopen(req, timeout=3600) as resp, open(tmp, "wb") as fh:
                     total = int(resp.headers.get("Content-Length") or 0)
                     if report:
@@ -110,9 +187,12 @@ class ModelFetcher:
                     )
                 print(f"[llama-node] download complete: {label} — {done:,} bytes")
                 tmp.replace(local)
+                self.downloaded.add(local)
+                self.downloaded.forget(tmp)
                 return local  # success
             except Exception as exc:
                 tmp.unlink(missing_ok=True)
+                self.downloaded.forget(tmp)
                 last_exc = exc
                 err_str = str(exc).lower()
                 print(f"[llama-node] download error (attempt {attempt + 1}/{len(_RETRY_DELAYS) + 1}): {label} — {exc}")
@@ -138,30 +218,39 @@ class ModelFetcher:
         raise AppError(f"model download failed: {last_exc}", 500)
 
     def cleanup_old(self, keep_paths: Any) -> None:
-        """Delete .gguf files from modelsBasePath except the kept ones (model +
-        mmproj + spec draft).
+        """Delete the .gguf files this scout downloaded, except the kept ones
+        (model + mmproj + spec draft).
 
-        Called after a successful llama-server start when cleanOldModels=true.
-        Only touches files inside our own model cache dir — never touches files
-        the user placed elsewhere.
+        Called after a successful llama-server start when cleanOldModels is
+        on (off by default). Only files the scout downloaded (DownloadedFiles)
+        — it used to be every .gguf under the cache dir.
         """
-        cache_dir = self.cache_dir()
-        if not cache_dir.is_dir():
-            return
         if isinstance(keep_paths, (str, Path)):
             keep_paths = [keep_paths]
         keep_resolved = {Path(p).resolve() for p in keep_paths if p}
-        deleted = []
-        # list() first: the loop removes emptied folders, and on Python 3.9 —
-        # the macOS scout's — a live rglob then scans a folder that is gone and
-        # raises FileNotFoundError halfway through, leaving the rest behind.
-        for p in list(cache_dir.rglob("*.gguf")):
+        deleted = [p.name for p in self._delete_downloaded((".gguf",), keep_resolved)[0]]
+        if deleted:
+            print(f"[llama-node] cleanOldModels: removed {len(deleted)} file(s): {deleted}")
+
+    def _delete_downloaded(self, suffixes: tuple, keep_resolved: set) -> tuple[list[Path], int]:
+        """Delete the downloaded files with these suffixes that are not kept,
+        and the folders they leave empty. Returns (deleted, freed bytes)."""
+        cache_dir = self.cache_dir()
+        deleted, freed = [], 0
+        for p in self.downloaded.paths():
+            if p.suffix not in suffixes:
+                continue
+            if not p.exists():
+                self.downloaded.forget(p)
+                continue
             if p.resolve() in keep_resolved:
                 continue
             try:
+                size = p.stat().st_size
                 p.unlink()
-                deleted.append(p.name)
-                # Remove empty parent dirs up to cache_dir
+                self.downloaded.forget(p)
+                deleted.append(p)
+                freed += size
                 parent = p.parent
                 while parent != cache_dir and parent.is_dir():
                     try:
@@ -171,39 +260,17 @@ class ModelFetcher:
                         break
             except Exception:
                 pass
-        if deleted:
-            print(f"[llama-node] cleanOldModels: removed {len(deleted)} file(s): {deleted}")
+        return deleted, freed
 
     def purge(self, keep: Any = None) -> dict[str, Any]:
-        """Delete downloaded .gguf/.tmp from the model cache dir (except `keep`).
+        """Delete the .gguf/.tmp files this scout downloaded (except `keep`).
 
         Called on stop when caching is off, and on demand via the purge-cache
         endpoint. Returns {removed, freedBytes}."""
-        cache_dir = self.cache_dir()
-        if not cache_dir.is_dir():
-            return {"removed": 0, "freedBytes": 0}
         if isinstance(keep, (str, Path)):
             keep = [keep]
         keep_resolved = {Path(p).resolve() for p in (keep or []) if p}
-        deleted, freed = [], 0
-        for pattern in ("*.gguf", "*.tmp"):
-            for p in list(cache_dir.rglob(pattern)):   # list() first: see cleanup_old
-                if p.resolve() in keep_resolved:
-                    continue
-                try:
-                    sz = p.stat().st_size
-                    p.unlink()
-                    deleted.append(p.name)
-                    freed += sz
-                    parent = p.parent
-                    while parent != cache_dir and parent.is_dir():
-                        try:
-                            parent.rmdir()
-                            parent = parent.parent
-                        except OSError:
-                            break
-                except Exception:
-                    pass
+        deleted, freed = self._delete_downloaded((".gguf", ".tmp"), keep_resolved)
         if deleted:
             print(f"[llama-node] purge cache: removed {len(deleted)} file(s), freed {freed} bytes")
         return {"removed": len(deleted), "freedBytes": freed}

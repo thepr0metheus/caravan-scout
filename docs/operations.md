@@ -54,8 +54,11 @@ systemctl --user restart caravan-scout.service   # or launchctl kickstart
 
 A restart does **not** stop the host's cells: the fresh scout re-adopts every
 cell in its registry (see below). What it does terminate at start is a
-llama-server that is in no record — an orphan holding a GPU and a port
-(`Cells.reap_strays`).
+llama-server that a scout started and that is in no record — an orphan
+holding a GPU and a port (`Cells.reap_strays`). Every cell the scout starts
+carries `CARAVAN_SCOUT_CELL=<port>` in its environment; a process without it
+— the controller's own cells on a machine the scout shares, a server run by
+hand — is never killed and never adopted (`HostProcesses.owned`).
 
 ## Config
 
@@ -80,9 +83,13 @@ start), `llama-node-configs/`, `var/server-cells/<port>/`, the model cache
   running when the scout stops; the fresh scout re-adopts them from the
   `cells` registry in `state.json` (pid + cmdline-marker match, or whoever
   healthily serves the cell's port when an exec chain rewrote the command
-  line) and reaps only unmatched llama-server orphans. Adopted processes are managed by pid
+  line — if a scout started it) and reaps only unmatched llama-server orphans
+  a scout started. Adopted processes are managed by pid
   (liveness `kill(pid,0)`, stop SIGTERM→SIGKILL) — the one thing lost across
   the adopt boundary is the exit code of a crash that happens while adopted.
+  A command cell started by a scout older than 2.2 carries no marker: if its
+  exec chain rewrote its command line, 2.2 does not re-adopt it after the
+  update — restart it from the board.
 
 - **Cell crash root causes live on the scout host**, one log per port:
   `<modelsBasePath>/llama-server.<port>.log`, and `command-cell.<port>.log`
@@ -92,7 +99,19 @@ start), `llama-node-configs/`, `var/server-cells/<port>/`, the model cache
 - **`sudo -n ufw allow <port>`** on cell start is best-effort: without
   passwordless sudo the port silently stays closed to the LAN.
 - **`cacheModels=false` (default)**: models re-download on every start and are
-  purged on stop; with caching on, only the active models are kept.
+  purged on stop; with caching on they stay. `cleanOldModels=true` (off by
+  default) removes the other cached models after a start, keeping what the
+  running cells hold.
+- **The scout deletes only what it downloaded.** Each download is written down
+  in `.caravan-downloads.json` in the cache; the purge, the old-model cleanup
+  and the corrupt-model retry delete only those files. A cache dir set to a
+  shared folder — the model library on the controller's machine, a NAS mount —
+  loses nothing. Files cached by a scout older than 2.2 are not in the record
+  and stay until removed by hand.
+- **One llama.cpp build at a time per tree.** `update-llama.sh` (and the
+  controller's `install-llama.sh`) take `flock` on
+  `<llama dir>.caravan-build.lock`, next to the tree; a second build or restore
+  stops with exit 75. Without `flock` (macOS) there is no lock.
 - **No auth on `:8092`** and command cells execute controller-supplied shell —
   the trusted-LAN assumption is explicit. Do not expose the port beyond it.
 - The heartbeat drops to a fast cadence while any cell is

@@ -191,8 +191,57 @@ def test_the_firewall_hint():
               f"диапазон тот же, что у контроллера по умолчанию ({want}) — один факт на оба репозитория")
 
 
+FAKE_FLOCK = r"""#!/usr/bin/env bash
+echo "$*" >> "$FLOCK_LOG"
+[[ "$FLOCK_ANSWER" == "free" ]]
+"""
+LOCK_LINE = 'exec 9>"${LLAMA_DIR%/}.caravan-build.lock"'
+
+
+def run_with_lock(script, action, answer, tmp):
+    """`script` for real, with a fake flock that answers busy or free, the
+    tree and the archive in `tmp`. Returns (exit code, output, flock calls)."""
+    fake_bin = tmp / "bin"
+    fake_bin.mkdir(parents=True, exist_ok=True)
+    (fake_bin / "flock").write_text(FAKE_FLOCK)
+    (fake_bin / "flock").chmod(0o755)
+    log = tmp / "flock.log"
+    env = {**os.environ, "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}", "HOME": str(tmp / "home"),
+           "FLOCK_LOG": str(log), "FLOCK_ANSWER": answer, "LLAMA_BUILDS_DIR": str(tmp / "builds")}
+    # One door opened on purpose: the script runs against a tree and an archive in `tmp`.
+    with patched(subprocess, Popen=REAL["Popen"]):
+        done = REAL["run"](["bash", str(script), "--llama-dir", str(tmp / "llama.cpp"), action],
+                           capture_output=True, text=True, env=env, timeout=60)
+    return done.returncode, done.stdout + done.stderr, log.read_text().splitlines() if log.exists() else []
+
+
+def test_one_build_at_a_time():
+    CHECKS.section("одна сборка llama.cpp на дерево — общий замок с контроллером (2.2):")
+    import tempfile
+    script = SCRIPTS / "update-llama.sh"
+    with tempfile.TemporaryDirectory() as tmp:
+        code, out, calls = run_with_lock(script, "--archive-current", "busy", Path(tmp))
+        lock = (Path(tmp) / "llama.cpp.caravan-build.lock").exists()
+        inside = (Path(tmp) / "llama.cpp").exists()
+    check(code == 75 and calls == ["-n 9"] and "another llama.cpp build or restore is running in" in out,
+          f"замок занят — сборка/архив не идут: код 75 и сказано почему (код {code}, flock {calls})")
+    check(lock and not inside,
+          "файл замка — рядом с деревом, не внутри: свежий git clone не откажется от папки")
+    with tempfile.TemporaryDirectory() as tmp:
+        code, out, calls = run_with_lock(script, "--list-builds", "busy", Path(tmp))
+    check(calls == [] and code != 75, "negative: список сборок ничего не меняет и замка не ждёт")
+    with tempfile.TemporaryDirectory() as tmp:
+        code, out, calls = run_with_lock(script, "--archive-current", "free", Path(tmp))
+    check(calls == ["-n 9"] and code != 75 and "another llama.cpp build" not in out,
+          "negative: замок свободен — скрипт идёт дальше")
+    sibling = ROOT.parent / "lama-caravan" / "scripts" / "install-llama.sh"
+    if sibling.exists():
+        check(LOCK_LINE in sibling.read_text(encoding="utf-8") and LOCK_LINE in read_real("update-llama.sh"),
+              "тот же файл замка у install-llama.sh контроллера — иначе замки разные и не мешают друг другу")
+
+
 for fn in (test_the_installer, test_one_command, test_the_rule_can_fail, test_a_rerun_changes_nothing,
-           test_the_firewall_hint):
+           test_the_firewall_hint, test_one_build_at_a_time):
     fn()
 
 sys.exit(CHECKS.finish())
