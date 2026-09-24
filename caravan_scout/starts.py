@@ -346,7 +346,7 @@ class LlamaLaunch:
         if result.get("ok"):
             cells.report(port, phase="running", error="")
             cells.records.add(port, "llama", result.get("pid") or 0, bin_path,
-                              cfg, log_path, cache_models)
+                              cfg, log_path, cache_models, launch=cell.process.launch_spec())
             # Manual snapshots only — no auto-save of launch params on start.
             # Caching on ⇒ keep only the active model (don't accumulate on disk).
             # Caching off ⇒ files get purged on stop anyway, no cleanup needed here.
@@ -450,7 +450,8 @@ class CommandStart(CellStart):
             marker = command.replace("$PORT", str(port)).replace("~/", "")[:120]
             cells.records.add(port, "command", result.get("pid") or 0, marker,
                               cfg, log_path, cell.cache_models,
-                              health_path=str(payload.get("healthPath") or "/health"))
+                              health_path=str(payload.get("healthPath") or "/health"),
+                              launch=cell.process.launch_spec())
         return result
 
 

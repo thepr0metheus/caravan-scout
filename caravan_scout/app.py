@@ -27,6 +27,8 @@ def main(argv: list[str] | None = None) -> int:
     # The cells that start with the machine; off the main thread, so a slow
     # start does not keep the port closed.
     threading.Thread(target=agent.autostart.start_all, daemon=True).start()
+    # A crashed cell comes back, as systemd brings the controller's (Watchdog).
+    threading.Thread(target=agent.watchdog.run, daemon=True).start()
     heartbeat = threading.Thread(target=agent.heartbeat.loop, daemon=True)
     heartbeat.start()
 

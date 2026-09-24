@@ -15,6 +15,7 @@ from typing import Any
 from caravan_scout.models import ModelFetcher
 from caravan_scout.process import CellProcess, HostProcesses
 from caravan_scout.starts import CellStart
+from caravan_scout.watchdog import Watchdog
 
 class Cell:
     """One cell on one port: its process, how its start is going, and whether
@@ -30,6 +31,8 @@ class Cell:
         self.startup: dict[str, Any] = {"phase": "idle"}
         self.lock = threading.Lock()
         self.cache_models = False
+        # Crashes since it was last started by hand (Watchdog); None = none.
+        self.crash: dict[str, Any] | None = None
 
 
 class LlamaProbe:
@@ -115,7 +118,7 @@ class CellRecords:
 
     def add(self, port: int, kind: str, pid: int, marker: str,
             cfg: dict, log_path, cache_models: bool,
-            health_path: str = "/health") -> None:
+            health_path: str = "/health", launch: dict | None = None) -> None:
         with self.state.lock:
             cells = self.state.setdefault("cells", {})
             cells[str(int(port))] = {
@@ -129,6 +132,9 @@ class CellRecords:
                 # replies on /v1/models; probing /health would bury it.
                 "healthPath": str(health_path or "/health"),
                 "startedAt": int(time.time()),
+                # How it was launched, so a crash after a scout restart can be
+                # followed by the same launch (Watchdog).
+                **({"launch": dict(launch)} if launch else {}),
             }
             self.state.save()
 
@@ -221,6 +227,9 @@ class Cells:
         st = cell.process.status()
         with cell.lock:
             startup = dict(cell.startup)
+            crash = Watchdog.public(cell.crash)
+        if crash:
+            st = {**st, "crash": crash}
         phase = startup.get("phase")
         if st.get("running"):
             p = st.get("port") or port
@@ -230,9 +239,13 @@ class Cells:
         # Crashed shortly after start (non-zero exit) — surface as error even if
         # the startup worker already marked it "running".
         if st.get("crashed"):
+            reason = st.get("lastError") or f"exited (code {st.get('exitCode')})"
+            if crash and crash.get("gaveUp"):
+                # Said on the card: the watchdog stopped trying, and why.
+                reason = (f"crashed {crash['count']} times in {Watchdog.WINDOW_SEC // 60} minutes — "
+                          f"not restarting it: {crash.get('reason') or reason}")
             return {**st, "phase": "error", "port": startup.get("port") or port,
-                    "modelPath": startup.get("modelPath", ""),
-                    "lastError": st.get("lastError") or f"exited (code {st.get('exitCode')})"}
+                    "modelPath": startup.get("modelPath", ""), "lastError": reason}
         if phase in ("resolving", "downloading", "loading"):
             return {
                 **st, "running": False, "phase": phase,
@@ -320,7 +333,8 @@ class Cells:
             log = rec.get("log") or ""
             cell.process.adopt(pid, dict(rec.get("cfg") or {}),
                                log_path=Path(log) if log else None,
-                               started_at=int(rec.get("startedAt") or 0))
+                               started_at=int(rec.get("startedAt") or 0),
+                               launch=rec.get("launch"))
             cell.cache_models = bool(rec.get("cacheModels"))
             self.report(port, phase="running", error="")
             adopted_pids.add(pid)
@@ -441,8 +455,19 @@ class Cells:
 
     def start(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Start a cell as the controller asks: a llama cell or a command cell,
-        whichever the payload names (starts.py)."""
-        return CellStart.of(self, payload).run()
+        whichever the payload names (starts.py). A start by hand clears the
+        cell's crash count: it counts since the operator last touched it."""
+        start = CellStart.of(self, payload)
+        try:
+            port = int(start.port())
+        except (TypeError, ValueError):
+            port = None
+        with self._lock:
+            cell = self.by_port.get(port) if port is not None else None
+        if cell is not None:            # only a cell that exists: a refusal leaves no slot
+            with cell.lock:
+                cell.crash = None
+        return start.run()
 
     def purge_models_safely(self) -> dict[str, Any]:
         """On-demand cache purge. Keeps the currently running cells' files so a

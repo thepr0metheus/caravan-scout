@@ -1404,7 +1404,8 @@ def test_command_cell_start():
     check(disk_cells(r.s).get(str(port)) == {
         "port": port, "kind": "command", "pid": 7070, "marker": f"bash run_whisper.sh {port} --lang en",
         "cfg": {"modelPath": "", "port": port, "cellKind": "command", "command": "bash ~/run_whisper.sh $PORT --lang en"},
-        "log": str(log), "cacheModels": True, "healthPath": "/v1/health", "startedAt": NOW},
+        "log": str(log), "cacheModels": True, "healthPath": "/v1/health", "startedAt": NOW,
+        "launch": {"argv": ["bash", "-lc", shell], "extraEnv": {}, "log": str(log)}},
         "ячейка в реестре: маркер с раскрытым $PORT и без ~/, cfg с командой без exec, healthPath от контроллера")
     check(r.s.cells.startup(port) == {"phase": "running", "modelPath": "bash ~/run_whisper.sh $PORT --lang en",
                                            "downloadedBytes": 0, "totalBytes": 0, "error": "", "startedAt": NOW},
@@ -1603,8 +1604,11 @@ def test_worker_success():
           "лог — свой для порта (llama-server.<port>.log): упавшая ячейка цитирует свой лог, а не соседа")
     check(disk_cells(s).get(str(port)) == {"port": port, "kind": "llama", "pid": 4242, "marker": str(LLAMA_BIN),
                                            "cfg": {**cfg, "artifact": artifact}, "log": log, "cacheModels": False,
-                                           "healthPath": "/health", "startedAt": NOW},
-          "успешный старт в реестре: маркер — путь бинаря, cfg с артефактом, лог порта")
+                                           "healthPath": "/health", "startedAt": NOW,
+                                           "launch": {"argv": [str(LLAMA_BIN), "--model", mp, "--port", str(port)],
+                                                      "extraEnv": {}, "log": log}},
+          "успешный старт в реестре: маркер — путь бинаря, cfg с артефактом, лог порта; и как запущен (argv, "
+          "окружение сверх обычного, лог) — чтобы после падения повторить тот же запуск и после рестарта скаута")
     size = len(BODIES[MODEL])
     check(s.cells.startup(port) == {"phase": "running", "error": "", "downloadedBytes": size, "totalBytes": size,
                                          "downloadingFile": "model-q4.gguf"},

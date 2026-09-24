@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.5.0 — 2026-09-24
+
+- **A crashed cell comes back.** The controller's cells are systemd units
+  with Restart=on-failure; a scout's cell stayed down. The watchdog launches
+  a cell that died without being stopped again the same way 10 s later — the
+  argv, the extra environment and the log each cell's record now keeps, so
+  also after a scout restart — at most 3 times in 10 minutes; then it stays
+  down and its error says the watchdog gave up and why. A clean exit is not a
+  crash. Each cell carries its crash note (`crash`: how many times since it
+  was last started by hand, when, why) — the 💥 on the board; a start by hand
+  clears it. A cell launched before 2.5 keeps no launch and is reported, not
+  restarted.
+
 ## 2.4.0 — 2026-09-24
 
 - **Cells start with the machine.** ↟ on the board now works for a scout's

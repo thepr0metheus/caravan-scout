@@ -60,6 +60,13 @@ class ReportSample:
                                      "specType": "", "port": 22001, "gpuLayers": 999, "ctxSize": 8192},
                               started_at=self.NOW - 600)
         scout.cells.report(22001, phase="running", error="")
+        # It crashed once and its watchdog brought it back (2.5): the note the
+        # board shows as 💥 rides the cell's view.
+        running.crash = {"count": 1, "at": "2026-09-24T09:00:00+0000", "reason": "CUDA error: out of memory",
+                         "restarts": [self.NOW - 700], "due": None}
+        # And it starts with the machine (2.4): its port rides "autostart".
+        scout.autostart.set(22001, True, {"modelPath": "models/org/model-q4.gguf", "port": 22001,
+                                          "args": ["--port", "22001"], "config": {"PORT": 22001}})
         scout.cells.report(22002, phase="downloading", modelPath="models/org/other-q8.gguf",
                            downloadedBytes=1_000_000, totalBytes=4_000_000, downloadingFile="other-q8.gguf",
                            startedAt=self.NOW - 30)

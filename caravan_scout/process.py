@@ -155,6 +155,10 @@ class CellProcess:
         self._last_error: str = ""
         self._log = CellLog(None)
         self._exit_info: dict[str, Any] | None = None
+        # How it was last launched — argv, the extra environment, the log —
+        # so a crash can be followed by the same launch (Watchdog), also after
+        # a scout restart: the record keeps it (CellRecords).
+        self._launch: dict[str, Any] | None = None
 
     @staticmethod
     def pid_alive(pid: int) -> bool:
@@ -171,7 +175,7 @@ class CellProcess:
     # ── public API ──────────────────────────────────────────────────────────
 
     def adopt(self, pid: int, cfg: dict[str, Any], log_path: Path | None = None,
-              started_at: int = 0) -> dict[str, Any]:
+              started_at: int = 0, launch: dict[str, Any] | None = None) -> dict[str, Any]:
         """Re-attach to a server that survived an agent restart (KillMode=process /
         AbandonProcessGroup). The process is NOT our child, so it is managed by
         pid: liveness via kill(pid, 0), stop via SIGTERM→SIGKILL."""
@@ -183,6 +187,7 @@ class CellProcess:
             self._last_error = ""
             self._log = CellLog(log_path)
             self._exit_info = None
+            self._launch = dict(launch) if isinstance(launch, dict) and launch.get("argv") else None
             return {"ok": True, "pid": int(pid), "adopted": True}
 
     def _running_locked(self) -> bool:
@@ -224,6 +229,7 @@ class CellProcess:
                 self._last_error = ""
                 self._log = CellLog(log_path)
                 self._exit_info = None
+                self._launch = {"argv": [str(a) for a in cmd], "extraEnv": {}, "log": str(log_path or "")}
                 return {"ok": True, "pid": self._proc.pid, "port": cfg.get("port")}
             except Exception as exc:
                 self._last_error = str(exc)
@@ -259,11 +265,49 @@ class CellProcess:
                 self._last_error = ""
                 self._log = CellLog(log_path)
                 self._exit_info = None
+                self._launch = {"argv": list(cmd), "extraEnv": dict(extra_env or {}), "log": str(log_path or "")}
                 return {"ok": True, "pid": self._proc.pid, "port": cfg.get("port")}
             except Exception as exc:
                 self._last_error = str(exc)
                 self._proc = None
                 return {"ok": False, "error": str(exc)}
+
+    def launch_spec(self) -> dict[str, Any] | None:
+        """How this cell was last launched, or None when it never was here."""
+        with self._lock:
+            return dict(self._launch) if self._launch else None
+
+    def relaunch(self) -> dict[str, Any]:
+        """The same launch again, after a crash: same argv, environment and
+        log (the crashed run's log is kept aside, as on every start)."""
+        with self._lock:
+            if self._running_locked():
+                return {"ok": False, "error": "the cell is running"}
+            spec = self._launch
+            if not spec or not spec.get("argv"):
+                return {"ok": False, "error": "no launch to repeat — it was started before this scout kept one"}
+            log_path = Path(spec["log"]) if spec.get("log") else None
+            if log_path:
+                CellLog(log_path).rotate()
+            try:
+                log_fh = open(log_path, "w") if log_path else subprocess.DEVNULL
+                self._proc = subprocess.Popen(
+                    list(spec["argv"]),
+                    stdout=log_fh,
+                    stderr=subprocess.STDOUT if log_path else subprocess.DEVNULL,
+                    close_fds=True,
+                    env={**HostProcesses.cell_env(self._cfg.get("port")), **dict(spec.get("extraEnv") or {})},
+                )
+            except Exception as exc:
+                self._last_error = str(exc)
+                self._proc = None
+                return {"ok": False, "error": str(exc)}
+            self._adopted_pid = None
+            self._started_at = int(time.time())
+            self._last_error = ""
+            self._log = CellLog(log_path)
+            self._exit_info = None
+            return {"ok": True, "pid": self._proc.pid}
 
     def stop(self) -> dict[str, Any]:
         with self._lock:

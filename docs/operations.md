@@ -102,6 +102,14 @@ start), `llama-node-configs/`, `var/server-cells/<port>/`, the model cache
   purged on stop; with caching on they stay. `cleanOldModels=true` (off by
   default) removes the other cached models after a start, keeping what the
   running cells hold.
+- **A crashed cell comes back (2.5+).** A cell that dies without being
+  stopped — a non-zero exit, or gone while adopted — is launched again the same
+  way 10 s later (the launch its record keeps, also after a scout restart), at
+  most 3 times in 10 minutes; then it stays down and its error says the
+  watchdog gave up and why. A clean exit (code 0) is not a crash. The crash
+  note (`crash` on the cell: count since the last start by hand, time, reason)
+  is the 💥 on the board; a start by hand clears it. A cell launched by a scout
+  older than 2.5 has no launch kept and is reported, not restarted.
 - **Autostart (2.4+).** A cell with ↟ on the board starts when the machine
   boots: the scout keeps the start request the controller sent (refreshed on
   every start and when the cell's settings are saved) and starts those cells on
