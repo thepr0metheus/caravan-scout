@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.16.2 — 2026-09-25
+
+- **Starting LM Studio from the board survives its own self-copy.** LM
+  Studio's daemon copies `lms` over itself as it starts; on the live check
+  `lms daemon up` started it, and the `lms server start` right after failed
+  with "Text file busy", leaving the daemon up and its server not. A command
+  that meets the copy is now tried again, a quarter of a second apart, for
+  up to five seconds; any other failure to run is said at once.
+
 ## 2.16.1 — 2026-09-25
 
 - **Looking at LM Studio never wakes it up.** Most of `lms` starts LM Studio

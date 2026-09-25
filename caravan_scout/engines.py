@@ -10,6 +10,7 @@ into the cards' free memory is asked about before it starts (2.15).
 """
 from __future__ import annotations
 
+import errno
 import ipaddress
 import json
 import os
@@ -126,10 +127,18 @@ class LmsCli:
     #: A load reads the model from disk and warms the card.
     LOAD = 300.0
     ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+    #: LM Studio's daemon copies `lms` over itself as it starts (seen
+    #: 2026-09-25: `lms daemon up`, then `lms server start` failed with
+    #: "Text file busy"). A command that meets the copy is tried again, this
+    #: often and this many seconds apart — five seconds in all.
+    BUSY_TRIES = 20
+    BUSY_PAUSE = 0.25
 
-    def __init__(self, home: str | Path | None = None, run: Callable[..., Any] | None = None):
+    def __init__(self, home: str | Path | None = None, run: Callable[..., Any] | None = None,
+                 pause: Callable[[float], None] | None = None):
         self._home = home
         self._run = run or self.run_process
+        self._pause = pause or (lambda sec: time.sleep(sec))
 
     @property
     def path(self) -> Path:
@@ -154,15 +163,19 @@ class LmsCli:
         code, text = self._run([str(self.path), *args], self.QUICK if timeout is None else timeout)
         return code, self.ANSI.sub("", text or "").replace("\r", "\n")
 
-    @staticmethod
-    def run_process(argv: list[str], timeout: float) -> tuple[int | None, str]:
-        try:
-            done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            return None, f"lms did not finish in {timeout:.0f} s"
-        except OSError as exc:
-            return None, f"lms did not run: {exc}"
-        return done.returncode, (done.stdout or "") + (done.stderr or "")
+    def run_process(self, argv: list[str], timeout: float) -> tuple[int | None, str]:
+        for attempt in range(self.BUSY_TRIES):
+            try:
+                done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                return None, f"lms did not finish in {timeout:.0f} s"
+            except OSError as exc:
+                if exc.errno == errno.ETXTBSY and attempt + 1 < self.BUSY_TRIES:
+                    self._pause(self.BUSY_PAUSE)
+                    continue
+                return None, f"lms did not run: {exc}"
+            return done.returncode, (done.stdout or "") + (done.stderr or "")
+        return None, "lms did not run"
 
 
 class EngineKind:

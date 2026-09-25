@@ -11,9 +11,11 @@ real HTTP opens the network door for its own server on an ephemeral port.
 Run: python3 scripts/test_scout_engines.py
 """
 import contextlib
+import errno
 import io
 import json
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -792,6 +794,33 @@ def test_lms_cli():
              "есть — зовётся по полному пути, цвета сняты, возврат каретки — перевод строки; ждать — секунды")
         cli(["load", "m"], timeout=300)
         same(runs[-1][1], 300, "долгой команде — свой срок")
+
+    busy = OSError(errno.ETXTBSY, "Text file busy")
+    tries, pauses = [], []
+
+    def run(argv, **kw):
+        tries.append(argv)
+        if len(tries) <= 2:
+            raise busy
+        return subprocess.CompletedProcess(argv, 0, stdout="The server is running on port 1234.", stderr="")
+
+    real = LmsCli(pause=pauses.append)
+    with patched(subprocess, run=run):
+        got = real.run_process(["/x/lms", "server", "status"], 10)
+    same((got, len(tries), pauses), ((0, "The server is running on port 1234."), 3, [0.25, 0.25]),
+         "файл lms переписывается (демон LM Studio копирует его при старте, видели 2026-09-25) — команда повторяется "
+         "через четверть секунды, пока не выйдет")
+    tries.clear()
+    pauses.clear()
+    with patched(subprocess, run=lambda argv, **kw: (tries.append(argv), (_ for _ in ()).throw(busy))[1]):
+        got = real.run_process(["/x/lms", "server", "start"], 10)
+    same((got, len(tries), len(pauses)), ((None, "lms did not run: [Errno 26] Text file busy"), 20, 19),
+         "negative: занят все пять секунд — так и сказано, а не бесконечно")
+    tries.clear()
+    with patched(subprocess, run=lambda argv, **kw: (tries.append(argv), (_ for _ in ()).throw(PermissionError(13, "Permission denied")))[1]):
+        got = real.run_process(["/x/lms", "ps"], 10)
+    same((got, len(tries)), ((None, "lms did not run: [Errno 13] Permission denied"), 1),
+         "negative: другая ошибка запуска — сразу, без повторов")
 
 
 def test_memory_question():
