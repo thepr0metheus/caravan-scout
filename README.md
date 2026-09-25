@@ -14,7 +14,8 @@ What it does, and all it does:
   loads or unloads their models when the board asks (2.14) — for as long as
   the board says to hold them, asking first when a model would not fit into
   the cards' free memory (2.15) — and starts and stops the engines' servers
-  themselves, starting them again when the machine boots (2.16);
+  themselves, starting them again when the machine boots (2.16), and downloads
+  models into them or deletes them (2.17);
 - **runs cells** the controller configures: llama.cpp servers and command
   cells (speech recognition, TTS…), models downloaded from the controller and
   cached here, the cells re-adopted after the scout restarts;

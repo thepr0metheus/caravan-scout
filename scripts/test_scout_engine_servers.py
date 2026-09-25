@@ -481,7 +481,8 @@ def test_serve():
     procs = Procs({5100: {**OLLAMA_INFO, "exe": str(exe), "args": [str(exe), "serve"]}})
     engines, machine, queued, clock = rig(up, procs)
     view = engines.views()[0]
-    same((view["runBy"], view["controls"]), ("user", ["load", "unload", "stop"]), "работает у пользователя скаута — можно остановить")
+    same((view["runBy"], view["controls"]), ("user", ["load", "unload", "delete", "pull", "stop"]),
+         "работает у пользователя скаута — можно остановить")
     got = engines.serve("stop", "ollama", 11434)
     same((got["ok"], got["engines"][0].get("serverAction"), len(queued)), (True, {"op": "stop", "since": 1000}, 1),
          "ответ сразу: движок помечен «останавливается»; сама остановка — в своей нити")

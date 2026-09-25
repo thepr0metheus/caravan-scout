@@ -22,11 +22,12 @@ import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _scout_harness import BLOCKED, REAL, Checks, RealCallBlocked, Served, make_scout, patched  # noqa: E402
 
-from caravan_scout.engines import EngineAsk, EngineCall, ForeignEngines, LmsCli, LmStudio, Ollama  # noqa: E402
+from caravan_scout.engines import EngineAsk, EngineCall, EngineStream, ForeignEngines, LmsCli, LmStudio, Ollama  # noqa: E402
 from caravan_scout.errors import AppError  # noqa: E402
 
 CHECKS = Checks("scout engines")
@@ -449,8 +450,8 @@ class Calls:
         self.table = dict(table or {})
         self.made = []
 
-    def __call__(self, path, body):
-        self.made.append((path, body))
+    def __call__(self, path, body, method="POST"):
+        self.made.append((path, body) if method == "POST" else (path, body, method))
         return self.table.get(path, (200, {"done": True}, ""))
 
 
@@ -464,9 +465,10 @@ def refusal(fn):
 
 def test_kind_controls():
     print("что можно сделать с движком (2.14):")
-    same([Ollama().controls({"state": s}) for s in ("ok", "auth", "unreachable")], [["load", "unload"], [], []],
-         "Ollama отвечает — загрузить и выгрузить; хочет токен или молчит — ничего")
-    same([LMS().controls({"state": "ok", "api": a}) for a in ("v1", "v0")], [["load", "unload"], []],
+    same([Ollama().controls({"state": s}) for s in ("ok", "auth", "unreachable")],
+         [["load", "unload", "delete", "pull"], [], []],
+         "Ollama отвечает — загрузить, выгрузить, удалить модель, скачать (2.17); хочет токен или молчит — ничего")
+    same([LMS().controls({"state": "ok", "api": a}) for a in ("v1", "v0")], [["load", "unload", "pull"], []],
          "negative: LM Studio 0.3 (только /api/v0) читается, но не водится — у старого API нет таких глаголов")
 
     c = Calls()
@@ -888,6 +890,144 @@ def test_memory_question():
          "оценка самого движка — без «не меньше»")
 
 
+class Stream:
+    """A streamed POST, stood in for: the lines it gives, then (status, words)."""
+
+    def __init__(self, lines=(), end=(200, ""), during=None):
+        self.lines = list(lines)
+        self.end = end
+        self.during = during
+        self.made = []
+
+    def __call__(self, path, body, on_line):
+        self.made.append((path, body))
+        for line in self.lines:
+            on_line(line)
+            if self.during:
+                self.during()
+        return self.end
+
+
+def test_pull_delete():
+    print("скачать и удалить модель (2.17):")
+    seen = []
+    reach = SimpleNamespace(stream=Stream([{"status": "pulling manifest"},
+                                           {"status": "pulling a", "digest": "a", "total": 100, "completed": 10},
+                                           {"digest": "b", "total": 50, "completed": 0},
+                                           {"digest": "a", "total": 100, "completed": 100},
+                                           {"digest": "b", "total": 50, "completed": 50}, {"status": "success"}]))
+    same((Ollama().pull(reach, "qwen3:8b", lambda d, t: seen.append((d, t))), seen, reach.stream.made),
+         ("", [(10, 100), (10, 150), (100, 150), (150, 150)], [("/api/pull", {"model": "qwen3:8b", "stream": True})]),
+         "Ollama: /api/pull потоком — сколько пришло из скольких, по сумме слоёв")
+    reach = SimpleNamespace(stream=Stream([{"status": "pulling manifest"},
+                                           {"error": "pull model manifest: file does not exist"}]))
+    same(Ollama().pull(reach, "ghost:1b", lambda d, t: None), "pull model manifest: file does not exist",
+         "отказ строкой в потоке после 200 — его словами, а не «скачано»")
+    for end, want in (((500, "boom"), "boom"), ((None, "no answer: refused"), "no answer: refused")):
+        same(Ollama().pull(SimpleNamespace(stream=Stream([], end)), "m", lambda d, t: None), want,
+             f"negative: {want} — так и сказано")
+    c = Calls()
+    same((Ollama().delete(c, "qwen3:8b"), c.made), ("", [("/api/delete", {"model": "qwen3:8b"}, "DELETE")]),
+         "Ollama: удаление — DELETE /api/delete")
+    same(Ollama().delete(Calls({"/api/delete": (404, None, "model 'x' not found")}), "x"), "model 'x' not found",
+         "negative: нечего удалять — его словами")
+    c = Calls()
+    same((LMS().delete(c, "qwen/qwen3-0.6b"), c.made), ("LM Studio cannot delete a model from here", []),
+         "negative: LM Studio удалять не умеет (нет глагола, файлы модели не названы) — сказано, движку ничего не ушло")
+
+    polls, got, pauses = [], [], []
+    status_answers = iter([(200, {"status": "downloading", "downloaded_bytes": 10, "total_size_bytes": 100}),
+                           (200, {"status": "completed", "downloaded_bytes": 100})])
+
+    def ask(path):
+        polls.append(path)
+        return next(status_answers)
+
+    reach = SimpleNamespace(call=Calls({"/api/v1/models/download": (200, {"job_id": "job-7", "status": "downloading",
+                                                                          "total_size_bytes": 100}, "")}),
+                            ask=ask, pause=pauses.append)
+    same((LMS().pull(reach, "qwen/qwen3-4b", lambda d, t: got.append((d, t))), reach.call.made, polls, got, pauses),
+         ("", [("/api/v1/models/download", {"model": "qwen/qwen3-4b"})],
+          ["/api/v1/models/download/status/job-7", "/api/v1/models/download/status/job-7"], [(10, 100), (100, 100)],
+          [2.0, 2.0]),
+         "LM Studio: /api/v1/models/download даёт задание; его ход спрашивается каждые 2 с до «completed»")
+    reach = SimpleNamespace(call=Calls({"/api/v1/models/download": (200, {"status": "already_downloaded"}, "")}),
+                            ask=lambda path: polls.append("never"), pause=pauses.append)
+    polls.clear()
+    same((LMS().pull(reach, "qwen/qwen3-0.6b", lambda d, t: None), polls), ("", []),
+         "уже скачана (так отвечает LM Studio) — готово, ничего не опрашивается")
+    for answers, want in (([(200, {"status": "failed"})], "LM Studio says the download failed"),
+                          ([(200, {"status": "paused"})], "the download was paused in LM Studio"),
+                          ([(None, None)], "LM Studio stopped answering during the download"),
+                          ([(404, None)], "the download's status did not answer")):
+        it = iter(answers)
+        reach = SimpleNamespace(call=Calls({"/api/v1/models/download": (200, {"job_id": "j", "status": "downloading"}, "")}),
+                                ask=lambda path: next(it), pause=lambda s: None)
+        same(LMS().pull(reach, "m", lambda d, t: None), want, f"negative: {want}")
+    reach = SimpleNamespace(call=Calls({"/api/v1/models/download": (200, {"status": "downloading"}, "")}),
+                            ask=None, pause=None)
+    same(LMS().pull(reach, "m", lambda d, t: None), "LM Studio started no download (downloading)",
+         "negative: задания не дали — так и сказано")
+    reach = SimpleNamespace(call=Calls({"/api/v1/models/download": (400, None, "Invalid model identifier")}),
+                            ask=None, pause=None)
+    same(LMS().pull(reach, "bad name", lambda d, t: None), "Invalid model identifier", "отказ начать — его словами")
+
+    engines, fleet, posts, queued, made = act_rig()
+    for args, want in ((("ollama", 11434, ""), (400, "model must be one name, such as qwen3:8b")),
+                       (("ollama", 11434, "two words"), (400, "model must be one name, such as qwen3:8b")),
+                       (("ollama", 11434, "a\tb"), (400, "model must be one name, such as qwen3:8b")),
+                       (("ollama", 11434, "x" * 301), (400, "model must be one name, such as qwen3:8b")),
+                       (("ollama", "x", "m"), (400, "port must be a number")),
+                       (("vllm", 11434, "m"), (404, "no vllm on port 11434 here"))):
+        same(refusal(lambda: engines.pull(*args)), want, f"negative: скачать {args[2][:12]!r} — {want[1]}")
+    lines_seen = []
+    stream = Stream([{"digest": "a", "total": 100, "completed": 40}, {"digest": "a", "total": 100, "completed": 100}],
+                    during=lambda: lines_seen.append(dict(engines.views()[0].get("downloading") or {})))
+    engines.stream = lambda port, host="127.0.0.1": stream
+    got = engines.pull("ollama", 11434, " qwen3:0.6b ")
+    same((got["ok"], got["engines"][0]["downloading"]),
+         (True, {"model": "qwen3:0.6b", "since": 1000, "doneBytes": None, "totalBytes": None}),
+         "ответ сразу: движок «скачивает», сколько — ещё не известно (None, а не 0)")
+    same(refusal(lambda: engines.pull("ollama", 11434, "other:1b")), (409, "Ollama is downloading qwen3:0.6b already"),
+         "negative: второе скачивание в тот же движок — 409")
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        queued.pop()()
+    same(([(x["doneBytes"], x["totalBytes"]) for x in lines_seen], "downloading" in engines.views()[0],
+          "download qwen3:0.6b into ollama:11434: done" in out.getvalue()),
+         ([(40, 100), (100, 100)], False, True), "пока идёт — сколько пришло; после — пометка снята, в журнале сказано")
+    engines.stream = lambda port, host="127.0.0.1": Stream([{"error": "max retries exceeded"}])
+    engines.pull("ollama", 11434, "qwen3:8b")
+    with contextlib.redirect_stdout(io.StringIO()):
+        queued.pop()()
+    same(engines.views()[0].get("downloadError"), {"model": "qwen3:8b", "error": "max retries exceeded", "at": 1000},
+         "отказ остаётся на движке его словами — до следующего скачивания")
+    engines.stream = lambda port, host="127.0.0.1": Stream([])
+    engines.pull("ollama", 11434, "qwen3:8b")
+    same(engines.views()[0].get("downloadError"), None, "следующее скачивание снимает прошлую ошибку")
+    with contextlib.redirect_stdout(io.StringIO()):
+        queued.pop()()
+    with patched(Ollama, pull=lambda self, reach, name, progress: (_ for _ in ()).throw(RuntimeError("kaboom"))):
+        engines.pull("ollama", 11434, "m")
+        with contextlib.redirect_stdout(io.StringIO()):
+            queued.pop()()
+    view = engines.views()[0]
+    same(("downloading" in view, view.get("downloadError", {}).get("error")), (False, "RuntimeError: kaboom"),
+         "negative: скачивание упало — не висит «скачивает» вечно")
+    silent, *_r = act_rig(engine=Answers({"/api/version": (401, None)}))
+    same(refusal(lambda: silent.pull("ollama", 11434, "m")), (409, "Ollama on port 11434 cannot download from here"),
+         "negative: движок хочет токен — скачивать нельзя")
+
+    engines, fleet, posts, queued, made = act_rig()
+    same(refusal(lambda: engines.act("delete", "ollama", 11434, "qwen3:8b")), (409, "qwen3:8b is loaded — unload it first"),
+         "negative: загруженную не удаляем — сначала выгрузить")
+    engines.act("delete", "ollama", 11434, "nomic-embed-text:latest")
+    same(refusal(lambda: engines.act("delete", "ollama", 11434, "nomic-embed-text:latest")),
+         (409, "nomic-embed-text:latest is being deleted already"), "negative: второе удаление, пока идёт первое, — 409")
+    with contextlib.redirect_stdout(io.StringIO()):
+        queued.pop()()
+    same(posts[11434].made, [("/api/delete", {"model": "nomic-embed-text:latest"}, "DELETE")], "удаление ушло движку")
+
+
 def test_engine_call():
     print("POST движку — по-настоящему:")
     class _Engine(BaseHTTPRequestHandler):
@@ -896,9 +1036,20 @@ def test_engine_call():
         def log_message(self, *_a):
             pass
 
+        def do_DELETE(self):
+            self.do_POST()
+
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
-            type(self).seen.append((self.path, body, self.headers.get("Content-Type")))
+            type(self).seen.append((self.command, self.path, body, self.headers.get("Content-Type")))
+            if self.path == "/stream":
+                data = b'{"status":"pulling manifest"}\n\n{"digest":"a","total":10,"completed":5}\nnot json\n'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-ndjson")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             status, payload = (200, {"done": True}) if self.path == "/ok" else (500, {"error": {"message": "no VRAM"}})
             data = json.dumps(payload).encode()
             self.send_response(status)
@@ -917,14 +1068,23 @@ def test_engine_call():
         with patched(urllib.request, urlopen=REAL["urlopen"]):
             call = EngineCall(server.server_address[1], timeout=5)
             got = [call("/ok", {"model": "m"}), call("/bad", {"model": "m"})]
+            deleted = call("/ok", {"model": "m"}, method="DELETE")
             dead = EngineCall(closed, timeout=1)("/ok", {})
+            lines = []
+            stream = EngineStream(server.server_address[1], timeout=5)
+            streamed = (stream("/stream", {"model": "m"}, lines.append), stream("/bad", {}, lines.append))
+            dead_stream = EngineStream(closed, timeout=1)("/stream", {}, lines.append)
     finally:
         server.shutdown()
         server.server_close()
     same(got, [(200, {"done": True}, ""), (500, {"error": {"message": "no VRAM"}}, "no VRAM")],
          "200 — тело; отказ — код и слова движка из error.message")
-    same(_Engine.seen, [("/ok", {"model": "m"}, "application/json"), ("/bad", {"model": "m"}, "application/json")],
-         "POST с JSON-телом")
+    same(_Engine.seen[:3], [("POST", "/ok", {"model": "m"}, "application/json"), ("POST", "/bad", {"model": "m"}, "application/json"),
+                            ("DELETE", "/ok", {"model": "m"}, "application/json")],
+         "POST с JSON-телом; удаление — DELETE с тем же телом (2.17)")
+    same((streamed, lines), (((200, ""), (500, "no VRAM")), [{"status": "pulling manifest"}, {"digest": "a", "total": 10, "completed": 5}]),
+         "поток: каждая JSON-строка — как пришла, пустые и не JSON пропущены; отказ — код и слова движка")
+    same((dead_stream[0], dead_stream[1].startswith("no answer:")), (None, True), "negative: поток не ответил — «no answer»")
     same((dead[0], dead[1], dead[2].startswith("no answer:")), (None, None, True), "negative: порт молчит — «no answer»")
     same(EngineCall.TIMEOUT, 300.0, "boundary: первая загрузка — минуты, не секунды")
 
@@ -944,6 +1104,10 @@ def test_http_routes():
         a = srv.post("/api/engines/load", {"kind": "ollama", "port": 11434, "model": "m", "contextLength": 4096})
         b = srv.post("/api/engines/unload", {"kind": "ollama", "port": 11434, "model": "m"})
         c = srv.post("/api/engines/load", {"kind": "ollama", "port": 9999, "model": "m"})
+        pulled, deleted = [], []
+        with patched(scout.engines, pull=lambda kind, port, model: (pulled.append((kind, port, model)), {"ok": True})[1]):
+            f = srv.post("/api/engines/pull", {"kind": "lmstudio", "port": 1234, "model": "qwen/qwen3-4b"})
+        g = srv.post("/api/engines/delete", {"kind": "ollama", "port": 11434, "model": "m"})
         d = srv.post("/api/engines/load", {"kind": "ollama", "port": 11434, "model": "m", "force": True})
         e = srv.post("/api/engines/load", {"kind": "ollama", "port": 11434, "model": "m", "force": "true"})
         srv.post("/api/engines/load", {"kind": "ollama", "port": 11434, "model": "m", "hold": 900})
@@ -952,13 +1116,17 @@ def test_http_routes():
          "load/unload отвечают сразу; отказ — своим кодом и словами")
     same(got_args[:3], [("load", "ollama", 11434, "m", 4096, False), ("unload", "ollama", 11434, "m", None, False),
                         ("load", "ollama", 9999, "m", None, False)], "вид, порт, модель и окно доходят как есть")
-    same([x[5] for x in got_args[3:5]], [True, False],
+    same([x[5] for x in got_args[4:6]], [True, False],
          "«грузить всё равно» (2.15) — только настоящее true; строка \"true\" — не согласие")
-    same(got_args[5:], [("load", "ollama", 11434, "m", None, False, 900)], "сколько держать (2.15) доходит как есть")
+    same(got_args[6:], [("load", "ollama", 11434, "m", None, False, 900)], "сколько держать (2.15) доходит как есть")
+    same((f, pulled, g[0], got_args[3]), ((200, {"ok": True}), [("lmstudio", 1234, "qwen/qwen3-4b")], 200,
+                                          ("delete", "ollama", 11434, "m", None, False)),
+         "скачать и удалить (2.17): вид, порт и имя модели доходят как есть; удаление — тот же act, что загрузка")
 
 
 TESTS = (test_ollama_read, test_lmstudio_read, test_scan, test_scope_and_host, test_views_and_loop,
-         test_engine_ask, test_report_carries_scan, test_kind_controls, test_act, test_holds, test_estimate, test_lms_cli,
+         test_engine_ask, test_report_carries_scan, test_kind_controls, test_act, test_holds, test_pull_delete,
+         test_estimate, test_lms_cli,
          test_memory_question, test_engine_call, test_http_routes)
 
 for test in TESTS:

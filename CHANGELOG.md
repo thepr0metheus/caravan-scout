@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.17.0 — 2026-09-25
+
+- **A model is downloaded into an engine, or deleted from it, from the
+  board.** `POST /api/engines/pull {kind, port, model}` — Ollama's streamed
+  `/api/pull` (the progress the sum of its layers; a failure can come as a
+  line after a 200), LM Studio's `/api/v1/models/download` job asked every
+  2 s. Answered at once; the engine carries `downloading` {model, since,
+  doneBytes, totalBytes}, kept up to date, one download per engine at a
+  time; a failure stays as `downloadError` in the engine's words.
+  `POST /api/engines/delete {kind, port, model}` removes an Ollama model
+  (`DELETE /api/delete`) — not a loaded one; LM Studio has no verb for it
+  and does not say which files are a model's, so it does not offer it.
+
 ## 2.16.2 — 2026-09-25
 
 - **Starting LM Studio from the board survives its own self-copy.** LM

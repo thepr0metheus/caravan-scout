@@ -180,6 +180,10 @@ class ReportSample:
                 scout.engines.act("unload", "lmstudio", 1234, "google/gemma-3-4b")
                 queued.pop()()
                 scout.engines.act("unload", "ollama", 11434, "qwen3:8b")
+                # And a download into Ollama under way (2.17), a fifth of it come.
+                scout.engines.pull("ollama", 11434, "qwen3:4b")
+                with scout.engines._lock:
+                    scout.engines._downloads[("ollama", 11434)].update(doneBytes=500_000_000, totalBytes=2_500_000_000)
             return {"heartbeat": scout.report.heartbeat(), "state": scout.report.public()}
 
     def text(self) -> str:

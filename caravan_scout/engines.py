@@ -22,6 +22,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 
@@ -77,8 +78,8 @@ class EngineCall:
         self.host = host
         self.timeout = self.TIMEOUT if timeout is None else timeout
 
-    def __call__(self, path: str, body: dict[str, Any]) -> tuple[int | None, Any, str]:
-        request = urllib.request.Request(f"http://{self.host}:{self.port}{path}", method="POST",
+    def __call__(self, path: str, body: dict[str, Any], method: str = "POST") -> tuple[int | None, Any, str]:
+        request = urllib.request.Request(f"http://{self.host}:{self.port}{path}", method=method,
                                          data=json.dumps(body).encode("utf-8"),
                                          headers={"Content-Type": "application/json"})
         try:
@@ -107,6 +108,50 @@ class EngineCall:
         if isinstance(error, dict):
             error = error.get("message") or json.dumps(error)
         return str(error or text or "").strip()[:300]
+
+
+class EngineStream:
+    """POST to one engine's port, its answer read line by line as it comes:
+    a download says its progress that way (Ollama's /api/pull). Each JSON
+    line goes to `on_line`; the call returns (status, the engine's words),
+    the words only for a refusal. The timeout is between two lines, not for
+    the whole download."""
+
+    TIMEOUT = 300.0
+
+    def __init__(self, port: int, host: str = "127.0.0.1", timeout: float | None = None):
+        self.port = int(port)
+        self.host = host
+        self.timeout = self.TIMEOUT if timeout is None else timeout
+
+    def __call__(self, path: str, body: dict[str, Any], on_line: Callable[[Any], None]) -> tuple[int | None, str]:
+        request = urllib.request.Request(f"http://{self.host}:{self.port}{path}", method="POST",
+                                         data=json.dumps(body).encode("utf-8"),
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as resp:
+                for raw in resp:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except ValueError:
+                        continue
+                    on_line(payload)
+                return resp.status, ""
+        except urllib.error.HTTPError as exc:
+            try:
+                text = exc.read(EngineCall.MAX_BYTES).decode("utf-8", "replace")
+            except Exception:
+                text = ""
+            try:
+                payload = json.loads(text)
+            except ValueError:
+                payload = None
+            return exc.code, EngineCall.words(payload, text)
+        except Exception as exc:
+            return None, f"no answer: {exc}"[:300]
 
 
 class LmsCli:
@@ -228,6 +273,17 @@ class EngineKind:
         it (2.15)."""
         return False
 
+    def pull(self, reach, name: str, progress: Callable[[int | None, int | None], None]) -> str:
+        """Download the model `name` into the engine (2.17): "" when it did,
+        else the engine's own words; `progress(doneBytes, totalBytes)` as it
+        goes. `reach` has call, ask, stream and pause for this engine."""
+        raise NotImplementedError
+
+    def delete(self, call, name: str) -> str:
+        """Remove the model `name` from the engine's disk: "" or its words.
+        A kind that cannot says so — and does not offer it (`controls`)."""
+        return f"{self.label} cannot delete a model from here"
+
     def load(self, call, ask, model: str, context_length: int | None, hold: int | None = None) -> str:
         """Load `model` into the engine's memory: "" when it did, else the
         engine's own words. `hold`: seconds the model stays loaded after its
@@ -308,10 +364,35 @@ class Ollama(EngineKind):
     process_prefixes = ("ollama",)
 
     def controls(self, seen):
-        return ["load", "unload"] if seen.get("state") == "ok" else []
+        return ["load", "unload", "delete", "pull"] if seen.get("state") == "ok" else []
 
     def holds(self, seen):
         return "load" in self.controls(seen)
+
+    def pull(self, reach, name, progress):
+        """/api/pull, streamed: each layer says its size and how much of it
+        has come; the progress is their sum. A failure is a line of its own
+        ({"error": …}) — even after a 200."""
+        layers: dict[str, tuple[int, int]] = {}
+        failed: list[str] = []
+
+        def on_line(line):
+            if not isinstance(line, dict):
+                return
+            if line.get("error"):
+                failed.append(self.text(line.get("error"), 300))
+                return
+            total = self.number(line.get("total"))
+            if line.get("digest") and total:
+                layers[str(line["digest"])] = (self.number(line.get("completed")) or 0, total)
+                progress(sum(c for c, _t in layers.values()), sum(t for _c, t in layers.values()))
+
+        status, words = reach.stream("/api/pull", {"model": name, "stream": True}, on_line)
+        return failed[-1] if failed else self.refused(status, words)
+
+    def delete(self, call, name):
+        status, _payload, words = call("/api/delete", {"model": name}, method="DELETE")
+        return self.refused(status, words)
 
     def load(self, call, ask, model, context_length, hold=None):
         """/api/generate with no prompt loads the model. keep_alive is how
@@ -481,10 +562,46 @@ class LmStudio(EngineKind):
         code, text = self.cli(["server", "status"])
         return code == 0 and "is running" in text
 
+    #: Seconds between two looks at a download's progress.
+    POLL = 2.0
+
     def controls(self, seen):
-        """Only its native API (0.4+) loads and unloads; 0.3's /api/v0 has no
-        such verbs, and is read, not driven."""
-        return ["load", "unload"] if seen.get("state") == "ok" and seen.get("api") == "v1" else []
+        """Only its native API (0.4+) loads, unloads and downloads; 0.3's
+        /api/v0 has no such verbs, and is read, not driven. A model is not
+        deleted from here: LM Studio has no verb for it, and which files are a
+        model's it does not say (a catalog name is not a path; some ship
+        inside the app) — a guess would delete the wrong ones."""
+        return ["load", "unload", "pull"] if seen.get("state") == "ok" and seen.get("api") == "v1" else []
+
+    def pull(self, reach, name, progress):
+        """/api/v1/models/download starts a job; its status is asked every
+        POLL seconds until it completes or fails."""
+        status, payload, words = reach.call("/api/v1/models/download", {"model": name})
+        if status is None or not 200 <= status < 300:
+            return self.refused(status, words)
+        payload = payload if isinstance(payload, dict) else {}
+        if payload.get("status") in ("already_downloaded", "completed"):
+            return ""
+        job = self.text(payload.get("job_id"), 120)
+        if not job:
+            return f"LM Studio started no download ({payload.get('status') or 'no status'})"
+        total = self.number(payload.get("total_size_bytes"))
+        while True:
+            reach.pause(self.POLL)
+            code, body = reach.ask(f"/api/v1/models/download/status/{job}")
+            if code is None:
+                return "LM Studio stopped answering during the download"
+            if code != 200 or not isinstance(body, dict):
+                return self.refused(code, "the download's status did not answer")
+            total = self.number(body.get("total_size_bytes")) or total
+            progress(self.number(body.get("downloaded_bytes")), total)
+            state = body.get("status")
+            if state == "completed":
+                return ""
+            if state == "failed":
+                return "LM Studio says the download failed"
+            if state == "paused":
+                return "the download was paused in LM Studio"
 
     def recipe(self, info, view):
         """Its own command line starts and stops it; what is learned is where
@@ -682,11 +799,12 @@ class ForeignEngines:
     def __init__(self, machine, cells, ask: Callable[..., Any] = EngineAsk, call: Callable[..., Any] = EngineCall,
                  clock: Callable[[], float] | None = None, spawn: Callable[..., Any] | None = None,
                  kinds: tuple[EngineKind, ...] | None = None, servers=None,
-                 pause: Callable[[float], None] | None = None):
+                 pause: Callable[[float], None] | None = None, stream: Callable[..., Any] = EngineStream):
         self.machine = machine
         self.cells = cells
         self.ask = ask
         self.call = call
+        self.stream = stream
         # The servers themselves (2.16, engine_servers.py): who runs each,
         # and starting and stopping them. None — looking and loading only.
         self.servers = servers
@@ -706,6 +824,11 @@ class ForeignEngines:
         # (kind, port, model) -> {op, error, at}: the last one that failed,
         # until the next action on that model.
         self._failures: dict[tuple[str, int, str], dict[str, Any]] = {}
+        # (kind, port) -> {model, since, doneBytes, totalBytes}: the download
+        # under way on that engine (2.17), one at a time; and the last one
+        # that failed, until the next download there.
+        self._downloads: dict[tuple[str, int], dict[str, Any]] = {}
+        self._download_errors: dict[tuple[str, int], dict[str, Any]] = {}
         self._lock = threading.Lock()
 
     def views(self) -> list[dict[str, Any]] | None:
@@ -722,8 +845,11 @@ class ForeignEngines:
         engine itself `serverAction` and `serverError` — its start or stop
         (2.16), keyed by no model."""
         server = (view["kind"], int(view["port"]), "")
+        engine = (view["kind"], int(view["port"]))
         view = {**view, **({"serverAction": dict(self._actions[server])} if server in self._actions else {}),
-                **({"serverError": dict(self._failures[server])} if server in self._failures else {})}
+                **({"serverError": dict(self._failures[server])} if server in self._failures else {}),
+                **({"downloading": dict(self._downloads[engine])} if engine in self._downloads else {}),
+                **({"downloadError": dict(self._download_errors[engine])} if engine in self._download_errors else {})}
         if not isinstance(view.get("models"), list):
             return dict(view)
         rows = []
@@ -757,7 +883,7 @@ class ForeignEngines:
         the engine can be told (`holds` in its view); -1 or none — until it
         is unloaded."""
         from caravan_scout.errors import AppError
-        if op not in ("load", "unload"):
+        if op not in ("load", "unload", "delete"):
             raise AppError(f"unknown engine action {op!r}", 400)
         try:
             port = int(port)
@@ -820,8 +946,11 @@ class ForeignEngines:
             raise AppError(f"{model} is loaded already", 409)
         if op == "unload" and row.get("loaded") is not True:
             raise AppError(f"{model} is not loaded", 409)
+        if op == "delete" and row.get("loaded") is True:
+            raise AppError(f"{model} is loaded — unload it first", 409)
         if key in self._actions:
-            raise AppError(f"{model} is being {self._actions[key]['op']}ed already", 409)
+            doing = {"load": "loaded", "unload": "unloaded", "delete": "deleted"}[self._actions[key]["op"]]
+            raise AppError(f"{model} is being {doing} already", 409)
         return dict(row)
 
     def free_vram(self) -> int | None:
@@ -853,6 +982,64 @@ class ForeignEngines:
         return {"needBytes": int(need), "freeBytes": int(free), "basis": estimate.get("basis") or "",
                 "error": f"{row.get('name')} needs {least}about {need / 1024 ** 3:.1f} GiB of VRAM, "
                          f"the cards have {free / 1024 ** 3:.1f} GiB free"}
+
+    #: A model's name as a download takes it: a catalog name, a tag, a link —
+    #: one word, no spaces or control characters.
+    MODEL_NAME = re.compile(r"^[^\s\x00-\x1f\x7f]{1,300}$")
+
+    def pull(self, kind_id: str, port: Any, model: str) -> dict[str, Any]:
+        """Download a model into an engine (2.17) — on a thread of its own:
+        a download takes minutes to hours. Answered at once, the engine
+        carrying `downloading` {model, since, doneBytes, totalBytes}, which
+        its thread keeps up to date; one download per engine at a time. What
+        failed stays as `downloadError` until the next download there."""
+        from caravan_scout.errors import AppError
+        model = str(model or "").strip()
+        if not self.MODEL_NAME.match(model):
+            raise AppError("model must be one name, such as qwen3:8b", 400)
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            raise AppError("port must be a number", 400)
+        kind = next((k for k in self.kinds if k.id == kind_id), None)
+        key = (kind_id, port)
+        with self._lock:
+            view = next((v for v in self._views or [] if v.get("kind") == kind_id and v.get("port") == port), None)
+            if kind is None or view is None:
+                raise AppError(f"no {kind_id or 'engine'} on port {port} here", 404)
+            if "pull" not in (view.get("controls") or []):
+                raise AppError(f"{view.get('label')} on port {port} cannot download from here", 409)
+            if key in self._downloads:
+                raise AppError(f"{view.get('label')} is downloading {self._downloads[key]['model']} already", 409)
+            self._downloads[key] = {"model": model, "since": int(self.clock()), "doneBytes": None, "totalBytes": None}
+            self._download_errors.pop(key, None)
+        host = self.ask_host(self.listener_of(port))
+        self.spawn(lambda: self._pull_run(kind, key, host, model))
+        return {"ok": True, "engines": self.views()}
+
+    def _pull_run(self, kind, key, host, model) -> None:
+        kind_id, port = key
+
+        def progress(done, total):
+            with self._lock:
+                if key in self._downloads:
+                    self._downloads[key].update(doneBytes=done, totalBytes=total)
+
+        reach = SimpleNamespace(call=self.call(port, host), ask=self.ask(port, host),
+                                stream=self.stream(port, host), pause=self.pause)
+        try:
+            reason = kind.pull(reach, model, progress)
+        except Exception as exc:  # noqa: BLE001 — a download that crashed failed; it must not stay "under way"
+            reason = f"{type(exc).__name__}: {exc}"[:300]
+        with self._lock:
+            self._downloads.pop(key, None)
+            if reason:
+                self._download_errors[key] = {"model": model, "error": reason, "at": int(self.clock())}
+        print(f"[engines] download {model} into {kind_id}:{port}: {reason or 'done'}")
+        try:
+            self.refresh()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[engines] scan after the download failed: {exc}")
 
     def serve(self, op: str, kind_id: str, port: Any) -> dict[str, Any]:
         """Start an engine's server, or stop it (2.16) — on a thread of its
@@ -951,7 +1138,12 @@ class ForeignEngines:
         try:
             call = self.call(port, host)
             ask = self.ask(port, host)
-            reason = kind.load(call, ask, model, ctx, hold) if op == "load" else kind.unload(call, ask, model)
+            if op == "load":
+                reason = kind.load(call, ask, model, ctx, hold)
+            elif op == "delete":
+                reason = kind.delete(call, model)
+            else:
+                reason = kind.unload(call, ask, model)
         except Exception as exc:  # noqa: BLE001 — an act that crashed failed; it must not stay "under way"
             reason = f"{type(exc).__name__}: {exc}"[:300]
         with self._lock:
