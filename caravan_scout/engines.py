@@ -455,6 +455,18 @@ class LmStudio(EngineKind):
 
     def __init__(self, cli: LmsCli | None = None):
         self.cli = cli or LmsCli()
+        # Most of `lms` wakes LM Studio up when it is not running ("Waking up
+        # LM Studio service..." — `lms ps` does, seen 2026-09-25): a read
+        # that met a stop half-way started the daemon again. Every sequence
+        # of commands holds this lock, and one that must not wake it asks
+        # `lms server status` (which does not) first.
+        self.lock = threading.Lock()
+
+    def running(self) -> bool:
+        """Whether its server runs now, as `lms server status` says — the
+        one question that does not wake LM Studio. Called with the lock held."""
+        code, text = self.cli(["server", "status"])
+        return code == 0 and "is running" in text
 
     def controls(self, seen):
         """Only its native API (0.4+) loads and unloads; 0.3's /api/v0 has no
@@ -480,21 +492,23 @@ class LmStudio(EngineKind):
     def start_server(self, recipe, procs):
         """`lms daemon up`, then `lms server start` on the learned port and
         address. The command line returns when the server has started."""
-        code, text = self.cli(["daemon", "up"], timeout=LmsCli.LOAD)
-        if code != 0:
-            return LmsCli.said(text) or f"lms daemon up exited with {code}"
-        code, text = self.cli(["server", "start", "-p", str(int(recipe.get("port") or self.default_port)),
-                               "--bind", str(recipe.get("bind") or "127.0.0.1")], timeout=LmsCli.LOAD)
+        with self.lock:
+            code, text = self.cli(["daemon", "up"], timeout=LmsCli.LOAD)
+            if code != 0:
+                return LmsCli.said(text) or f"lms daemon up exited with {code}"
+            code, text = self.cli(["server", "start", "-p", str(int(recipe.get("port") or self.default_port)),
+                                   "--bind", str(recipe.get("bind") or "127.0.0.1")], timeout=LmsCli.LOAD)
         return "" if code == 0 else (LmsCli.said(text) or f"lms server start exited with {code}")
 
     def stop_server(self, recipe, pid, procs):
         """`lms daemon down` — the daemon holds the loaded models, and only
         its going frees their memory; where there is no daemon (the app
         runs the server), `lms server stop`."""
-        code, text = self.cli(["daemon", "down"], timeout=LmsCli.LOAD)
-        if code == 0:
-            return ""
-        code, text = self.cli(["server", "stop"], timeout=LmsCli.LOAD)
+        with self.lock:
+            code, text = self.cli(["daemon", "down"], timeout=LmsCli.LOAD)
+            if code == 0:
+                return ""
+            code, text = self.cli(["server", "stop"], timeout=LmsCli.LOAD)
         return "" if code == 0 else (LmsCli.said(text) or f"lms server stop exited with {code}")
 
     def holds(self, seen):
@@ -508,8 +522,12 @@ class LmStudio(EngineKind):
         The command line loads the variant the model list names, as the
         REST load does."""
         if hold:
-            code, text = self.cli(["load", model, "-y", "--ttl", str(int(hold)),
-                                   *(["-c", str(int(context_length))] if context_length else [])], timeout=LmsCli.LOAD)
+            with self.lock:
+                if not self.running():
+                    return "LM Studio is not running"
+                code, text = self.cli(["load", model, "-y", "--ttl", str(int(hold)),
+                                       *(["-c", str(int(context_length))] if context_length else [])],
+                                      timeout=LmsCli.LOAD)
             return "" if code == 0 else (LmsCli.said(text) or f"lms load exited with {code}")
         body = {"model": model, **({"context_length": int(context_length)} if context_length else {})}
         status, _payload, words = call("/api/v1/models/load", body)
@@ -536,8 +554,11 @@ class LmStudio(EngineKind):
         """LM Studio's own estimate for the window asked for (its default
         without one), from `lms load --estimate-only`; the file alone when
         the command line is not there or says no number."""
-        code, text = self.cli(["load", str(row.get("name") or ""), "--estimate-only", "-y",
-                               *(["-c", str(int(context_length))] if context_length else [])])
+        with self.lock:
+            if not self.running():
+                return super().estimate(call, ask, row, context_length)
+            code, text = self.cli(["load", str(row.get("name") or ""), "--estimate-only", "-y",
+                                   *(["-c", str(int(context_length))] if context_length else [])])
         found = self.ESTIMATE.search(text) if code == 0 else None
         if not found:
             return super().estimate(call, ask, row, context_length)
@@ -567,8 +588,12 @@ class LmStudio(EngineKind):
     def idle_limits(self) -> dict[str, dict[str, Any]]:
         """{instance id: {ttlMs, lastUsedTime}} of what is loaded, from `lms
         ps --json` — the REST list does not say an idle limit. {} when the
-        command line is not there or does not answer: then nobody knows."""
-        code, text = self.cli(["ps", "--json"])
+        command line is not there or does not answer, or its server is not
+        running — `lms ps` would wake LM Studio up: then nobody knows."""
+        with self.lock:
+            if not self.running():
+                return {}
+            code, text = self.cli(["ps", "--json"])
         try:
             rows = json.loads(text) if code == 0 else None
         except ValueError:

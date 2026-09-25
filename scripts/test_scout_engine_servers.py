@@ -190,6 +190,38 @@ def test_kind_start_stop():
          "negative: не остановилось ничего — сказано, а не «остановлен»")
 
 
+def test_lms_lock():
+    CHECKS.section("чтение не будит LM Studio посреди остановки:")
+    import threading
+    order, result, blocked, readers = [], [], [], []
+
+    class RacingCli:
+        up = True
+
+        def available(self):
+            return True
+
+        def __call__(self, args, timeout=None):
+            order.append(" ".join(args[:2]))
+            if list(args[:2]) == ["server", "status"]:
+                return (0, "The server is running on port 1234.") if self.up else (0, "The server is not running.")
+            if list(args[:2]) == ["daemon", "down"]:
+                reader = threading.Thread(target=lambda: result.append(kind.idle_limits()), daemon=True)
+                reader.start()
+                reader.join(0.3)
+                blocked.append(reader.is_alive())
+                readers.append(reader)
+                self.up = False
+                return 0, "Done."
+            return 0, "[]"
+
+    kind = LmStudio(cli=RacingCli())
+    said = kind.stop_server({}, 7, None)
+    readers[0].join(2)
+    same((said, blocked, result, order), ("", [True], [{}], ["daemon down", "server status"]),
+         "чтение пришло посреди остановки — ждёт её конца, видит «не работает» и lms ps не зовёт (он поднял бы LM Studio снова)")
+
+
 def fake_proc(root, pid, uid_of_dir=None, cmdline=(), environ=None, exe=None, ppid=1):
     d = Path(root) / str(pid)
     d.mkdir(parents=True, exist_ok=True)
@@ -571,7 +603,7 @@ def test_scout_and_http():
     same(got, [("start", "ollama", 11434), ("stop", "lmstudio", 1234), ("start", "ollama", 9)], "вид и порт доходят как есть")
 
 
-TESTS = (test_kind_recipes, test_kind_start_stop, test_procs, test_annotate, test_servers_start_stop, test_serve,
+TESTS = (test_kind_recipes, test_kind_start_stop, test_lms_lock, test_procs, test_annotate, test_servers_start_stop, test_serve,
          test_boot, test_scout_and_http)
 
 for test in TESTS:

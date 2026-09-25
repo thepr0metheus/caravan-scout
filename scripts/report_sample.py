@@ -208,8 +208,9 @@ class SampleProcs:
 
 
 class SampleLms:
-    """LM Studio's command line in the sample: `lms ps --json` answers with
-    the loaded model's idle limit; nothing else is asked of it."""
+    """LM Studio's command line in the sample: its server runs, and `lms ps
+    --json` answers with the loaded model's idle limit; nothing else is
+    asked of it."""
 
     def __init__(self, ps):
         self.ps = ps
@@ -219,6 +220,8 @@ class SampleLms:
         return True
 
     def __call__(self, args, timeout=None):
+        if list(args) == ["server", "status"]:
+            return 0, "The server is running on port 1234."
         return (0, json.dumps(self.ps)) if list(args) == ["ps", "--json"] else (1, "not in the sample")
 
 

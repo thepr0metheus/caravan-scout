@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.16.1 — 2026-09-25
+
+- **Looking at LM Studio never wakes it up.** Most of `lms` starts LM Studio
+  when it is not running (`lms ps` prints "Waking up LM Studio service...").
+  On the live check a board stop of LM Studio met the scan's `lms ps --json`
+  half-way, and the daemon came straight back. Now a read of the idle
+  limits, an estimate and a load through the command line ask `lms server
+  status` first — which does not wake it — and skip `lms` when the server
+  is not running; and every sequence of `lms` commands holds one lock, so a
+  read cannot slip between a stop's command and its end.
+
 ## 2.16.0 — 2026-09-25
 
 - **An engine's server is started and stopped from the board.** `POST

@@ -602,22 +602,32 @@ QWEN2_INFO = {"general.architecture": "qwen2", "qwen2.block_count": 24, "qwen2.a
 
 
 class Cli:
-    """LM Studio's command line, stood in for: what it prints for each
-    command, and every command asked."""
+    """LM Studio's command line, stood in for: `lms server status` says
+    whether its server runs (`running`), every other command prints
+    `answer`. `made` / `waits` keep what was done — the status questions
+    aside, in `asked`."""
 
-    def __init__(self, answer=(0, ""), available=True):
+    def __init__(self, answer=(0, ""), available=True, running=True):
         self.answer = answer
         self.is_there = available
+        self.up = running
         self.made = []
         self.waits = []
+        self.asked = 0
 
     def available(self):
         return self.is_there
 
     def __call__(self, args, timeout=None):
+        if not self.is_there:
+            self.made.append(list(args))
+            return None, "no lms at /home/u/.lmstudio/bin/lms"
+        if list(args[:2]) == ["server", "status"]:
+            self.asked += 1
+            return (0, "The server is running on port 1234.") if self.up else (0, "The server is not running.")
         self.made.append(list(args))
         self.waits.append(timeout)
-        return self.answer if self.is_there else (None, "no lms at /home/u/.lmstudio/bin/lms")
+        return self.answer
 
 
 PS_JSON = json.dumps([
@@ -674,7 +684,15 @@ def test_holds():
     cli = Cli((0, PS_JSON))
     idle = {"models": [{**m, "loaded_instances": []} for m in LMS_V1["models"]]}
     LMS(cli).read(Answers({"/api/v1/models": (200, idle)}))
-    same(cli.made, [], "negative: ничего не загружено — lms ps не зовётся (0,13 с на каждый скан — только по делу)")
+    same((cli.made, cli.asked), ([], 0), "negative: ничего не загружено — lms ps не зовётся (0,13 с на каждый скан — только по делу)")
+    cli = Cli((0, PS_JSON), running=False)
+    seen = LMS(cli).read(Answers({"/api/v1/models": (200, LMS_V1)}))
+    same((cli.made, cli.asked, seen["models"][0]["staysLoaded"]), ([], 1, None),
+         "negative: сервер LM Studio не работает — lms ps не зовётся: он бы разбудил LM Studio (видели 2026-09-25); "
+         "срок — не знаю")
+    cli = Cli((0, ""), running=False)
+    same((LMS(cli).load(Calls(), None, "m", None, 60), cli.made), ("LM Studio is not running", []),
+         "negative: загрузка со сроком при остановленном сервере — отказ, а не lms load, который поднял бы его сам")
     for answer, why in (((1, "boom"), "lms ps упал"), ((0, "not json"), "ответ не JSON"),
                         ((1, PS_JSON), "lms ps вышел с ошибкой, хоть и напечатал список")):
         seen = LMS(Cli(answer)).read(Answers({"/api/v1/models": (200, LMS_V1)}))
@@ -746,6 +764,10 @@ def test_estimate():
     same((LmStudio(cli=cli).estimate(None, None, lms_row, None), cli.made[0][-1]),
          ({"needBytes": int(647.41 * 1024 ** 2), "basis": "engine"}, "-y"),
          "без окна — его окно по умолчанию, без -c; МиБ считаются МиБ")
+    cli = Cli((0, "Estimated GPU Memory:   6.52 GiB\n"), running=False)
+    same((LmStudio(cli=cli).estimate(None, None, lms_row, 8192), cli.made),
+         ({"needBytes": 6_326_932_336, "basis": "weights"}, []),
+         "negative: сервер LM Studio не работает — оценку у lms не спрашиваем (разбудила бы), только файл")
     for answer, why in (((None, "no lms at /x"), "командной строки нет"),
                         ((0, "No model found that matches model key \"x\"."), "числа не сказано"),
                         ((1, "Estimated GPU Memory: 1 GiB"), "команда упала — её число не берётся")):
