@@ -10,8 +10,8 @@ What it does, and all it does:
 - **reports its machine** — GPUs and what runs on them, CPU/RAM, the cells,
   the llama.cpp build — in a heartbeat to the controller;
 - **names the engines next to its cells** — Ollama and LM Studio on the same
-  machine: their models, what is loaded, the memory they hold (read only,
-  2.12);
+  machine: their models, what is loaded, the memory they hold (2.12), and
+  loads or unloads their models when the board asks (2.14);
 - **runs cells** the controller configures: llama.cpp servers and command
   cells (speech recognition, TTS…), models downloaded from the controller and
   cached here, the cells re-adopted after the scout restarts;

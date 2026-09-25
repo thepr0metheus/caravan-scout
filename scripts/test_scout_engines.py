@@ -22,9 +22,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _scout_harness import BLOCKED, REAL, Checks, RealCallBlocked, make_scout, patched  # noqa: E402
+from _scout_harness import BLOCKED, REAL, Checks, RealCallBlocked, Served, make_scout, patched  # noqa: E402
 
-from caravan_scout.engines import EngineAsk, ForeignEngines, LmStudio, Ollama  # noqa: E402
+from caravan_scout.engines import EngineAsk, EngineCall, ForeignEngines, LmStudio, Ollama  # noqa: E402
+from caravan_scout.errors import AppError  # noqa: E402
 
 CHECKS = Checks("scout engines")
 check = CHECKS.check
@@ -83,6 +84,7 @@ class Fleet:
         return self.listen if self.listen is not None else {"ok": False, "error": "ss: ss", "ports": []}
 
     def processes(self):
+        self.proc_reads = getattr(self, "proc_reads", 0) + 1   # a full scan reads it; an act does not
         return self.procs
 
     def all(self):
@@ -259,9 +261,9 @@ def test_scan():
           1234: ([613, 614, 700], (409_600 + 102_400 + 51_200) * 1024)},
          "процессы движка: по имени и все их потомки (раннер, помощник) — as-is: два Ollama одной машины "
          "делят процессы своего имени; RAM — сумма RSS")
-    same(sorted(views[2]), ["api", "firewall", "kind", "label", "listen", "models", "pids", "port", "ramBytes",
-                            "state", "version"],
-         "вид движка: вид, имя, порт, где слушает, файрвол, версия, модели, процессы, память")
+    same(sorted(views[2]), ["api", "controls", "firewall", "kind", "label", "listen", "models", "pids", "port",
+                            "ramBytes", "state", "version"],
+         "вид движка: вид, имя, порт, где слушает, файрвол, что с ним можно делать, версия, модели, процессы, память")
 
     print("файрвол у порта движка (2.13):")
     fw = Fleet(engines={11434: ollama(), 41000: ollama(), 1234: Answers({"/api/v1/models": (200, LMS_V1)})},
@@ -424,8 +426,228 @@ def test_report_carries_scan():
     same(after[0], after[1], "пульс и /api/state говорят одно и то же одним именем — engines")
 
 
+class Calls:
+    """An engine's answers to POSTs by path — (status, payload, its words) —
+    and every call made, path and body."""
+
+    def __init__(self, table=None):
+        self.table = dict(table or {})
+        self.made = []
+
+    def __call__(self, path, body):
+        self.made.append((path, body))
+        return self.table.get(path, (200, {"done": True}, ""))
+
+
+def refusal(fn):
+    try:
+        fn()
+    except AppError as exc:
+        return (exc.status, str(exc))
+    return None
+
+
+def test_kind_controls():
+    print("что можно сделать с движком (2.14):")
+    same([Ollama().controls({"state": s}) for s in ("ok", "auth", "unreachable")], [["load", "unload"], [], []],
+         "Ollama отвечает — загрузить и выгрузить; хочет токен или молчит — ничего")
+    same([LmStudio().controls({"state": "ok", "api": a}) for a in ("v1", "v0")], [["load", "unload"], []],
+         "negative: LM Studio 0.3 (только /api/v0) читается, но не водится — у старого API нет таких глаголов")
+
+    c = Calls()
+    same((Ollama().load(c, None, "qwen3:8b", 4096), c.made),
+         ("", [("/api/generate", {"model": "qwen3:8b", "keep_alive": -1, "options": {"num_ctx": 4096}})]),
+         "Ollama: загрузка — /api/generate без запроса, keep_alive -1 (держать, пока не выгрузят), окно — num_ctx")
+    c = Calls()
+    Ollama().load(c, None, "m", None)
+    same(c.made[0][1], {"model": "m", "keep_alive": -1}, "окно не задано — своё окно Ollama, без options")
+    c = Calls()
+    same((Ollama().unload(c, None, "m"), c.made), ("", [("/api/generate", {"model": "m", "keep_alive": 0})]),
+         "выгрузка — keep_alive 0")
+    same(Ollama().load(Calls({"/api/generate": (500, {"error": "model requires more system memory"},
+                                                "model requires more system memory")}), None, "m", None),
+         "model requires more system memory", "отказ — словами самого движка")
+    same(Ollama().load(Calls({"/api/generate": (None, None, "no answer: refused")}), None, "m", None),
+         "no answer: refused", "negative: не ответил — так и сказано, а не «загружено»")
+    same(Ollama().load(Calls({"/api/generate": (500, None, "")}), None, "m", None), "http 500",
+         "boundary: отказ без слов — хотя бы код, а не пустая строка «успех»")
+
+    c = Calls()
+    same((LmStudio().load(c, None, "google/gemma-3-4b", 8192), c.made),
+         ("", [("/api/v1/models/load", {"model": "google/gemma-3-4b", "context_length": 8192})]),
+         "LM Studio: /api/v1/models/load с окном")
+    c = Calls()
+    same((LmStudio().unload(c, Answers({"/api/v1/models": (200, LMS_V1)}), "google/gemma-3-4b"), c.made),
+         ("", [("/api/v1/models/unload", {"instance_id": "google/gemma-3-4b"}),
+               ("/api/v1/models/unload", {"instance_id": "google/gemma-3-4b:2"})]),
+         "выгрузка — каждый экземпляр по id, спрошенным заново, а не из прошлого поиска")
+    same(LmStudio().unload(Calls(), Answers({"/api/v1/models": (200, LMS_V1)}), "text-embedding-nomic"),
+         "text-embedding-nomic is not loaded", "negative: экземпляров нет — так и сказано")
+    same(LmStudio().unload(Calls(), Answers(silent=True), "x"), "the model list did not answer",
+         "negative: список моделей не ответил — выгружать нечего по чьим-то словам")
+    c = Calls({"/api/v1/models/unload": (404, {"error": {"message": "no such instance"}}, "no such instance")})
+    same((LmStudio().unload(c, Answers({"/api/v1/models": (200, LMS_V1)}), "google/gemma-3-4b"), len(c.made)),
+         ("no such instance", 1), "первый отказ останавливает выгрузку и назван словами движка")
+
+
+def act_rig(listen=("127.0.0.1",), engine=None):
+    fleet = Fleet(engines={11434: engine or ollama()}, processes={},
+                  listeners={"ok": True, "ports": [{"port": 11434, "proc": "ollama", "pid": 5100,
+                                                    "addrs": list(listen)}]})
+    posts, queued, made = {}, [], []
+
+    def call(port, host="127.0.0.1"):
+        made.append((port, host))
+        return posts.setdefault(port, Calls())
+
+    engines = ForeignEngines(fleet, fleet, ask=fleet.ask, call=call, clock=lambda: 1000.0, spawn=queued.append)
+    with contextlib.redirect_stdout(io.StringIO()):
+        engines.refresh()
+    return engines, fleet, posts, queued, made
+
+
+def model_row(views, name):
+    for v in views or []:
+        for m in v.get("models") or []:
+            if m.get("name") == name:
+                return m
+    return None
+
+
+def test_act():
+    print("загрузить и выгрузить с доски (2.14):")
+    engines, fleet, posts, queued, made = act_rig()
+    got = engines.act("load", "ollama", 11434, "nomic-embed-text:latest", "2048")
+    same((got["ok"], model_row(got["engines"], "nomic-embed-text:latest").get("action")),
+         (True, {"op": "load", "since": 1000}), "ответ сразу: модель помечена «грузится», с какого часа")
+    same(len(queued), 1, "само действие — вне запроса (своя нить): загрузка идёт секунды и минуты")
+    same(refusal(lambda: engines.act("load", "ollama", 11434, "nomic-embed-text:latest")),
+         (409, "nomic-embed-text:latest is being loaded already"), "negative: второе действие над той же моделью — 409")
+    scans_before = fleet.proc_reads
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        queued.pop()()
+    same(posts[11434].made, [("/api/generate", {"model": "nomic-embed-text:latest", "keep_alive": -1,
+                                                "options": {"num_ctx": 2048}})],
+         "движку ушла загрузка с окном из запроса")
+    same((model_row(engines.views(), "nomic-embed-text:latest").get("action"), fleet.proc_reads == scans_before + 1,
+          "load nomic-embed-text:latest on ollama:11434: done" in out.getvalue()),
+         (None, True, True), "после — метка снята, движок опрошен сразу (не через 10 с), в журнале сказано")
+
+    posts[11434] = Calls({"/api/generate": (500, {"error": "boom"}, "boom")})
+    engines.act("unload", "ollama", 11434, "qwen3:8b")
+    with contextlib.redirect_stdout(io.StringIO()):
+        queued.pop()()
+    same(model_row(engines.views(), "qwen3:8b").get("actionError"), {"op": "unload", "error": "boom", "at": 1000},
+         "отказ движка остаётся у модели словами — до следующего действия над ней")
+    posts[11434] = Calls()
+    engines.act("unload", "ollama", 11434, "qwen3:8b")
+    same(model_row(engines.views(), "qwen3:8b").get("actionError"), None,
+         "следующее действие снимает прошлую ошибку")
+
+    def crash(*_a):
+        raise RuntimeError("kaboom")
+
+    queued.clear()
+    with patched(Ollama, unload=crash):
+        engines, *_rest = act_rig()
+        engines.act("unload", "ollama", 11434, "qwen3:8b")
+        with contextlib.redirect_stdout(io.StringIO()):
+            _rest[2].pop()()
+    row = model_row(engines.views(), "qwen3:8b")
+    same((row.get("action"), row.get("actionError", {}).get("error")), (None, "RuntimeError: kaboom"),
+         "negative: действие упало — не висит «идёт» вечно, упавшее названо ошибкой")
+
+    engines, fleet, posts, queued, made = act_rig()
+    for args, want in (
+            (("stop", "ollama", 11434, "qwen3:8b"), (400, "unknown engine action 'stop'")),
+            (("load", "ollama", 9999, "qwen3:8b"), (404, "no ollama on port 9999 here")),
+            (("load", "vllm", 11434, "qwen3:8b"), (404, "no vllm on port 11434 here")),
+            (("load", "ollama", "x", "qwen3:8b"), (400, "port must be a number")),
+            (("load", "ollama", 11434, "ghost:1"), (404, "Ollama lists no model 'ghost:1'")),
+            (("load", "ollama", 11434, "gpt-oss:120b-cloud"), (400, "gpt-oss:120b-cloud runs on the engine's cloud, not on this machine")),
+            (("load", "ollama", 11434, "qwen3:8b"), (409, "qwen3:8b is loaded already")),
+            (("unload", "ollama", 11434, "nomic-embed-text:latest"), (409, "nomic-embed-text:latest is not loaded")),
+            (("load", "ollama", 11434, "nomic-embed-text:latest", "big"), (400, "contextLength must be a number of tokens")),
+            (("load", "ollama", 11434, "nomic-embed-text:latest", 100), (400, "contextLength must be 256…1048576"))):
+        same(refusal(lambda: engines.act(*args)), want, f"negative: {args[0]} {args[2]}:{args[3]} — {want[1]}")
+    same(queued, [], "negative: ни один отказ ничего не запустил")
+    engines.act("load", "ollama", 11434, "nomic-embed-text:latest", "")
+    same(made[-1:] if made else made, [], "boundary: пустое окно — окно движка; движок ещё не зовётся до нити")
+    engines, fleet, posts, queued, made = act_rig(listen=("203.0.113.20",))
+    engines.act("load", "ollama", 11434, "nomic-embed-text:latest")
+    with contextlib.redirect_stdout(io.StringIO()):
+        queued.pop()()
+    same(made, [(11434, "203.0.113.20")], "движок, привязанный к одному адресу, зовётся по нему, как при поиске")
+    silent, *_r = act_rig(engine=Answers({"/api/version": (401, None)}))
+    same(refusal(lambda: silent.act("load", "ollama", 11434, "x")), None if False else (409, "Ollama on port 11434 cannot load from here"),
+         "negative: движок хочет токен — водить его нельзя (controls пуст)")
+
+
+def test_engine_call():
+    print("POST движку — по-настоящему:")
+    class _Engine(BaseHTTPRequestHandler):
+        seen = []
+
+        def log_message(self, *_a):
+            pass
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+            type(self).seen.append((self.path, body, self.headers.get("Content-Type")))
+            status, payload = (200, {"done": True}) if self.path == "/ok" else (500, {"error": {"message": "no VRAM"}})
+            data = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Engine)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        closed = probe.getsockname()[1]
+    try:
+        with patched(urllib.request, urlopen=REAL["urlopen"]):
+            call = EngineCall(server.server_address[1], timeout=5)
+            got = [call("/ok", {"model": "m"}), call("/bad", {"model": "m"})]
+            dead = EngineCall(closed, timeout=1)("/ok", {})
+    finally:
+        server.shutdown()
+        server.server_close()
+    same(got, [(200, {"done": True}, ""), (500, {"error": {"message": "no VRAM"}}, "no VRAM")],
+         "200 — тело; отказ — код и слова движка из error.message")
+    same(_Engine.seen, [("/ok", {"model": "m"}, "application/json"), ("/bad", {"model": "m"}, "application/json")],
+         "POST с JSON-телом")
+    same((dead[0], dead[1], dead[2].startswith("no answer:")), (None, None, True), "negative: порт молчит — «no answer»")
+    same(EngineCall.TIMEOUT, 300.0, "boundary: первая загрузка — минуты, не секунды")
+
+
+def test_http_routes():
+    print("пути скаута для действий над движком:")
+    scout = make_scout()
+    got_args = []
+
+    def act(*args):
+        got_args.append(args)
+        if args[2] == 9999:
+            raise AppError("no ollama on port 9999 here", 404)
+        return {"ok": True, "engines": []}
+
+    with patched(scout.engines, act=act), Served(scout) as srv:
+        a = srv.post("/api/engines/load", {"kind": "ollama", "port": 11434, "model": "m", "contextLength": 4096})
+        b = srv.post("/api/engines/unload", {"kind": "ollama", "port": 11434, "model": "m"})
+        c = srv.post("/api/engines/load", {"kind": "ollama", "port": 9999, "model": "m"})
+    same((a, b, c), ((200, {"ok": True, "engines": []}), (200, {"ok": True, "engines": []}),
+                     (404, {"error": "no ollama on port 9999 here"})),
+         "load/unload отвечают сразу; отказ — своим кодом и словами")
+    same(got_args, [("load", "ollama", 11434, "m", 4096), ("unload", "ollama", 11434, "m", None),
+                    ("load", "ollama", 9999, "m", None)], "вид, порт, модель и окно доходят как есть")
+
+
 TESTS = (test_ollama_read, test_lmstudio_read, test_scan, test_scope_and_host, test_views_and_loop,
-         test_engine_ask, test_report_carries_scan)
+         test_engine_ask, test_report_carries_scan, test_kind_controls, test_act, test_engine_call, test_http_routes)
 
 for test in TESTS:
     blocked_before = len(BLOCKED)

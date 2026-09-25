@@ -19,6 +19,8 @@ Run: python3 scripts/report_sample.py          — say whether the file is curre
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import socket
 import sys
@@ -157,6 +159,16 @@ class ReportSample:
                         (lambda path: self.ENGINE_ANSWERS.get((port, path), (404, None)))):
             # The engines are scanned by their own thread; here, once, by hand.
             scout.engines.refresh()
+            # Acts on them from the board (2.14): one that failed, with the
+            # engine's words, and one still under way.
+            queued = []
+            scout.engines.spawn = queued.append
+            scout.engines.call = lambda port, host="127.0.0.1": (
+                lambda path, body: (500, {"error": {"message": "the instance is busy"}}, "the instance is busy"))
+            with contextlib.redirect_stdout(io.StringIO()):
+                scout.engines.act("unload", "lmstudio", 1234, "google/gemma-3-4b")
+                queued.pop()()
+                scout.engines.act("unload", "ollama", 11434, "qwen3:8b")
             return {"heartbeat": scout.report.heartbeat(), "state": scout.report.public()}
 
     def text(self) -> str:

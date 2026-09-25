@@ -1,11 +1,11 @@
 """Model engines on this machine that are not its cells: Ollama and LM Studio,
 found by their ports and process names and read through their own HTTP APIs.
 
-Read only. Nothing here loads, unloads or stops anything, and the one verb it
-has is GET: an engine that someone runs by hand next to the caravan is theirs,
-and a scout that changed it while looking would be a surprise on their
-machine. Driving an engine from the board is a later step of its own
-(docs/foreign-engines.md in the controller's repository).
+Looking is read only: the scan's one verb is GET, and an engine someone runs
+by hand next to the caravan is never changed by being looked at. Changing it
+is a separate, explicit act (2.14): the operator loads a model into an engine
+or unloads one, from the board, and only then does the scout POST to it — to
+an engine it found, about a model the engine listed.
 """
 from __future__ import annotations
 
@@ -50,6 +50,55 @@ class EngineAsk:
             return status, None
 
 
+class EngineCall:
+    """POST to one engine's port: (status, JSON payload, the engine's own
+    words). The only place the scout changes an engine, and only when the
+    operator asked. The status is None when nothing answered.
+
+    A first load reads the model from disk and warms the card — Ollama took
+    31 s on a fresh runner — so the timeout is minutes, not seconds; the call
+    runs on a thread of its own (ForeignEngines.act)."""
+
+    TIMEOUT = 300.0
+    MAX_BYTES = 1024 * 1024
+
+    def __init__(self, port: int, host: str = "127.0.0.1", timeout: float | None = None):
+        self.port = int(port)
+        self.host = host
+        self.timeout = self.TIMEOUT if timeout is None else timeout
+
+    def __call__(self, path: str, body: dict[str, Any]) -> tuple[int | None, Any, str]:
+        request = urllib.request.Request(f"http://{self.host}:{self.port}{path}", method="POST",
+                                         data=json.dumps(body).encode("utf-8"),
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as resp:
+                status, raw = resp.status, resp.read(self.MAX_BYTES)
+        except urllib.error.HTTPError as exc:
+            try:
+                status, raw = exc.code, exc.read(self.MAX_BYTES)
+            except Exception:
+                status, raw = exc.code, b""
+        except Exception as exc:
+            return None, None, f"no answer: {exc}"[:300]
+        text = raw.decode("utf-8", "replace")
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            payload = None
+        # Its words are for a refusal; an answer that did what was asked says none.
+        return status, payload, "" if 200 <= status < 300 else self.words(payload, text)
+
+    @staticmethod
+    def words(payload: Any, text: str) -> str:
+        """What the engine said went wrong, as it said it: its `error` (a text
+        or {message}), else the raw answer."""
+        error = payload.get("error") if isinstance(payload, dict) else None
+        if isinstance(error, dict):
+            error = error.get("message") or json.dumps(error)
+        return str(error or text or "").strip()[:300]
+
+
 class EngineKind:
     """One kind of engine: the port it takes when nobody changes it, what its
     processes are called, and how its API is read.
@@ -90,6 +139,27 @@ class EngineKind:
         answers is not this kind."""
         raise NotImplementedError
 
+    def controls(self, seen: dict[str, Any]) -> list[str]:
+        """What the operator can do to this engine from the board, as it
+        answered: nothing to an engine that did not answer or wants a token."""
+        return []
+
+    def load(self, call, ask, model: str, context_length: int | None) -> str:
+        """Load `model` into the engine's memory: "" when it did, else the
+        engine's own words."""
+        raise NotImplementedError
+
+    def unload(self, call, ask, model: str) -> str:
+        """Unload `model`: "" when it did, else the engine's own words."""
+        raise NotImplementedError
+
+    @staticmethod
+    def refused(status: int | None, words: str) -> str:
+        """"" for a 2xx; the reason for anything else, never empty."""
+        if status is not None and 200 <= status < 300:
+            return ""
+        return words or (f"http {status}" if status else "no answer")
+
     @staticmethod
     def row(name: str, **fields: Any) -> dict[str, Any]:
         """One model in the shape every kind reports: what a request names it
@@ -116,6 +186,23 @@ class Ollama(EngineKind):
     label = "Ollama"
     default_port = 11434
     process_prefixes = ("ollama",)
+
+    def controls(self, seen):
+        return ["load", "unload"] if seen.get("state") == "ok" else []
+
+    def load(self, call, ask, model, context_length):
+        """/api/generate with no prompt loads the model; keep_alive -1 keeps
+        it until it is unloaded — a model started from the board runs until
+        it is stopped there, as a cell does. The window is the runner's
+        num_ctx; none given, Ollama's own default."""
+        body = {"model": model, "keep_alive": -1,
+                **({"options": {"num_ctx": int(context_length)}} if context_length else {})}
+        status, _payload, words = call("/api/generate", body)
+        return self.refused(status, words)
+
+    def unload(self, call, ask, model):
+        status, _payload, words = call("/api/generate", {"model": model, "keep_alive": 0})
+        return self.refused(status, words)
 
     def read(self, ask):
         status, version = ask("/api/version")
@@ -174,6 +261,33 @@ class LmStudio(EngineKind):
     label = "LM Studio"
     default_port = 1234
     process_prefixes = ("lm studio", "lm-studio", "lmstudio", "llmster")
+
+    def controls(self, seen):
+        """Only its native API (0.4+) loads and unloads; 0.3's /api/v0 has no
+        such verbs, and is read, not driven."""
+        return ["load", "unload"] if seen.get("state") == "ok" and seen.get("api") == "v1" else []
+
+    def load(self, call, ask, model, context_length):
+        body = {"model": model, **({"context_length": int(context_length)} if context_length else {})}
+        status, _payload, words = call("/api/v1/models/load", body)
+        return self.refused(status, words)
+
+    def unload(self, call, ask, model):
+        """Every loaded instance of the model, by the ids the engine gives
+        now — asked afresh, not taken from the last scan."""
+        status, body = ask("/api/v1/models")
+        if status != 200 or not isinstance(body, dict):
+            return self.refused(status, "the model list did not answer")
+        ids = [str(i.get("id")) for m in body.get("models") or [] if isinstance(m, dict) and m.get("key") == model
+               for i in m.get("loaded_instances") or [] if isinstance(i, dict) and i.get("id")]
+        if not ids:
+            return f"{model} is not loaded"
+        for instance in ids:
+            status, _payload, words = call("/api/v1/models/unload", {"instance_id": instance})
+            reason = self.refused(status, words)
+            if reason:
+                return reason
+        return ""
 
     def read(self, ask):
         status, body = ask("/api/v1/models")
@@ -239,17 +353,124 @@ class ForeignEngines:
     #: Addresses a port listens on that take connections from anywhere.
     WILDCARDS = ("*", "0.0.0.0", "::", "[::]")
 
-    def __init__(self, machine, cells, ask: Callable[..., Any] = EngineAsk):
+    #: The window a load may ask for, in tokens.
+    CONTEXT_RANGE = (256, 1_048_576)
+
+    def __init__(self, machine, cells, ask: Callable[..., Any] = EngineAsk, call: Callable[..., Any] = EngineCall,
+                 clock: Callable[[], float] | None = None, spawn: Callable[..., Any] | None = None):
         self.machine = machine
         self.cells = cells
         self.ask = ask
+        self.call = call
+        # time.time looked up at each reading, so a patched clock is seen.
+        self.clock = clock or (lambda: time.time())
+        # How an action runs off the request: a daemon thread; a test runs it
+        # in place.
+        self.spawn = spawn or (lambda fn: threading.Thread(target=fn, daemon=True).start())
         self._views: list[dict[str, Any]] | None = None
+        # (kind, port, model) -> {op, since}: an action under way.
+        self._actions: dict[tuple[str, int, str], dict[str, Any]] = {}
+        # (kind, port, model) -> {op, error, at}: the last one that failed,
+        # until the next action on that model.
+        self._failures: dict[tuple[str, int, str], dict[str, Any]] = {}
         self._lock = threading.Lock()
 
     def views(self) -> list[dict[str, Any]] | None:
-        """The last scan: a list, or None before the first one."""
+        """The last scan, with what is being done to each model and what
+        failed last: a list, or None before the first scan."""
         with self._lock:
-            return self._views
+            if self._views is None:
+                return None
+            return [self.with_actions(v) for v in self._views]
+
+    def with_actions(self, view: dict[str, Any]) -> dict[str, Any]:
+        """A copy of one engine's view, each model carrying `action` while an
+        action on it runs and `actionError` when the last one failed."""
+        if not isinstance(view.get("models"), list):
+            return dict(view)
+        rows = []
+        for model in view["models"]:
+            key = (view["kind"], int(view["port"]), model.get("name"))
+            row = dict(model)
+            if key in self._actions:
+                row["action"] = dict(self._actions[key])
+            if key in self._failures:
+                row["actionError"] = dict(self._failures[key])
+            rows.append(row)
+        return {**view, "models": rows}
+
+    def act(self, op: str, kind_id: str, port: Any, model: str, context_length: Any = None) -> dict[str, Any]:
+        """Load a model into an engine, or unload it — on a thread of its own,
+        since a load takes seconds to minutes; answered at once, with the
+        engines as they are now (the model marked as being acted on).
+
+        Only an engine the last scan found, only an act it offers
+        (`controls`), only a model it listed — the scout is no proxy to an
+        arbitrary port — and one act per model at a time."""
+        from caravan_scout.errors import AppError
+        if op not in ("load", "unload"):
+            raise AppError(f"unknown engine action {op!r}", 400)
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            raise AppError("port must be a number", 400)
+        ctx = None
+        if context_length not in (None, ""):
+            try:
+                ctx = int(context_length)
+            except (TypeError, ValueError):
+                raise AppError("contextLength must be a number of tokens", 400)
+            if not self.CONTEXT_RANGE[0] <= ctx <= self.CONTEXT_RANGE[1]:
+                raise AppError(f"contextLength must be {self.CONTEXT_RANGE[0]}…{self.CONTEXT_RANGE[1]}", 400)
+        kind = next((k for k in self.KINDS if k.id == kind_id), None)
+        with self._lock:
+            view = next((v for v in self._views or [] if v.get("kind") == kind_id and v.get("port") == port), None)
+            if kind is None or view is None:
+                raise AppError(f"no {kind_id or 'engine'} on port {port} here", 404)
+            if op not in (view.get("controls") or []):
+                raise AppError(f"{view.get('label')} on port {port} cannot {op} from here", 409)
+            row = next((m for m in view.get("models") or [] if m.get("name") == model), None)
+            if row is None:
+                raise AppError(f"{view.get('label')} lists no model {model!r}", 404)
+            if op == "load" and row.get("remote"):
+                raise AppError(f"{model} runs on the engine's cloud, not on this machine", 400)
+            if op == "load" and row.get("loaded") is True:
+                raise AppError(f"{model} is loaded already", 409)
+            if op == "unload" and row.get("loaded") is not True:
+                raise AppError(f"{model} is not loaded", 409)
+            key = (kind_id, port, model)
+            if key in self._actions:
+                raise AppError(f"{model} is being {self._actions[key]['op']}ed already", 409)
+            self._actions[key] = {"op": op, "since": int(self.clock())}
+            self._failures.pop(key, None)
+        host = self.ask_host(self.listener_of(port))
+        self.spawn(lambda: self._run(kind, op, key, host, ctx))
+        return {"ok": True, "engines": self.views()}
+
+    def listener_of(self, port: int) -> dict[str, Any] | None:
+        """Who listens on `port` now, as the OS says — to reach the engine at
+        the address it is bound to; None when the OS will not say."""
+        heard = self.machine.listeners()
+        rows = heard.get("ports") if isinstance(heard, dict) and heard.get("ok") else []
+        return next((r for r in rows or [] if isinstance(r, dict) and r.get("port") == port), None)
+
+    def _run(self, kind, op, key, host, ctx) -> None:
+        kind_id, port, model = key
+        try:
+            call = self.call(port, host)
+            ask = self.ask(port, host)
+            reason = kind.load(call, ask, model, ctx) if op == "load" else kind.unload(call, ask, model)
+        except Exception as exc:  # noqa: BLE001 — an act that crashed failed; it must not stay "under way"
+            reason = f"{type(exc).__name__}: {exc}"[:300]
+        with self._lock:
+            self._actions.pop(key, None)
+            if reason:
+                self._failures[key] = {"op": op, "error": reason, "at": int(self.clock())}
+        print(f"[engines] {op} {model} on {kind_id}:{port}: {reason or 'done'}")
+        try:
+            self.refresh()   # the loaded state now, not in ten seconds
+        except Exception as exc:  # noqa: BLE001
+            print(f"[engines] scan after {op} failed: {exc}")
 
     def refresh(self) -> list[dict[str, Any]]:
         views = self.scan()
@@ -340,6 +561,8 @@ class ForeignEngines:
         # that wants a token has models too.
         return {"kind": kind.id, "label": kind.label, "port": int(port), "listen": scope,
                 "version": "", "models": None, **seen, "pids": sorted(pids),
+                # What the board may do to it (2.14): load and unload a model.
+                "controls": kind.controls(seen),
                 # Who ufw lets reach its port (2.13), as a cell's port says it:
                 # an engine open to the network is still closed to the
                 # controller's proxy when no rule lets it in. Asked only when

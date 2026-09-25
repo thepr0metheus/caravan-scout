@@ -107,6 +107,11 @@ class Api:
             "/api/llama-node/suspect-dismiss": lambda body: (s.suspect.dismiss(), 200),
             "/api/llama-node/purge-cache": lambda body: ({"ok": True, **s.cells.purge_models_safely()}, 200),
             "/api/llama-node/configs/delete": self._delete_config,
+            # A model of an engine next to the cells (Ollama, LM Studio) loaded
+            # or unloaded from the board (2.14): {kind, port, model,
+            # contextLength?}; answered at once, the act runs on its own.
+            "/api/engines/load": lambda body: self._engine("load", body),
+            "/api/engines/unload": lambda body: self._engine("unload", body),
         }
 
     def _start(self, body) -> tuple[Any, int]:
@@ -115,6 +120,11 @@ class Api:
         if result.get("ok"):
             self.scout.autostart.refresh(result.get("port"), payload)
         return result, 200 if result.get("ok") else 400
+
+    def _engine(self, op, body) -> tuple[Any, int]:
+        b = body()
+        return self.scout.engines.act(op, str(b.get("kind") or ""), b.get("port"), str(b.get("model") or ""),
+                                      b.get("contextLength")), 200
 
     def _autostart(self, body) -> tuple[Any, int]:
         b = body()

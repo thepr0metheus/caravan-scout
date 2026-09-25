@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.14.0 — 2026-09-25
+
+- **A model of an engine next to the cells is loaded and unloaded from the
+  board.** `POST /api/engines/load` and `/api/engines/unload` —
+  `{kind, port, model, contextLength?}` — load a model into Ollama or LM
+  Studio (0.4+) with the window asked for, or unload it. Only an engine the
+  scan found, only what its view offers (`controls`), only a model it listed,
+  one act per model at a time. The answer comes at once and the act runs on
+  its own thread: a first load takes seconds to a minute. While it runs the
+  model carries `action`; a refusal stays on it as `actionError`, in the
+  engine's own words, until the next act. Ollama keeps a model loaded from
+  the board until it is unloaded there (`keep_alive: -1`), as a started cell
+  runs until it is stopped. Looking at an engine stays read only.
+
 ## 2.13.0 — 2026-09-25
 
 - **An engine open to the network says who its firewall lets in.** An
