@@ -71,12 +71,22 @@ adds the scout (`POST /api/controller-url`: atomic rewrite, an immediate
 heartbeat, no restart) and removed when it lets go (`POST /api/unpair`). The
 page on `http://<host>:8092/` only reads.
 
-Runtime files (never in git): `state.json` (heartbeat status and the `cells`
-registry; a 1.x state's `assignments`/`applyStatus` are dropped once at
-start), `llama-node-configs/`, `var/server-cells/<port>/`, the model cache
+Runtime files (never in git): `state.json` (heartbeat status, the `cells`
+registry and the pinned `hostId`; a 1.x state's `assignments`/`applyStatus`
+are dropped once at start), `llama-node-configs/`, `var/server-cells/<port>/`, the model cache
 (`~/llama-model-cache` by default).
 
 ## Known quirks
+
+- **A renamed machine stays the same host (2.10+).** The id was the
+  hostname at every start, so `hostnamectl set-hostname` turned a machine
+  into a new host, and its cells, schedules and power buttons stayed with
+  the old one. The first run of 2.10 pins the id the scout reports then in
+  `state.json` (`[identity] host id '…' pinned` in the log); from then on a
+  rename changes only the name the board shows, at the next report. A
+  `hostId` in `config.json` still wins and becomes the pin. Deleting
+  `state.json` forgets the pin (and the cell registry). Not
+  `/etc/machine-id`: clones of one VM image share it, and macOS has none.
 
 - **Scout restarts do not interrupt cells.** systemd (`KillMode=process`) and
   launchd (`AbandonProcessGroup`) leave the llama-server / command children

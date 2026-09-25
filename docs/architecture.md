@@ -93,7 +93,7 @@ systemd/launchd units); the code lives in the package:
 | `paths.py` | Env-driven constants, the `{{…}}` placeholder contract, `DEFAULT_CONFIG` |
 | `errors.py` | `AppError` (HTTP-visible failures) |
 | `machine.py` | `Machine` — the host as its OS tells it: NVIDIA GPUs and the processes on them, CPU/RAM, who ufw lets in, listening ports, raw `nvidia-smi`, the address facing the controller; the caches that keep polling cheap |
-| `process.py` | `CellProcess` — one cell's process: start, adopt, stop, status; `CellLog` — the log kept across runs and read for a crash reason; `HostProcesses` — a process found again by its command line or by the port it serves; `MemoryScope` — the memory limits a cell is launched with (the controller's cell unit values, in a systemd user scope) |
+| `process.py` | `CellProcess` — one cell's process: start, adopt, stop, status; `CellLog` — the log kept across runs and read for a crash reason; `HostProcesses` — a process found again by its command line or by the port it serves; `MemoryScope` — the memory limits a cell is launched with (the values the controller's cell unit had, in a systemd user scope; the scout is their one home since the controller's step 6.9) |
 | `report.py` | `Report` — what the scout says about its machine: `public()` for /api/state, `heartbeat()` for the beat (same facts, same names), `pairing()` for the scout's page and the controller's first look |
 | `heartbeat.py` | `Heartbeat` — one beat to the controller, the loop of beats, and pairing; each outcome written to state.json |
 | `models.py` | `ModelFetcher` — the model cache: download from the controller with retries, verify, clean up, purge; reports progress through a callback |
@@ -108,9 +108,10 @@ systemd/launchd units); the code lives in the package:
 | `saved_configs.py` | `SavedConfigs` — launch parameters saved by hand as `llama-node.bak.<stamp>.json` |
 | `cell_assets.py` | `CellAssets` — before a command cell starts, the files its launcher runs are brought up to the controller's copies (by sha256); never blocks a start |
 | `starts.py` | `CellStart` → `LlamaStart` (checked on the request) + `LlamaLaunch` (download, artifacts, start, register — in the background) and `CommandStart` (all on the request); `CellArtifacts` — start.sh and cell.json under `var/server-cells/<port>/` |
-| `config.py` | `ScoutConfig` — config.json merged over the defaults; the token; `pair()`, its one writer |
+| `config.py` | `ScoutConfig` — config.json merged over the defaults (and what the file itself says, `from_file`); the token; `pair()`, its one writer |
+| `identity.py` | `HostIdentity` — the id this machine goes by on the board, pinned in state.json at the first run so a rename keeps it (config.json's `hostId` wins and becomes the pin); the name the board shows, the live hostname unless config.json names one |
 | `state.py` | `ScoutState` — state.json as a dict with one lock and an atomic save; drops 1.x agent keys once |
-| `scout.py` | `Scout` — the machine's scout, put together: the config, the state, the machine, the cells (and their model cache), the llama.cpp builds, the saved configs, the report and the heartbeat |
+| `scout.py` | `Scout` — the machine's scout, put together: the config, the state, the identity (settled before anything reads hostId), the machine, the cells (and their model cache), the llama.cpp builds, the saved configs, the report and the heartbeat |
 | `http.py` | `Api` — the `:8092` surface as tables, one line per path, behind the fleet-token gate; `ScoutHandler` — one request answered from them; `Power` — reboot and poweroff, each on its own path |
 | `webui.py` | `PairingPage` — the read-only page on `GET /`: the machine, its pairing, the address to enter on the controller; reads the open `/api/pairing` |
 | `app.py` | The process entry point: arguments, the scout, re-adoption, the heartbeat thread, the server |

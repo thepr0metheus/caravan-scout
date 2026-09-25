@@ -205,6 +205,8 @@ python3 -m caravan_scout.app --config config.json --state state.json
 
 | Field | Description |
 |---|---|
+| `hostId` | The id this machine goes by on the board. Leave it out: the first run pins the hostname in `state.json`, and a later rename of the machine keeps it (2.10). Set it to choose an id; the board then sees a new host, and its cells move with "move cells". |
+| `displayName` | The name the board shows. Leave it out to follow the machine's hostname, live. |
 | `controllerUrl` | The LAMA CARAVAN admin URL the heartbeat posts to — written by the controller when it adds the scout. |
 | `llamaServerBin` | Path to the `llama-server` binary (set by `install.sh`). |
 | `modelsBasePath` | Local cache dir for downloaded models. The scout deletes only files it downloaded there, so it may point at a shared folder. |

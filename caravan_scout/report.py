@@ -23,8 +23,11 @@ class Report:
     other every minute.
     """
 
-    def __init__(self, config, state, machine, cells, builds, autostart, suspect, telemetry):
+    def __init__(self, config, state, machine, cells, builds, autostart, suspect, telemetry, identity=None):
         self.config = config
+        # The name the board shows follows the machine's hostname (a rename
+        # shows at the next report); without one, the configured name.
+        self.identity = identity
         self.state = state
         self.machine = machine
         self.cells = cells
@@ -60,7 +63,7 @@ class Report:
                 "telemetry": self.telemetry.describe(),
                 "host": {
                     "id": self.config.get("hostId"),
-                    "name": self.config.get("displayName"),
+                    "name": self.identity.name() if self.identity else self.config.get("displayName"),
                     "hostname": socket.gethostname(),
                     "ip": self.machine.address(),
                 },

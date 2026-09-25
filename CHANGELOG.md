@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.10.1 — 2026-09-25
+
+- **The identity snapshot's example machine is a made-up one.** 2.10.0's
+  upgrade case used a real machine's name; the tests name no real machine.
+  No change to the scout itself.
+
+## 2.10.0 — 2026-09-25
+
+- **A renamed machine stays the same host.** The id a scout reports was the
+  hostname, read at every start: `hostnamectl set-hostname` turned a machine
+  into a new host on the board, and its cells, their schedules and
+  autostart, its power schedule and the client record of the same machine
+  stayed with the old one. The id in use is now pinned in `state.json`
+  (`[identity] host id '…' pinned` in the log), and a rename changes only
+  the name the board shows — the live hostname, at the next report. The
+  first run after the upgrade pins the id the scout reports now, so no
+  machine turns into a new host by upgrading. A `hostId` in `config.json`
+  is the operator's choice: it wins and becomes the pin; the board then sees
+  a new host, and its cells move with "move cells". Not `/etc/machine-id`:
+  clones of one VM image share it, and macOS has none.
+
 ## 2.9.1 — 2026-09-25
 
 - **The build script is the controller's copy again.** `update-llama.sh` is a

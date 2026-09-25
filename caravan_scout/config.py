@@ -26,17 +26,26 @@ class ScoutConfig:
 
     def load(self) -> dict[str, Any]:
         config = DEFAULT_CONFIG.copy()
+        # What the file itself says, apart from the defaults: a hostId or a
+        # displayName written there is the operator's choice (HostIdentity).
+        self._file: dict[str, Any] = {}
         if self.path.exists():
             payload = json.loads(self.path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
                 raise AppError("config must be a JSON object")
             config.update(payload)
+            self._file = dict(payload)
         config["listenPort"] = int(config.get("listenPort") or 8092)
         config["heartbeatIntervalSeconds"] = max(2, int(config.get("heartbeatIntervalSeconds") or 60))
         return config
 
     def get(self, key: str, default: Any = None) -> Any:
         return self.data.get(key, default)
+
+    def from_file(self, key: str) -> Any:
+        """The value config.json itself holds for `key` — None when only a
+        default supplies it."""
+        return self._file.get(key)
 
     def __getitem__(self, key: str) -> Any:
         return self.data[key]

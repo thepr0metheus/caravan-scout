@@ -20,8 +20,10 @@ ledger and the fakes.
 Run: python3 scripts/test_scout_hw.py
 """
 import builtins
+import contextlib
 import io
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -696,10 +698,19 @@ def test_nvidia_smi():
          (False, "Command '['nvidia-smi']' timed out after 5 seconds"),
          "negative: таймаут — текст исключения")
 
-    with patched(subprocess, run=NvidiaSmi(0, stdout="ok")), patched(time, time=clock.time):
+    # hostId empty in config.json is no choice: the id is the one pinned from
+    # the machine's hostname (2.10, HostIdentity) — never empty, so the
+    # displayName and "remote" fallbacks are left to a machine with no name.
+    with patched(subprocess, run=NvidiaSmi(0, stdout="ok")), patched(time, time=clock.time), \
+            patched(socket, gethostname=lambda: "box-h.lan"), contextlib.redirect_stdout(io.StringIO()):
         sources = [dig(outcome(make_scout(cfg).machine.nvidia_smi), "source")
                    for cfg in ({"hostId": "", "displayName": "Box B"}, {"hostId": "", "displayName": ""})]
-    same(sources, ["Box B", "remote"], "источник: hostId, иначе displayName, иначе «remote»")
+    with patched(subprocess, run=NvidiaSmi(0, stdout="ok")), patched(time, time=clock.time), \
+            patched(socket, gethostname=lambda: ""), contextlib.redirect_stdout(io.StringIO()):
+        sources.append(dig(outcome(make_scout({"hostId": "", "displayName": "Box B"}).machine.nvidia_smi), "source"))
+    same(sources, ["box-h", "box-h", "remote"],
+         "источник: id машины — при пустом hostId в файле прибитый hostname; машина без имени — «remote», "
+         "а не displayName (2.10)")
 
 
 TESTS = (test_nvidia_gpus, test_nvidia_apps, test_lspci_fallback, test_gpu_inventory,

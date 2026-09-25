@@ -8,6 +8,7 @@ from caravan_scout.builds import LlamaBuilds
 from caravan_scout.cells import Cells
 from caravan_scout.config import ScoutConfig
 from caravan_scout.heartbeat import Heartbeat
+from caravan_scout.identity import HostIdentity
 from caravan_scout.machine import Machine
 from caravan_scout.report import Report
 from caravan_scout.saved_configs import SavedConfigs
@@ -31,6 +32,9 @@ class Scout:
     def __init__(self, config_path: Path, state_path: Path):
         self.config = ScoutConfig(config_path)
         self.state = ScoutState(state_path)
+        # Before anything reads hostId: the id that stays across renames.
+        self.identity = HostIdentity(self.config, self.state)
+        self.identity.settle()
         self.machine = Machine(self.config)
         self.cells = Cells(self.machine, self.config, self.state)
         # The cells' model cache, also reached from here: its listing and
@@ -46,5 +50,5 @@ class Scout:
         self.telemetry = Telemetry(self.machine)
         self.watchdog = Watchdog(self.cells, self.suspect)
         self.report = Report(self.config, self.state, self.machine, self.cells, self.builds, self.autostart,
-                             self.suspect, self.telemetry)
+                             self.suspect, self.telemetry, identity=self.identity)
         self.heartbeat = Heartbeat(self.config, self.state, self.report, self.cells)
