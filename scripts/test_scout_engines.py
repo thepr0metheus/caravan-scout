@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _scout_harness import BLOCKED, REAL, Checks, RealCallBlocked, Served, make_scout, patched  # noqa: E402
 
-from caravan_scout.engines import EngineAsk, EngineCall, ForeignEngines, LmStudio, Ollama  # noqa: E402
+from caravan_scout.engines import EngineAsk, EngineCall, ForeignEngines, LmsCli, LmStudio, Ollama  # noqa: E402
 from caravan_scout.errors import AppError  # noqa: E402
 
 CHECKS = Checks("scout engines")
@@ -63,18 +63,29 @@ class Answers:
         return self.table.get(path, (404, None))
 
 
+def LMS(cli=None):
+    """LM Studio with its command line stood in for — absent unless a pin
+    hands one in: a snapshot must not run the lms of the machine it runs on."""
+    return LmStudio(cli=cli or Cli(available=False))
+
+
 class Fleet:
     """The fake machine a ForeignEngines scans: engines' replies by port,
     what listens, the process table and the scout's own cells."""
 
-    def __init__(self, engines=None, listeners=None, processes=None, cells=(), firewalls=None):
+    def __init__(self, engines=None, listeners=None, processes=None, cells=(), firewalls=None, cards=None):
         self.engines = {int(k): v for k, v in (engines or {}).items()}
+        self.cards = list(cards or [])
         self.listen = listeners
         self.procs = processes
         self.cell_ports = list(cells)
         self.firewalls = dict(firewalls or {})
         self.asked = []   # (port, host)
         self.fw_asked = []
+
+    def nvidia_gpus(self):
+        self.cards_read = getattr(self, "cards_read", 0) + 1
+        return self.cards
 
     def firewall(self, port):
         self.fw_asked.append(int(port))
@@ -95,7 +106,7 @@ class Fleet:
         return self.engines.get(int(port), Answers(silent=True))
 
     def scanner(self):
-        return ForeignEngines(self, self, ask=self.ask)
+        return ForeignEngines(self, self, ask=self.ask, kinds=(Ollama(), LMS()))
 
 
 # ── the engines' own words ──────────────────────────────────────────────────
@@ -154,7 +165,7 @@ def test_ollama_read():
         "name": "qwen3:8b", "type": "", "format": "gguf", "family": "qwen3", "params": "8.2B", "quant": "Q4_K_M",
         "fileBytes": 5_225_388_164, "remote": False, "loaded": True, "memBytes": 6_591_830_464,
         "vramBytes": 5_333_539_264, "contextLength": 4096, "maxContextLength": None,
-        "expiresAt": "2026-09-22T17:00:00+00:00", "instances": None},
+        "expiresAt": "2026-09-22T17:00:00+00:00", "staysLoaded": None, "instances": None},
          "загруженная: файл из списка установленных, память и из неё VRAM, окно и срок выгрузки — из /api/ps")
     same({k: dig(seen, "models", 1, k) for k in ("loaded", "memBytes", "vramBytes", "contextLength", "fileBytes")},
          {"loaded": False, "memBytes": None, "vramBytes": None, "contextLength": None, "fileBytes": 274_302_450},
@@ -182,7 +193,7 @@ def test_ollama_read():
 def test_lmstudio_read():
     CHECKS.section("LM Studio — что он говорит о себе:")
     ask = Answers({"/api/v1/models": (200, LMS_V1)})
-    seen = LmStudio().read(ask)
+    seen = LMS().read(ask)
     same((dig(seen, "state"), dig(seen, "api"), dig(seen, "version")), ("ok", "v1", ""),
          "родной API 0.4+ (/api/v1/models); версии он не говорит — пусто, не выдумано")
     same(ask.asked, ["/api/v1/models"], "одного списка достаточно — v0 не спрашивается")
@@ -192,7 +203,8 @@ def test_lmstudio_read():
     same(dig(seen, "models", 0), {
         "name": "google/gemma-3-4b", "type": "llm", "format": "gguf", "family": "gemma3", "params": "4B",
         "quant": "Q4_K_M", "fileBytes": 3_340_000_000, "remote": False, "loaded": True, "memBytes": None,
-        "vramBytes": None, "contextLength": 8192, "maxContextLength": 131072, "expiresAt": "", "instances": 2},
+        "vramBytes": None, "contextLength": 8192, "maxContextLength": 131072, "expiresAt": "", "staysLoaded": None,
+        "instances": 2},
          "загружена двумя экземплярами: окно — первого, потолок окна — модели; памяти LM Studio не говорит — None")
     same({k: dig(seen, "models", 1, k) for k in ("loaded", "contextLength", "maxContextLength", "quant",
                                                  "instances", "type")},
@@ -203,7 +215,7 @@ def test_lmstudio_read():
          "boundary: потолок окна, сказанный только в конфиге экземпляра, — тоже потолок")
 
     ask = Answers({"/api/v0/models": (200, LMS_V0)})
-    seen = LmStudio().read(ask)
+    seen = LMS().read(ask)
     same((dig(seen, "api"), ask.asked), ("v0", ["/api/v1/models", "/api/v0/models"]),
          "0.3 без /api/v1 — старый /api/v0")
     same([(m["name"], m["loaded"], m["contextLength"], m["maxContextLength"], m["format"])
@@ -211,11 +223,11 @@ def test_lmstudio_read():
          [("qwen2-vl-7b-instruct", True, 8192, 32768, "mlx"), ("granite-3.0-2b-instruct", False, None, 4096, "gguf")],
          "v0: загружена ли — из state, окно — только у загруженной")
     plain = Answers({"/api/v0/models": (200, {"data": [{"id": "some-model", "object": "model"}]})})
-    same(LmStudio().read(plain), None,
+    same(LMS().read(plain), None,
          "negative: обычный OpenAI-список без state — не LM Studio (свой знак — state у каждой модели)")
-    same(LmStudio().read(Answers({"/api/v1/models": (401, None)})), {"state": "auth"}, "401 — хочет токен")
-    same(LmStudio().read(Answers(silent=True)), {"state": "unreachable"}, "никто не ответил — unreachable")
-    same(LmStudio().read(Answers({"/api/v1/models": (200, {"data": []})})), None,
+    same(LMS().read(Answers({"/api/v1/models": (401, None)})), {"state": "auth"}, "401 — хочет токен")
+    same(LMS().read(Answers(silent=True)), {"state": "unreachable"}, "никто не ответил — unreachable")
+    same(LMS().read(Answers({"/api/v1/models": (200, {"data": []})})), None,
          "negative: ответ не того вида и v0 нет — не LM Studio")
 
 
@@ -261,9 +273,10 @@ def test_scan():
           1234: ([613, 614, 700], (409_600 + 102_400 + 51_200) * 1024)},
          "процессы движка: по имени и все их потомки (раннер, помощник) — as-is: два Ollama одной машины "
          "делят процессы своего имени; RAM — сумма RSS")
-    same(sorted(views[2]), ["api", "controls", "firewall", "kind", "label", "listen", "models", "pids", "port",
+    same(sorted(views[2]), ["api", "controls", "firewall", "holds", "kind", "label", "listen", "models", "pids", "port",
                             "ramBytes", "state", "version"],
-         "вид движка: вид, имя, порт, где слушает, файрвол, что с ним можно делать, версия, модели, процессы, память")
+         "вид движка: вид, имя, порт, где слушает, файрвол, что с ним можно делать и можно ли сказать, сколько держать, "
+         "версия, модели, процессы, память")
 
     print("файрвол у порта движка (2.13):")
     fw = Fleet(engines={11434: ollama(), 41000: ollama(), 1234: Answers({"/api/v1/models": (200, LMS_V1)})},
@@ -451,7 +464,7 @@ def test_kind_controls():
     print("что можно сделать с движком (2.14):")
     same([Ollama().controls({"state": s}) for s in ("ok", "auth", "unreachable")], [["load", "unload"], [], []],
          "Ollama отвечает — загрузить и выгрузить; хочет токен или молчит — ничего")
-    same([LmStudio().controls({"state": "ok", "api": a}) for a in ("v1", "v0")], [["load", "unload"], []],
+    same([LMS().controls({"state": "ok", "api": a}) for a in ("v1", "v0")], [["load", "unload"], []],
          "negative: LM Studio 0.3 (только /api/v0) читается, но не водится — у старого API нет таких глаголов")
 
     c = Calls()
@@ -473,34 +486,35 @@ def test_kind_controls():
          "boundary: отказ без слов — хотя бы код, а не пустая строка «успех»")
 
     c = Calls()
-    same((LmStudio().load(c, None, "google/gemma-3-4b", 8192), c.made),
+    same((LMS().load(c, None, "google/gemma-3-4b", 8192), c.made),
          ("", [("/api/v1/models/load", {"model": "google/gemma-3-4b", "context_length": 8192})]),
          "LM Studio: /api/v1/models/load с окном")
     c = Calls()
-    same((LmStudio().unload(c, Answers({"/api/v1/models": (200, LMS_V1)}), "google/gemma-3-4b"), c.made),
+    same((LMS().unload(c, Answers({"/api/v1/models": (200, LMS_V1)}), "google/gemma-3-4b"), c.made),
          ("", [("/api/v1/models/unload", {"instance_id": "google/gemma-3-4b"}),
                ("/api/v1/models/unload", {"instance_id": "google/gemma-3-4b:2"})]),
          "выгрузка — каждый экземпляр по id, спрошенным заново, а не из прошлого поиска")
-    same(LmStudio().unload(Calls(), Answers({"/api/v1/models": (200, LMS_V1)}), "text-embedding-nomic"),
+    same(LMS().unload(Calls(), Answers({"/api/v1/models": (200, LMS_V1)}), "text-embedding-nomic"),
          "text-embedding-nomic is not loaded", "negative: экземпляров нет — так и сказано")
-    same(LmStudio().unload(Calls(), Answers(silent=True), "x"), "the model list did not answer",
+    same(LMS().unload(Calls(), Answers(silent=True), "x"), "the model list did not answer",
          "negative: список моделей не ответил — выгружать нечего по чьим-то словам")
     c = Calls({"/api/v1/models/unload": (404, {"error": {"message": "no such instance"}}, "no such instance")})
-    same((LmStudio().unload(c, Answers({"/api/v1/models": (200, LMS_V1)}), "google/gemma-3-4b"), len(c.made)),
+    same((LMS().unload(c, Answers({"/api/v1/models": (200, LMS_V1)}), "google/gemma-3-4b"), len(c.made)),
          ("no such instance", 1), "первый отказ останавливает выгрузку и назван словами движка")
 
 
-def act_rig(listen=("127.0.0.1",), engine=None):
-    fleet = Fleet(engines={11434: engine or ollama()}, processes={},
+def act_rig(listen=("127.0.0.1",), engine=None, cards=None, kinds=None):
+    fleet = Fleet(engines={11434: engine or ollama()}, processes={}, cards=cards,
                   listeners={"ok": True, "ports": [{"port": 11434, "proc": "ollama", "pid": 5100,
                                                     "addrs": list(listen)}]})
     posts, queued, made = {}, [], []
 
-    def call(port, host="127.0.0.1"):
-        made.append((port, host))
+    def call(port, host="127.0.0.1", timeout=None):
+        made.append((port, host) if timeout is None else (port, host, timeout))
         return posts.setdefault(port, Calls())
 
-    engines = ForeignEngines(fleet, fleet, ask=fleet.ask, call=call, clock=lambda: 1000.0, spawn=queued.append)
+    engines = ForeignEngines(fleet, fleet, ask=fleet.ask, call=call, clock=lambda: 1000.0, spawn=queued.append,
+                             kinds=kinds or (Ollama(), LMS()))
     with contextlib.redirect_stdout(io.StringIO()):
         engines.refresh()
     return engines, fleet, posts, queued, made
@@ -583,6 +597,246 @@ def test_act():
          "negative: движок хочет токен — водить его нельзя (controls пуст)")
 
 
+QWEN2_INFO = {"general.architecture": "qwen2", "qwen2.block_count": 24, "qwen2.attention.head_count": 14,
+              "qwen2.attention.head_count_kv": 2, "qwen2.embedding_length": 896}
+
+
+class Cli:
+    """LM Studio's command line, stood in for: what it prints for each
+    command, and every command asked."""
+
+    def __init__(self, answer=(0, ""), available=True):
+        self.answer = answer
+        self.is_there = available
+        self.made = []
+        self.waits = []
+
+    def available(self):
+        return self.is_there
+
+    def __call__(self, args, timeout=None):
+        self.made.append(list(args))
+        self.waits.append(timeout)
+        return self.answer if self.is_there else (None, "no lms at /home/u/.lmstudio/bin/lms")
+
+
+PS_JSON = json.dumps([
+    {"modelKey": "google/gemma-3-4b", "identifier": "google/gemma-3-4b", "ttlMs": 3_600_000,
+     "lastUsedTime": 1_790_327_477_075, "contextLength": 8192},
+    {"modelKey": "mlx-community/qwen3-4b", "identifier": "qwen-fast", "ttlMs": None, "lastUsedTime": 1_790_300_000_000}])
+
+
+def test_holds():
+    print("сколько держать загруженную модель (2.15):")
+    same([Ollama().holds({"state": s}) for s in ("ok", "auth")], [True, False],
+         "Ollama отвечает — держать можно сказать (keep_alive); хочет токен — нет")
+    same([LMS(Cli()).holds({"state": "ok", "api": "v1"}), LMS().holds({"state": "ok", "api": "v1"}),
+          LMS(Cli()).holds({"state": "ok", "api": "v0"})], [True, False, False],
+         "LM Studio — только где есть lms: REST-загрузка срока не знает; 0.3 не водится вовсе")
+    c = Calls()
+    Ollama().load(c, None, "m", 4096, 900)
+    same(c.made[0][1], {"model": "m", "keep_alive": 900, "options": {"num_ctx": 4096}},
+         "Ollama: срок — keep_alive в секундах после последнего запроса")
+    c = Calls()
+    Ollama().load(c, None, "m", None, None)
+    same(c.made[0][1]["keep_alive"], -1, "без срока — -1: пока не выгрузят")
+
+    cli, c = Cli((0, "Model loaded successfully in 429.00ms.")), Calls()
+    same((LMS(cli).load(c, None, "google/gemma-3-4b", 8192, 3600), cli.made, c.made),
+         ("", [["load", "google/gemma-3-4b", "-y", "--ttl", "3600", "-c", "8192"]], []),
+         "LM Studio со сроком — `lms load --ttl`; REST не зовётся")
+    same(cli.waits, [LmsCli.LOAD], "…и ждёт её минуты, как загрузку, а не секунды, как оценку")
+    cli = Cli()
+    LMS(cli).load(Calls(), None, "m", None, 60)
+    same(cli.made, [["load", "m", "-y", "--ttl", "60"]], "без окна — без -c")
+    cli, c = Cli(), Calls()
+    LMS(cli).load(c, None, "m", 2048, None)
+    same((cli.made, c.made), ([], [("/api/v1/models/load", {"model": "m", "context_length": 2048})]),
+         "без срока — прежняя REST-загрузка, командная строка не зовётся")
+    failed = Cli((1, "Loading x 0% ⠇\nModel not found\nNo model found that matches model key \"x\".\n"
+                     "To see a list of all downloaded models, run:\n    lms ls\n"))
+    same(LMS(failed).load(Calls(), None, "x", None, 60),
+         'Model not found — No model found that matches model key "x".',
+         "отказ lms — его словами, без строк загрузки и советов")
+    same([LMS(Cli((None, "lms did not finish in 300 s"))).load(Calls(), None, "x", None, 60),
+          LMS(Cli((2, ""))).load(Calls(), None, "x", None, 60)],
+         ["lms did not finish in 300 s", "lms load exited with 2"],
+         "negative: не дождались или упал молча — так и сказано, а не «загружено»")
+
+    cli = Cli((0, PS_JSON))
+    seen = LMS(cli).read(Answers({"/api/v1/models": (200, LMS_V1)}))
+    same([(m["name"], m["expiresAt"], m["staysLoaded"]) for m in seen["models"]],
+         [("google/gemma-3-4b", "2026-09-25T10:11:17+00:00", False), ("text-embedding-nomic", "", None),
+          ("mlx-community/qwen3-4b", "", True)],
+         "из `lms ps`: со сроком — когда отпустит (последний раз + срок); без срока — держит, пока не выгрузят; "
+         "не загружена — ни того ни другого")
+    same(cli.made, [["ps", "--json"]], "lms ps спрашивается один раз за чтение")
+    cli = Cli((0, PS_JSON))
+    idle = {"models": [{**m, "loaded_instances": []} for m in LMS_V1["models"]]}
+    LMS(cli).read(Answers({"/api/v1/models": (200, idle)}))
+    same(cli.made, [], "negative: ничего не загружено — lms ps не зовётся (0,13 с на каждый скан — только по делу)")
+    for answer, why in (((1, "boom"), "lms ps упал"), ((0, "not json"), "ответ не JSON"),
+                        ((1, PS_JSON), "lms ps вышел с ошибкой, хоть и напечатал список")):
+        seen = LMS(Cli(answer)).read(Answers({"/api/v1/models": (200, LMS_V1)}))
+        same((seen["models"][0]["expiresAt"], seen["models"][0]["staysLoaded"]), ("", None),
+             f"negative: {why} — срок неизвестен (None), а не «держит вечно»")
+
+    engines, fleet, posts, queued, made = act_rig()
+    for hold, want in (("soon", (400, "hold must be a number of seconds, or -1 to keep until unloaded")),
+                       (30, (400, "hold must be 60…604800 seconds, or -1 to keep until unloaded")),
+                       (604801, (400, "hold must be 60…604800 seconds, or -1 to keep until unloaded")),
+                       (True, (400, "hold must be 60…604800 seconds, or -1 to keep until unloaded"))):
+        same(refusal(lambda: engines.act("load", "ollama", 11434, "nomic-embed-text:latest", hold=hold)), want,
+             f"negative: срок {hold!r} — {want[1]}")
+    same(queued, [], "negative: ни один из них ничего не запустил")
+    for hold, keep in ((60, 60), ("3600", 3600), (604800, 604800), (-1, -1), ("-1", -1), (None, -1), ("", -1)):
+        engines, fleet, posts, queued, made = act_rig()
+        engines.act("load", "ollama", 11434, "nomic-embed-text:latest", hold=hold)
+        with contextlib.redirect_stdout(io.StringIO()):
+            queued.pop()()
+        same(posts[11434].made[-1][1]["keep_alive"], keep, f"срок {hold!r} → keep_alive {keep}")
+    lms_engine = Answers({"/api/v1/models": (200, {"models": [{**m, "loaded_instances": []} for m in LMS_V1["models"]]})})
+    fleet = Fleet(engines={1234: lms_engine}, processes={},
+                  listeners={"ok": True, "ports": [{"port": 1234, "proc": "llmster", "pid": 7, "addrs": ["127.0.0.1"]}]})
+    engines = ForeignEngines(fleet, fleet, ask=fleet.ask, call=lambda *a, **k: Calls(), clock=lambda: 1000.0,
+                             spawn=lambda fn: None, kinds=(Ollama(), LMS()))
+    with contextlib.redirect_stdout(io.StringIO()):
+        engines.refresh()
+    same((refusal(lambda: engines.act("load", "lmstudio", 1234, "google/gemma-3-4b", hold=900)),
+          engines.act("load", "lmstudio", 1234, "google/gemma-3-4b", hold=-1)["ok"]),
+         ((409, "LM Studio on port 1234 cannot be told how long to hold a model from here"), True),
+         "negative: LM Studio без lms — срок не принимается (409), а «пока не выгрузят» — да")
+
+
+def test_estimate():
+    print("сколько займёт загрузка (2.15):")
+    row = {"name": "qwen2.5:0.5b", "fileBytes": 397_807_936}
+    c = Calls({"/api/show": (200, {"model_info": QWEN2_INFO}, "")})
+    same((Ollama().estimate(c, None, row, 8192), c.made),
+         ({"needBytes": 397_807_936 + 12_288 * 8192, "basis": "weights+cache"}, [("/api/show", {"model": "qwen2.5:0.5b"})]),
+         "Ollama с окном: файл + кэш окна по форме модели из /api/show (24 слоя × 2 KV-головы × (64+64) × 2 байта на токен)")
+    c = Calls()
+    same((Ollama().estimate(c, None, row, None), c.made), ({"needBytes": 397_807_936, "basis": "weights"}, []),
+         "без окна — только файл («не меньше»): окно Ollama выберет сама и заранее не скажет; /api/show не спрашивается")
+    same(Ollama().estimate(Calls({"/api/show": (500, None, "boom")}), None, row, 8192),
+         {"needBytes": 397_807_936, "basis": "weights"}, "negative: /api/show отказал — файл, а не выдуманный кэш")
+    same(Ollama().estimate(Calls({"/api/show": (200, {"model_info": {"general.architecture": "x"}}, "")}), None, row, 8192),
+         {"needBytes": 397_807_936, "basis": "weights"}, "negative: форма модели не сказана — только файл")
+    same(Ollama().estimate(Calls(), None, {"name": "m", "fileBytes": None}, 8192), {"needBytes": None, "basis": ""},
+         "negative: размер файла неизвестен — «не знаю», а не ноль")
+    same([Ollama.cache_per_token(i) for i in (
+            QWEN2_INFO,
+            {"general.architecture": "g", "g.block_count": 18, "g.attention.head_count_kv": 1,
+             "g.attention.key_length": 256, "g.attention.value_length": 256},
+            {"general.architecture": "h", "h.block_count": 3, "h.attention.head_count_kv": [8, 0, 8],
+             "h.attention.key_length": 128},
+            {"general.architecture": "q", "q.block_count": 24, "q.attention.head_count_kv": 2},
+            {})],
+         [12_288, 18 * 1 * 512 * 2, 16 * 256 * 2, None, None],
+         "кэш на токен: ширина головы — из key/value_length или embedding/heads; головы по слоям — списком; нет формы — None")
+
+    lms_row = {"name": "google/gemma-4-e4b", "fileBytes": 6_326_932_336}
+    cli = Cli((0, "Model: google/gemma-4-e4b\nContext Length: 8,192\nEstimated GPU Memory:   6.52 GiB\n"
+                  "Estimated Total Memory: 6.52 GiB\n"))
+    same((LmStudio(cli=cli).estimate(None, None, lms_row, 8192), cli.made),
+         ({"needBytes": int(6.52 * 1024 ** 3), "basis": "engine"},
+          [["load", "google/gemma-4-e4b", "--estimate-only", "-y", "-c", "8192"]]),
+         "LM Studio: его собственная оценка (`lms load --estimate-only`) на окно из запроса")
+    cli = Cli((0, "Estimated GPU Memory:   647.41 MiB\n"))
+    same((LmStudio(cli=cli).estimate(None, None, lms_row, None), cli.made[0][-1]),
+         ({"needBytes": int(647.41 * 1024 ** 2), "basis": "engine"}, "-y"),
+         "без окна — его окно по умолчанию, без -c; МиБ считаются МиБ")
+    for answer, why in (((None, "no lms at /x"), "командной строки нет"),
+                        ((0, "No model found that matches model key \"x\"."), "числа не сказано"),
+                        ((1, "Estimated GPU Memory: 1 GiB"), "команда упала — её число не берётся")):
+        same(LmStudio(cli=Cli(answer)).estimate(None, None, lms_row, 8192),
+             {"needBytes": 6_326_932_336, "basis": "weights"}, f"negative: {why} — только файл")
+
+
+def test_lms_cli():
+    print("командная строка LM Studio:")
+    import tempfile
+    with tempfile.TemporaryDirectory() as home:
+        runs = []
+        cli = LmsCli(home=home, run=lambda argv, timeout: (runs.append((argv, timeout)), (0, "\x1b[32mok\x1b[0m\rdone"))[1])
+        same((cli.available(), cli(["ps"]), runs), (False, (None, f"no lms at {home}/.lmstudio/bin/lms"), []),
+             "negative: lms нет — так и сказано, ничего не запускалось")
+        path = Path(home) / ".lmstudio" / "bin" / "lms"
+        path.parent.mkdir(parents=True)
+        path.write_text("#!/bin/sh\n")
+        path.chmod(0o755)
+        same((cli.available(), cli(["ps", "--json"]), runs),
+             (True, (0, "ok\ndone"), [([str(path), "ps", "--json"], LmsCli.QUICK)]),
+             "есть — зовётся по полному пути, цвета сняты, возврат каретки — перевод строки; ждать — секунды")
+        cli(["load", "m"], timeout=300)
+        same(runs[-1][1], 300, "долгой команде — свой срок")
+
+
+def test_memory_question():
+    print("не влезет — спросить (2.15):")
+    big = {**OLLAMA_TAGS, "models": [*OLLAMA_TAGS["models"][:2], {"name": "big:70b", "size": 42 * 1024 ** 3,
+                                                                "details": OLLAMA_DETAILS}]}
+    engine = ollama(tags=(200, big))
+    engines, fleet, posts, queued, made = act_rig(engine=engine, cards=[{"memoryFreeMiB": "600"}, {"memoryFreeMiB": "400"}])
+    got = engines.act("load", "ollama", 11434, "big:70b")
+    same((got["ok"], got["short"], got["error"]),
+         (False, {"needBytes": 42 * 1024 ** 3, "freeBytes": 1000 * 1024 ** 2, "basis": "weights",
+                  "error": "big:70b needs at least about 42.0 GiB of VRAM, the cards have 1.0 GiB free"},
+          "big:70b needs at least about 42.0 GiB of VRAM, the cards have 1.0 GiB free"),
+         "не влезает в свободное на всех картах вместе — вопрос, а не отказ: сколько нужно, сколько есть, откуда число")
+    same((queued, model_row(got["engines"], "big:70b").get("action")), ([], None),
+         "negative: ничего не начато и не помечено «грузится»")
+    got = engines.act("load", "ollama", 11434, "big:70b", force=True)
+    same((got["ok"], len(queued), model_row(got["engines"], "big:70b").get("action")),
+         (True, 1, {"op": "load", "since": 1000}), "«грузить всё равно» — грузится, не спрашивая")
+    engines, fleet, posts, queued, made = act_rig(engine=ollama(tags=(200, big)),
+                                                  cards=[{"memoryFreeMiB": str(30 * 1024)}, {"memoryFreeMiB": str(13 * 1024)}])
+    same((engines.act("load", "ollama", 11434, "big:70b")["ok"], len(queued)), (True, 1),
+         "boundary: на одной карте не влезла бы, на двух вместе — влезает: движок раскладывает модель по картам")
+    engines, fleet, posts, queued, made = act_rig(engine=ollama(tags=(200, big)), cards=[{"memoryFreeMiB": str(42 * 1024)}])
+    same(engines.act("load", "ollama", 11434, "big:70b")["ok"], True, "boundary: нужно ровно столько, сколько свободно, — влезает")
+
+    class Racing(Ollama):
+        """An estimate during which another request loads the same model."""
+        def estimate(self, call, ask, row, ctx):
+            engines.act("load", "ollama", 11434, "big:70b", force=True)
+            return {"needBytes": 1, "basis": "weights"}
+
+    engines, fleet, posts, queued, made = act_rig(engine=ollama(tags=(200, big)), cards=[{"memoryFreeMiB": "600"}],
+                                                  kinds=(Racing(), LmStudio(cli=Cli(available=False))))
+    same((refusal(lambda: engines.act("load", "ollama", 11434, "big:70b")), len(queued)),
+         ((409, "big:70b is being loaded already"), 1),
+         "negative: пока шла оценка, ту же модель начал грузить другой запрос — второй раз не начинается")
+    for cards, why in (([], "nvidia-smi нет"), ([{"memoryFreeMiB": "[N/A]"}], "карта не сказала"),
+                       ([{"memoryFreeMiB": "900"}, {"memoryFreeMiB": "[N/A]"}], "одна из карт не сказала")):
+        engines, fleet, posts, queued, made = act_rig(engine=ollama(tags=(200, big)), cards=cards)
+        same((engines.act("load", "ollama", 11434, "big:70b")["ok"], len(queued)), (True, 1),
+             f"negative: {why} — нехватка не известна, не спрашивается")
+    engines, fleet, posts, queued, made = act_rig(engine=ollama(tags=(200, big)), cards=[])
+    engines.act("load", "ollama", 11434, "big:70b", 8192)
+    same((made, posts), ([], {}), "negative: карты молчат — и движок об оценке не спрашивается: сравнить не с чем")
+    engines, fleet, posts, queued, made = act_rig(engine=ollama(tags=(200, big)), cards=[{"memoryFreeMiB": "1"}])
+    same((engines.act("unload", "ollama", 11434, "qwen3:8b")["ok"], getattr(fleet, "cards_read", 0)), (True, 0),
+         "выгрузка память не спрашивает")
+    engines, fleet, posts, queued, made = act_rig(engine=ollama(tags=(200, big)), cards=[{"memoryFreeMiB": "600"}])
+    engines.act("load", "ollama", 11434, "nomic-embed-text:latest", 2048)
+    same(made, [(11434, "127.0.0.1", EngineCall.QUICK)],
+         "оценка с окном спрашивает движок коротким сроком (запрос доски ждёт 15 с), по адресу его привязки")
+    same(posts[11434].made, [("/api/show", {"model": "nomic-embed-text:latest"})],
+         "…и только /api/show: загрузка ещё не начата")
+    lms_cli = Cli((0, "Estimated GPU Memory:   6.52 GiB\n"))
+    lms_engine = Answers({"/api/v1/models": (200, LMS_V1)})
+    fleet = Fleet(engines={1234: lms_engine}, processes={}, cards=[{"memoryFreeMiB": "4096"}],
+                  listeners={"ok": True, "ports": [{"port": 1234, "proc": "llmster", "pid": 7, "addrs": ["127.0.0.1"]}]})
+    engines = ForeignEngines(fleet, fleet, ask=fleet.ask, call=lambda *a, **k: Calls(), clock=lambda: 1000.0,
+                             spawn=lambda fn: None, kinds=(Ollama(), LmStudio(cli=lms_cli)))
+    with contextlib.redirect_stdout(io.StringIO()):
+        engines.refresh()
+    got = engines.act("load", "lmstudio", 1234, "text-embedding-nomic")
+    same(got.get("short", {}).get("error"), "text-embedding-nomic needs about 6.5 GiB of VRAM, the cards have 4.0 GiB free",
+         "оценка самого движка — без «не меньше»")
+
+
 def test_engine_call():
     print("POST движку — по-настоящему:")
     class _Engine(BaseHTTPRequestHandler):
@@ -629,8 +883,8 @@ def test_http_routes():
     scout = make_scout()
     got_args = []
 
-    def act(*args):
-        got_args.append(args)
+    def act(*args, force=False, hold=None):
+        got_args.append((*args, force) if hold is None else (*args, force, hold))
         if args[2] == 9999:
             raise AppError("no ollama on port 9999 here", 404)
         return {"ok": True, "engines": []}
@@ -639,15 +893,22 @@ def test_http_routes():
         a = srv.post("/api/engines/load", {"kind": "ollama", "port": 11434, "model": "m", "contextLength": 4096})
         b = srv.post("/api/engines/unload", {"kind": "ollama", "port": 11434, "model": "m"})
         c = srv.post("/api/engines/load", {"kind": "ollama", "port": 9999, "model": "m"})
+        d = srv.post("/api/engines/load", {"kind": "ollama", "port": 11434, "model": "m", "force": True})
+        e = srv.post("/api/engines/load", {"kind": "ollama", "port": 11434, "model": "m", "force": "true"})
+        srv.post("/api/engines/load", {"kind": "ollama", "port": 11434, "model": "m", "hold": 900})
     same((a, b, c), ((200, {"ok": True, "engines": []}), (200, {"ok": True, "engines": []}),
                      (404, {"error": "no ollama on port 9999 here"})),
          "load/unload отвечают сразу; отказ — своим кодом и словами")
-    same(got_args, [("load", "ollama", 11434, "m", 4096), ("unload", "ollama", 11434, "m", None),
-                    ("load", "ollama", 9999, "m", None)], "вид, порт, модель и окно доходят как есть")
+    same(got_args[:3], [("load", "ollama", 11434, "m", 4096, False), ("unload", "ollama", 11434, "m", None, False),
+                        ("load", "ollama", 9999, "m", None, False)], "вид, порт, модель и окно доходят как есть")
+    same([x[5] for x in got_args[3:5]], [True, False],
+         "«грузить всё равно» (2.15) — только настоящее true; строка \"true\" — не согласие")
+    same(got_args[5:], [("load", "ollama", 11434, "m", None, False, 900)], "сколько держать (2.15) доходит как есть")
 
 
 TESTS = (test_ollama_read, test_lmstudio_read, test_scan, test_scope_and_host, test_views_and_loop,
-         test_engine_ask, test_report_carries_scan, test_kind_controls, test_act, test_engine_call, test_http_routes)
+         test_engine_ask, test_report_carries_scan, test_kind_controls, test_act, test_holds, test_estimate, test_lms_cli,
+         test_memory_question, test_engine_call, test_http_routes)
 
 for test in TESTS:
     blocked_before = len(BLOCKED)

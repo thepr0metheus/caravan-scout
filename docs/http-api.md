@@ -45,12 +45,17 @@ holds a report. `null` before the first scan, `[]` when none was found.
              "loaded": true,     // null when the engine did not say
              "memBytes": 6591830464, "vramBytes": 5333539264,   // Ollama only
              "contextLength": 4096, "maxContextLength": null,
-             "expiresAt": "2026-09-22T17:00:00+00:00",          // Ollama's keep_alive
+             "expiresAt": "2026-09-22T17:00:00+00:00",          // when it is let go if unused: Ollama's
+                                 // keep_alive; LM Studio's lastUsedTime + ttlMs from `lms ps` (2.15)
+             "staysLoaded": null, // LM Studio (2.15): true — no idle limit, false — one;
+                                 // null when `lms ps` did not say (Ollama says it by a far expiresAt)
              "instances": null,                                 // LM Studio's loaded copies
              "action": {"op": "load", "since": 1790000000},     // an act under way (2.14)
              "actionError": {"op": "unload", "error": "…", "at": 1790000000}}],  // the last one refused
  "controls": ["load", "unload"], // what the board may do to it (2.14): nothing to an engine
                                  // that did not answer, wants a token, or is LM Studio 0.3
+ "holds": true,                  // a load can say how long the model stays unused (2.15):
+                                 // Ollama always; LM Studio only where its `lms` is
  "firewall": {"state": "blocked", "allowedFrom": []},   // who ufw lets reach its port
                                  // (2.13; as a cell's port); null on 127.0.0.1 only
  "pids": [5100, 5151],           // its processes and their children: the cards'
@@ -77,7 +82,7 @@ A model the engine does not describe keeps `null`, never a zero. `models` is
 | `/api/llama-node/suspect-dismiss` | Hide the "fresh build, crashing cells" banner for the current build (2.6+); a new build can raise it again. |
 | `/api/llama-node/purge-cache` | Manually clear the model cache (safe variant). |
 | `/api/llama-node/configs/delete` | Delete a saved launch config by `filename`. |
-| `/api/engines/load` · `/api/engines/unload` | Load a model into an engine next to the cells, or unload it (2.14+): `{kind, port, model, contextLength?}`. Only an engine the last scan found, only an act its `controls` offer, only a model it listed (not an Ollama cloud model; not one loaded already, or not loaded, as the act needs), one act per model at a time — else 400/404/409 with the reason. Answered at once with `{ok, engines}`, the model carrying `action: {op, since}`; the act runs on a thread of its own (a first load takes seconds to a minute), then the engines are scanned again. Ollama: `/api/generate` with no prompt and `keep_alive: -1` (kept until unloaded; `contextLength` → `options.num_ctx`), unload with `keep_alive: 0`. LM Studio 0.4+: `/api/v1/models/load` (`context_length`) and `/api/v1/models/unload` for every loaded instance. A refusal stays on the model as `actionError: {op, error, at}` — the engine's own words — until the next act on it. |
+| `/api/engines/load` · `/api/engines/unload` | Load a model into an engine next to the cells, or unload it (2.14+): `{kind, port, model, contextLength?, force?, hold?}`. Only an engine the last scan found, only an act its `controls` offer, only a model it listed (not an Ollama cloud model; not one loaded already, or not loaded, as the act needs), one act per model at a time — else 400/404/409 with the reason. Answered at once with `{ok, engines}`, the model carrying `action: {op, since}`; the act runs on a thread of its own (a first load takes seconds to a minute), then the engines are scanned again. Ollama: `/api/generate` with no prompt and `keep_alive: -1` (kept until unloaded; `contextLength` → `options.num_ctx`), unload with `keep_alive: 0`. LM Studio 0.4+: `/api/v1/models/load` (`context_length`) and `/api/v1/models/unload` for every loaded instance. A refusal stays on the model as `actionError: {op, error, at}` — the engine's own words — until the next act on it. A load that would not fit into the cards' free VRAM (all cards together, read at the moment) does not start (2.15): the answer is `{ok: false, short: {needBytes, freeBytes, basis, error}, error, engines}` with status 200 — a question, not a refusal — and the same load with `force: true` (a JSON true, nothing else) starts anyway. `basis` says where the need comes from: `engine` (LM Studio's own `lms load --estimate-only`), `weights+cache` (Ollama: the file and the cache of the window asked for, from `/api/show`), `weights` (the file alone: at least that much). Cards that do not say their free memory (no nvidia-smi, `[N/A]`) ask nothing, and then the engine is not asked for an estimate either. `hold` (2.15): seconds the model stays loaded after its last use, 60…604800; `-1` or none — until unloaded. Only where the engine's view says `holds` (else 409): Ollama takes it as `keep_alive`; LM Studio through `lms load --ttl` (its REST load has no idle limit; without a hold the REST load is used as before). |
 | `/api/host/reboot` · `/api/host/poweroff` | Power-cycle or power off this machine (`sudo -n systemctl …`; needs passwordless sudo for it and says so when it is missing). Two paths, not a flag: poweroff cannot be undone from the board. |
 
 ## Auth

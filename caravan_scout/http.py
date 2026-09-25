@@ -124,7 +124,7 @@ class Api:
     def _engine(self, op, body) -> tuple[Any, int]:
         b = body()
         return self.scout.engines.act(op, str(b.get("kind") or ""), b.get("port"), str(b.get("model") or ""),
-                                      b.get("contextLength")), 200
+                                      b.get("contextLength"), force=b.get("force") is True, hold=b.get("hold")), 200
 
     def _autostart(self, body) -> tuple[Any, int]:
         b = body()

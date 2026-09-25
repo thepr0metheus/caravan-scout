@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _scout_harness import TMP, make_scout, patched  # noqa: E402
 
 import caravan_scout.report as report_module  # noqa: E402
+from caravan_scout.engines import LmStudio, Ollama  # noqa: E402
 from caravan_scout.process import CellProcess  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -84,6 +85,10 @@ class ReportSample:
              "size_bytes": 3_340_000_000, "params_string": "4B", "max_context_length": 131072, "format": "gguf",
              "loaded_instances": [{"id": "google/gemma-3-4b", "config": {"context_length": 8192, "parallel": 4}}]}]}),
     }
+    # LM Studio's command line (2.15): the loaded model's idle limit, which
+    # its REST list does not say.
+    LMS_PS = [{"identifier": "google/gemma-3-4b", "modelKey": "google/gemma-3-4b", "ttlMs": 3_600_000,
+               "lastUsedTime": (NOW - 600) * 1000}]
     CPU = {"loadPct": 12.5, "load1": 1.5, "ncpu": 12, "logicalCores": 12, "availableCores": 12,
            "physicalCores": 6, "ram": {"usedGb": 18.2, "totalGb": 62.7}}
     METRICS = {"promptTps": 812.5, "genTps": 41.3, "requestsProcessing": 1, "ctxMax": 8192, "ctxUsed": 2048}
@@ -156,14 +161,15 @@ class ReportSample:
                 patched(socket, gethostname=lambda: "box-a.lan"), patched(time, time=lambda: float(self.NOW)), \
                 patched(sys, platform="linux"), patched(report_module, APP_VERSION=self.VERSION), \
                 patched(scout.engines, ask=lambda port, host="127.0.0.1":
-                        (lambda path: self.ENGINE_ANSWERS.get((port, path), (404, None)))):
+                        (lambda path: self.ENGINE_ANSWERS.get((port, path), (404, None))),
+                        kinds=(Ollama(), LmStudio(cli=SampleLms(self.LMS_PS)))):
             # The engines are scanned by their own thread; here, once, by hand.
             scout.engines.refresh()
             # Acts on them from the board (2.14): one that failed, with the
             # engine's words, and one still under way.
             queued = []
             scout.engines.spawn = queued.append
-            scout.engines.call = lambda port, host="127.0.0.1": (
+            scout.engines.call = lambda port, host="127.0.0.1", timeout=None: (
                 lambda path, body: (500, {"error": {"message": "the instance is busy"}}, "the instance is busy"))
             with contextlib.redirect_stdout(io.StringIO()):
                 scout.engines.act("unload", "lmstudio", 1234, "google/gemma-3-4b")
@@ -179,6 +185,21 @@ class ReportSample:
 
     def write(self) -> None:
         self.PATH.write_text(self.text(), encoding="utf-8")
+
+
+class SampleLms:
+    """LM Studio's command line in the sample: `lms ps --json` answers with
+    the loaded model's idle limit; nothing else is asked of it."""
+
+    def __init__(self, ps):
+        self.ps = ps
+
+    @staticmethod
+    def available() -> bool:
+        return True
+
+    def __call__(self, args, timeout=None):
+        return (0, json.dumps(self.ps)) if list(args) == ["ps", "--json"] else (1, "not in the sample")
 
 
 def main(argv: list[str]) -> int:

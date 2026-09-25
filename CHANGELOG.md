@@ -1,5 +1,27 @@
 # Changelog
 
+## 2.15.0 — 2026-09-25
+
+- **A load that would not fit into the cards' free memory asks first.** A
+  load reads the cards' free VRAM at that moment (all cards together: an
+  engine spreads a model across them) and, when the model would not fit,
+  does not start: the answer is `{ok: false, short: {needBytes, freeBytes,
+  basis, error}}` with status 200 — a question for the operator, not a
+  refusal — and the same load with `force: true` starts anyway. The need is
+  as close as each engine lets it be: LM Studio's own estimate (`lms load
+  --estimate-only`), Ollama's file and the cache of the window asked for
+  (from the model's shape in `/api/show`), else the file alone — at least
+  that much. Cards that do not say their free memory ask nothing.
+- **A load says how long the model stays unused.** `hold`: seconds after
+  its last use (a minute to a week), or `-1` / none — until unloaded, as
+  before. Ollama takes it as `keep_alive`; LM Studio through `lms load
+  --ttl`, the one way it takes an idle limit. The view says `holds` — where
+  a hold can be kept — and a hold is refused (409) elsewhere. LM Studio's
+  loaded models say when they will be let go (`expiresAt`, from `lms ps
+  --json`) or `staysLoaded`.
+- `LmsCli` — LM Studio's own command line, `~/.lmstudio/bin/lms`, for what its
+  REST API does not say or do.
+
 ## 2.14.0 — 2026-09-25
 
 - **A model of an engine next to the cells is loaded and unloaded from the

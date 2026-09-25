@@ -5,16 +5,22 @@ Looking is read only: the scan's one verb is GET, and an engine someone runs
 by hand next to the caravan is never changed by being looked at. Changing it
 is a separate, explicit act (2.14): the operator loads a model into an engine
 or unloads one, from the board, and only then does the scout POST to it — to
-an engine it found, about a model the engine listed.
+an engine it found, about a model the engine listed. A load that would not fit
+into the cards' free memory is asked about before it starts (2.15).
 """
 from __future__ import annotations
 
 import ipaddress
 import json
+import os
+import re
+import subprocess
 import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 
@@ -60,6 +66,9 @@ class EngineCall:
     runs on a thread of its own (ForeignEngines.act)."""
 
     TIMEOUT = 300.0
+    #: A question that loads nothing (/api/show): answered in a moment, and
+    #: asked inside the board's request, which gives up after 15 s.
+    QUICK = 10.0
     MAX_BYTES = 1024 * 1024
 
     def __init__(self, port: int, host: str = "127.0.0.1", timeout: float | None = None):
@@ -97,6 +106,63 @@ class EngineCall:
         if isinstance(error, dict):
             error = error.get("message") or json.dumps(error)
         return str(error or text or "").strip()[:300]
+
+
+class LmsCli:
+    """LM Studio's own command line, `lms`, where every LM Studio — the app
+    and its windowless daemon — puts it: ~/.lmstudio/bin/lms.
+
+    Its REST API loads and unloads; only the command line gives LM Studio's
+    own estimate of what a load takes (2.15). It talks to the LM Studio of
+    the user it runs as, which is the scout's.
+
+    (argv, timeout) -> (exit code, what it printed, colours stripped); the
+    code is None when it did not run or did not finish.
+    """
+
+    #: The estimate is a moment (0.14 s measured); it is asked inside the
+    #: board's request, which gives up after 15 s.
+    QUICK = 10.0
+    #: A load reads the model from disk and warms the card.
+    LOAD = 300.0
+    ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+    def __init__(self, home: str | Path | None = None, run: Callable[..., Any] | None = None):
+        self._home = home
+        self._run = run or self.run_process
+
+    @property
+    def path(self) -> Path:
+        # The home looked up when asked, not when the scout was built.
+        return Path(self._home or Path.home()) / ".lmstudio" / "bin" / "lms"
+
+    def available(self) -> bool:
+        return os.access(self.path, os.X_OK)
+
+    @staticmethod
+    def said(text: str) -> str:
+        """What a failed command said, without its progress lines and the
+        advice after them: "Model not found — No model found that matches
+        model key "x"."."""
+        lines = [line.strip() for line in str(text or "").splitlines()
+                 if line.strip() and not line.strip().startswith("Loading ")]
+        return " — ".join(lines[:2])[:300]
+
+    def __call__(self, args: list[str], timeout: float | None = None) -> tuple[int | None, str]:
+        if not self.available():
+            return None, f"no lms at {self.path}"
+        code, text = self._run([str(self.path), *args], self.QUICK if timeout is None else timeout)
+        return code, self.ANSI.sub("", text or "").replace("\r", "\n")
+
+    @staticmethod
+    def run_process(argv: list[str], timeout: float) -> tuple[int | None, str]:
+        try:
+            done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return None, f"lms did not finish in {timeout:.0f} s"
+        except OSError as exc:
+            return None, f"lms did not run: {exc}"
+        return done.returncode, (done.stdout or "") + (done.stderr or "")
 
 
 class EngineKind:
@@ -144,14 +210,30 @@ class EngineKind:
         answered: nothing to an engine that did not answer or wants a token."""
         return []
 
-    def load(self, call, ask, model: str, context_length: int | None) -> str:
+    def holds(self, seen: dict[str, Any]) -> bool:
+        """Whether a load can say how long the model stays when nobody uses
+        it (2.15)."""
+        return False
+
+    def load(self, call, ask, model: str, context_length: int | None, hold: int | None = None) -> str:
         """Load `model` into the engine's memory: "" when it did, else the
-        engine's own words."""
+        engine's own words. `hold`: seconds the model stays loaded after its
+        last use; None — until it is unloaded."""
         raise NotImplementedError
 
     def unload(self, call, ask, model: str) -> str:
         """Unload `model`: "" when it did, else the engine's own words."""
         raise NotImplementedError
+
+    def estimate(self, call, ask, row: dict[str, Any], context_length: int | None) -> dict[str, Any]:
+        """What loading `row` takes, as closely as this kind can say:
+        {"needBytes", "basis"}. The basis names how it was reached —
+        "engine" (the engine's own estimate), "weights+cache" (the file and
+        the cache of the window asked for), "weights" (the file alone: at
+        least that much); needBytes is None, and the basis "", when nothing
+        says."""
+        weights = self.number(row.get("fileBytes"))
+        return {"needBytes": weights, "basis": "weights" if weights else ""}
 
     @staticmethod
     def refused(status: int | None, words: str) -> str:
@@ -168,8 +250,8 @@ class EngineKind:
         None, never a zero."""
         return {"name": name, "type": "", "format": "", "family": "", "params": "", "quant": "",
                 "fileBytes": None, "remote": False, "loaded": None, "memBytes": None, "vramBytes": None,
-                "contextLength": None, "maxContextLength": None, "expiresAt": "", "instances": None,
-                **fields}
+                "contextLength": None, "maxContextLength": None, "expiresAt": "", "staysLoaded": None,
+                "instances": None, **fields}
 
 
 class Ollama(EngineKind):
@@ -190,12 +272,16 @@ class Ollama(EngineKind):
     def controls(self, seen):
         return ["load", "unload"] if seen.get("state") == "ok" else []
 
-    def load(self, call, ask, model, context_length):
-        """/api/generate with no prompt loads the model; keep_alive -1 keeps
-        it until it is unloaded — a model started from the board runs until
-        it is stopped there, as a cell does. The window is the runner's
-        num_ctx; none given, Ollama's own default."""
-        body = {"model": model, "keep_alive": -1,
+    def holds(self, seen):
+        return "load" in self.controls(seen)
+
+    def load(self, call, ask, model, context_length, hold=None):
+        """/api/generate with no prompt loads the model. keep_alive is how
+        long it stays after its last request: the hold asked for, in
+        seconds, or -1 — until it is unloaded, as a started cell runs until
+        it is stopped. The window is the runner's num_ctx; none given,
+        Ollama's own default."""
+        body = {"model": model, "keep_alive": int(hold) if hold else -1,
                 **({"options": {"num_ctx": int(context_length)}} if context_length else {})}
         status, _payload, words = call("/api/generate", body)
         return self.refused(status, words)
@@ -203,6 +289,42 @@ class Ollama(EngineKind):
     def unload(self, call, ask, model):
         status, _payload, words = call("/api/generate", {"model": model, "keep_alive": 0})
         return self.refused(status, words)
+
+    def estimate(self, call, ask, row, context_length):
+        """The file, and — when a window is asked for — its cache, from the
+        model's shape as /api/show says it. Without a window Ollama picks its
+        own, which it does not say before loading: the file alone, at least."""
+        base = super().estimate(call, ask, row, context_length)
+        if not base["needBytes"] or not context_length:
+            return base
+        status, payload, _words = call("/api/show", {"model": row.get("name")})
+        info = payload.get("model_info") if status == 200 and isinstance(payload, dict) else None
+        per_token = self.cache_per_token(info) if isinstance(info, dict) else None
+        if not per_token:
+            return base
+        return {"needBytes": base["needBytes"] + per_token * int(context_length), "basis": "weights+cache"}
+
+    @classmethod
+    def cache_per_token(cls, info: dict[str, Any]) -> int | None:
+        """Bytes one token of the window takes in the cache at 16 bit: each
+        layer keeps a key and a value for every KV head. A model whose heads
+        vary by layer says a list. None when the model does not say its
+        shape. Layers that attend over a sliding window keep less than this:
+        an estimate from above."""
+        arch = str(info.get("general.architecture") or "")
+        layers = cls.number(info.get(f"{arch}.block_count"))
+        heads = cls.number(info.get(f"{arch}.attention.head_count"))
+        width = cls.number(info.get(f"{arch}.embedding_length"))
+        key = cls.number(info.get(f"{arch}.attention.key_length")) or (width // heads if width and heads else None)
+        value = cls.number(info.get(f"{arch}.attention.value_length")) or key
+        kv = info.get(f"{arch}.attention.head_count_kv")
+        if isinstance(kv, list):
+            kv_heads = sum(n for n in (cls.number(x) for x in kv) if n) or None
+        else:
+            kv_heads = cls.number(kv) * layers if cls.number(kv) and layers else None
+        if not kv_heads or not key or not value:
+            return None
+        return kv_heads * (key + value) * 2
 
     def read(self, ask):
         status, version = ask("/api/version")
@@ -261,13 +383,33 @@ class LmStudio(EngineKind):
     label = "LM Studio"
     default_port = 1234
     process_prefixes = ("lm studio", "lm-studio", "lmstudio", "llmster")
+    #: "Estimated GPU Memory:   5.89 GiB", as `lms load --estimate-only` prints it.
+    ESTIMATE = re.compile(r"Estimated GPU Memory:\s*([0-9][0-9.,]*)\s*([KMGT]i?B|B)\b")
+    UNITS = {"B": 1, "KB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3, "TB": 1000 ** 4,
+             "KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3, "TiB": 1024 ** 4}
+
+    def __init__(self, cli: LmsCli | None = None):
+        self.cli = cli or LmsCli()
 
     def controls(self, seen):
         """Only its native API (0.4+) loads and unloads; 0.3's /api/v0 has no
         such verbs, and is read, not driven."""
         return ["load", "unload"] if seen.get("state") == "ok" and seen.get("api") == "v1" else []
 
-    def load(self, call, ask, model, context_length):
+    def holds(self, seen):
+        """Its REST load has no idle limit; only `lms load --ttl` sets one —
+        so only where the command line is."""
+        return "load" in self.controls(seen) and self.cli.available()
+
+    def load(self, call, ask, model, context_length, hold=None):
+        """The REST load (/api/v1/models/load) — until it is unloaded; with
+        a hold, `lms load --ttl`, the one way LM Studio takes an idle limit.
+        The command line loads the variant the model list names, as the
+        REST load does."""
+        if hold:
+            code, text = self.cli(["load", model, "-y", "--ttl", str(int(hold)),
+                                   *(["-c", str(int(context_length))] if context_length else [])], timeout=LmsCli.LOAD)
+            return "" if code == 0 else (LmsCli.said(text) or f"lms load exited with {code}")
         body = {"model": model, **({"context_length": int(context_length)} if context_length else {})}
         status, _payload, words = call("/api/v1/models/load", body)
         return self.refused(status, words)
@@ -289,6 +431,18 @@ class LmStudio(EngineKind):
                 return reason
         return ""
 
+    def estimate(self, call, ask, row, context_length):
+        """LM Studio's own estimate for the window asked for (its default
+        without one), from `lms load --estimate-only`; the file alone when
+        the command line is not there or says no number."""
+        code, text = self.cli(["load", str(row.get("name") or ""), "--estimate-only", "-y",
+                               *(["-c", str(int(context_length))] if context_length else [])])
+        found = self.ESTIMATE.search(text) if code == 0 else None
+        if not found:
+            return super().estimate(call, ask, row, context_length)
+        size = float(found.group(1).replace(",", ""))
+        return {"needBytes": int(size * self.UNITS[found.group(2)]), "basis": "engine"}
+
     def read(self, ask):
         status, body = ask("/api/v1/models")
         if status is None:
@@ -296,8 +450,10 @@ class LmStudio(EngineKind):
         if status in (401, 403):
             return {"state": "auth"}
         if status == 200 and isinstance(body, dict) and isinstance(body.get("models"), list):
+            rows = [m for m in body["models"] if isinstance(m, dict) and self.text(m.get("key"))]
+            limits = self.idle_limits() if any(m.get("loaded_instances") for m in rows) else {}
             return {"state": "ok", "version": "", "api": "v1",
-                    "models": [self._v1(m) for m in body["models"] if isinstance(m, dict) and self.text(m.get("key"))]}
+                    "models": [self._v1(m, limits) for m in rows]}
         status, body = ask("/api/v0/models")
         rows = body.get("data") if status == 200 and isinstance(body, dict) else None
         # Its own mark: every entry says whether it is loaded. A plain
@@ -307,17 +463,38 @@ class LmStudio(EngineKind):
                     "models": [self._v0(m) for m in rows if self.text(m.get("id"))]}
         return None
 
-    def _v1(self, m):
+    def idle_limits(self) -> dict[str, dict[str, Any]]:
+        """{instance id: {ttlMs, lastUsedTime}} of what is loaded, from `lms
+        ps --json` — the REST list does not say an idle limit. {} when the
+        command line is not there or does not answer: then nobody knows."""
+        code, text = self.cli(["ps", "--json"])
+        try:
+            rows = json.loads(text) if code == 0 else None
+        except ValueError:
+            rows = None
+        return {str(r.get("identifier")): r for r in rows or [] if isinstance(r, dict) and r.get("identifier")}
+
+    def _v1(self, m, limits=None):
         instances = [i for i in (m.get("loaded_instances") or []) if isinstance(i, dict)]
         config = instances[0].get("config") if instances and isinstance(instances[0].get("config"), dict) else {}
         quant = m.get("quantization")
+        # The first instance's idle limit, as the window is the first one's:
+        # when it is let go (lastUsedTime + ttlMs), or that it stays until
+        # unloaded (ttlMs null). Neither when `lms ps` did not say.
+        limit = (limits or {}).get(str(instances[0].get("id"))) if instances else None
+        ttl = self.number(limit.get("ttlMs")) if limit else None
+        last = self.number(limit.get("lastUsedTime")) if limit else None
+        expires = ""
+        if ttl and last:
+            expires = datetime.fromtimestamp((last + ttl) / 1000, tz=timezone.utc).isoformat(timespec="seconds")
         return self.row(self.text(m.get("key"), 200), type=self.text(m.get("type"), 20), format=self.text(m.get("format"), 20),
                         family=self.text(m.get("architecture"), 40), params=self.text(m.get("params_string"), 20),
                         quant=self.text(quant.get("name") if isinstance(quant, dict) else quant, 20),
                         fileBytes=self.number(m.get("size_bytes")), loaded=bool(instances),
                         contextLength=self.number(config.get("context_length")) if instances else None,
                         maxContextLength=self.number(m.get("max_context_length") or config.get("max_context_length")),
-                        instances=len(instances))
+                        instances=len(instances), expiresAt=expires,
+                        staysLoaded=(limit.get("ttlMs") is None) if limit else None)
 
     def _v0(self, m):
         loaded = str(m.get("state") or "") == "loaded"
@@ -355,13 +532,20 @@ class ForeignEngines:
 
     #: The window a load may ask for, in tokens.
     CONTEXT_RANGE = (256, 1_048_576)
+    #: How long a loaded model may stay unused before the engine lets it go,
+    #: in seconds (2.15): a minute to a week; -1 or none — until unloaded.
+    HOLD_RANGE = (60, 7 * 24 * 3600)
 
     def __init__(self, machine, cells, ask: Callable[..., Any] = EngineAsk, call: Callable[..., Any] = EngineCall,
-                 clock: Callable[[], float] | None = None, spawn: Callable[..., Any] | None = None):
+                 clock: Callable[[], float] | None = None, spawn: Callable[..., Any] | None = None,
+                 kinds: tuple[EngineKind, ...] | None = None):
         self.machine = machine
         self.cells = cells
         self.ask = ask
         self.call = call
+        # The kinds it looks for; a test hands in kinds with their command
+        # line stood in for.
+        self.kinds = kinds or self.KINDS
         # time.time looked up at each reading, so a patched clock is seen.
         self.clock = clock or (lambda: time.time())
         # How an action runs off the request: a daemon thread; a test runs it
@@ -399,14 +583,25 @@ class ForeignEngines:
             rows.append(row)
         return {**view, "models": rows}
 
-    def act(self, op: str, kind_id: str, port: Any, model: str, context_length: Any = None) -> dict[str, Any]:
+    def act(self, op: str, kind_id: str, port: Any, model: str, context_length: Any = None,
+            force: bool = False, hold: Any = None) -> dict[str, Any]:
         """Load a model into an engine, or unload it — on a thread of its own,
         since a load takes seconds to minutes; answered at once, with the
         engines as they are now (the model marked as being acted on).
 
         Only an engine the last scan found, only an act it offers
         (`controls`), only a model it listed — the scout is no proxy to an
-        arbitrary port — and one act per model at a time."""
+        arbitrary port — and one act per model at a time.
+
+        A load that would not fit into the cards' free memory does not start
+        (2.15): the answer is {"ok": False, "short": {…}} — a question to
+        the operator, not a refusal — and the same load with `force` starts
+        anyway. Engines put what does not fit into RAM, where it runs
+        slower, or fail to load; the cells already on the cards keep theirs.
+
+        `hold` (2.15): seconds a loaded model stays after its last use, where
+        the engine can be told (`holds` in its view); -1 or none — until it
+        is unloaded."""
         from caravan_scout.errors import AppError
         if op not in ("load", "unload"):
             raise AppError(f"unknown engine action {op!r}", 400)
@@ -422,30 +617,88 @@ class ForeignEngines:
                 raise AppError("contextLength must be a number of tokens", 400)
             if not self.CONTEXT_RANGE[0] <= ctx <= self.CONTEXT_RANGE[1]:
                 raise AppError(f"contextLength must be {self.CONTEXT_RANGE[0]}…{self.CONTEXT_RANGE[1]}", 400)
-        kind = next((k for k in self.KINDS if k.id == kind_id), None)
+        idle = None
+        if hold not in (None, "", -1, "-1"):
+            try:
+                idle = int(hold)
+            except (TypeError, ValueError):
+                raise AppError("hold must be a number of seconds, or -1 to keep until unloaded", 400)
+            if not self.HOLD_RANGE[0] <= idle <= self.HOLD_RANGE[1]:
+                raise AppError(f"hold must be {self.HOLD_RANGE[0]}…{self.HOLD_RANGE[1]} seconds, "
+                               "or -1 to keep until unloaded", 400)
+        kind = next((k for k in self.kinds if k.id == kind_id), None)
+        key = (kind_id, port, model)
         with self._lock:
-            view = next((v for v in self._views or [] if v.get("kind") == kind_id and v.get("port") == port), None)
-            if kind is None or view is None:
-                raise AppError(f"no {kind_id or 'engine'} on port {port} here", 404)
-            if op not in (view.get("controls") or []):
-                raise AppError(f"{view.get('label')} on port {port} cannot {op} from here", 409)
-            row = next((m for m in view.get("models") or [] if m.get("name") == model), None)
-            if row is None:
-                raise AppError(f"{view.get('label')} lists no model {model!r}", 404)
-            if op == "load" and row.get("remote"):
-                raise AppError(f"{model} runs on the engine's cloud, not on this machine", 400)
-            if op == "load" and row.get("loaded") is True:
-                raise AppError(f"{model} is loaded already", 409)
-            if op == "unload" and row.get("loaded") is not True:
-                raise AppError(f"{model} is not loaded", 409)
-            key = (kind_id, port, model)
-            if key in self._actions:
-                raise AppError(f"{model} is being {self._actions[key]['op']}ed already", 409)
+            row = self._target(op, kind, key)
+            view = next(v for v in self._views or [] if v.get("kind") == kind_id and v.get("port") == port)
+            if idle and not view.get("holds"):
+                raise AppError(f"{view.get('label')} on port {port} cannot be told how long to hold a model "
+                               "from here", 409)
+        host = self.ask_host(self.listener_of(port))
+        if op == "load" and not force:
+            short = self.short_of_memory(kind, port, host, row, ctx)
+            if short:
+                return {"ok": False, "short": short, "error": short["error"], "engines": self.views()}
+        with self._lock:
+            self._target(op, kind, key)   # again: another act may have begun while memory was asked
             self._actions[key] = {"op": op, "since": int(self.clock())}
             self._failures.pop(key, None)
-        host = self.ask_host(self.listener_of(port))
-        self.spawn(lambda: self._run(kind, op, key, host, ctx))
+        self.spawn(lambda: self._run(kind, op, key, host, ctx, idle))
         return {"ok": True, "engines": self.views()}
+
+    def _target(self, op: str, kind: EngineKind | None, key: tuple[str, int, str]) -> dict[str, Any]:
+        """The model row an act is about, as the last scan saw it — or the
+        refusal that says why there is none to act on. Called with the lock
+        held."""
+        from caravan_scout.errors import AppError
+        kind_id, port, model = key
+        view = next((v for v in self._views or [] if v.get("kind") == kind_id and v.get("port") == port), None)
+        if kind is None or view is None:
+            raise AppError(f"no {kind_id or 'engine'} on port {port} here", 404)
+        if op not in (view.get("controls") or []):
+            raise AppError(f"{view.get('label')} on port {port} cannot {op} from here", 409)
+        row = next((m for m in view.get("models") or [] if m.get("name") == model), None)
+        if row is None:
+            raise AppError(f"{view.get('label')} lists no model {model!r}", 404)
+        if op == "load" and row.get("remote"):
+            raise AppError(f"{model} runs on the engine's cloud, not on this machine", 400)
+        if op == "load" and row.get("loaded") is True:
+            raise AppError(f"{model} is loaded already", 409)
+        if op == "unload" and row.get("loaded") is not True:
+            raise AppError(f"{model} is not loaded", 409)
+        if key in self._actions:
+            raise AppError(f"{model} is being {self._actions[key]['op']}ed already", 409)
+        return dict(row)
+
+    def free_vram(self) -> int | None:
+        """Bytes free on this machine's cards now, all of them together — an
+        engine spreads a model across cards. None when a card does not say
+        (no nvidia-smi, a card that answers [N/A]): then nothing is known to
+        be short, and nothing is asked."""
+        free = []
+        for card in self.machine.nvidia_gpus() or []:
+            try:
+                free.append(float(card.get("memoryFreeMiB")))
+            except (TypeError, ValueError, AttributeError):
+                return None
+        return int(sum(free) * 1024 * 1024) if free else None
+
+    def short_of_memory(self, kind, port, host, row, ctx) -> dict[str, Any] | None:
+        """{needBytes, freeBytes, basis, error} when the model would not fit
+        into the cards' free memory; None when it would, or when either side
+        is not known. The cards are read first: when they say nothing, the
+        engine is not asked for an estimate nobody could compare."""
+        free = self.free_vram()
+        if free is None:
+            return None
+        estimate = kind.estimate(self.call(port, host, timeout=EngineCall.QUICK), self.ask(port, host), row, ctx)
+        need = estimate.get("needBytes")
+        if not need or need <= free:
+            return None
+        least = "at least " if estimate.get("basis") == "weights" else ""
+        return {"needBytes": int(need), "freeBytes": int(free), "basis": estimate.get("basis") or "",
+                "error": f"{row.get('name')} needs {least}about {need / 1024 ** 3:.1f} GiB of VRAM, "
+                         f"the cards have {free / 1024 ** 3:.1f} GiB free"}
 
     def listener_of(self, port: int) -> dict[str, Any] | None:
         """Who listens on `port` now, as the OS says — to reach the engine at
@@ -454,12 +707,12 @@ class ForeignEngines:
         rows = heard.get("ports") if isinstance(heard, dict) and heard.get("ok") else []
         return next((r for r in rows or [] if isinstance(r, dict) and r.get("port") == port), None)
 
-    def _run(self, kind, op, key, host, ctx) -> None:
+    def _run(self, kind, op, key, host, ctx, hold=None) -> None:
         kind_id, port, model = key
         try:
             call = self.call(port, host)
             ask = self.ask(port, host)
-            reason = kind.load(call, ask, model, ctx) if op == "load" else kind.unload(call, ask, model)
+            reason = kind.load(call, ask, model, ctx, hold) if op == "load" else kind.unload(call, ask, model)
         except Exception as exc:  # noqa: BLE001 — an act that crashed failed; it must not stay "under way"
             reason = f"{type(exc).__name__}: {exc}"[:300]
         with self._lock:
@@ -495,7 +748,7 @@ class ForeignEngines:
         own = {int(port) for port, _cell in self.cells.all()}
         procs = self.machine.processes()
         found = []
-        for kind in self.KINDS:
+        for kind in self.kinds:
             for port, listener in self.candidates(kind, rows, own):
                 seen = kind.read(self.ask(port, self.ask_host(listener)))
                 if seen is None:
@@ -561,8 +814,10 @@ class ForeignEngines:
         # that wants a token has models too.
         return {"kind": kind.id, "label": kind.label, "port": int(port), "listen": scope,
                 "version": "", "models": None, **seen, "pids": sorted(pids),
-                # What the board may do to it (2.14): load and unload a model.
+                # What the board may do to it (2.14): load and unload a model;
+                # whether a load can say how long it stays unused (2.15).
                 "controls": kind.controls(seen),
+                "holds": kind.holds(seen),
                 # Who ufw lets reach its port (2.13), as a cell's port says it:
                 # an engine open to the network is still closed to the
                 # controller's proxy when no rule lets it in. Asked only when
