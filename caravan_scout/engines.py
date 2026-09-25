@@ -335,10 +335,16 @@ class ForeignEngines:
 
     def view(self, kind, port, listener, seen, procs) -> dict[str, Any]:
         pids = self.pids(kind, listener, procs)
+        scope = self.scope(listener)
         # A kind that did not answer says no models: None, not [] — an engine
         # that wants a token has models too.
-        return {"kind": kind.id, "label": kind.label, "port": int(port), "listen": self.scope(listener),
+        return {"kind": kind.id, "label": kind.label, "port": int(port), "listen": scope,
                 "version": "", "models": None, **seen, "pids": sorted(pids),
+                # Who ufw lets reach its port (2.13), as a cell's port says it:
+                # an engine open to the network is still closed to the
+                # controller's proxy when no rule lets it in. Asked only when
+                # it listens beyond this machine — on 127.0.0.1 no rule matters.
+                "firewall": self.machine.firewall(port) if scope != "loopback" else None,
                 # The memory its processes hold (RSS); None when ps will not say.
                 "ramBytes": (None if procs is None else sum(int(procs[p]["rssKb"]) for p in pids) * 1024)}
 

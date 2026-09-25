@@ -47,6 +47,8 @@ holds a report. `null` before the first scan, `[]` when none was found.
              "contextLength": 4096, "maxContextLength": null,
              "expiresAt": "2026-09-22T17:00:00+00:00",          // Ollama's keep_alive
              "instances": null}],                               // LM Studio's loaded copies
+ "firewall": {"state": "blocked", "allowedFrom": []},   // who ufw lets reach its port
+                                 // (2.13; as a cell's port); null on 127.0.0.1 only
  "pids": [5100, 5151],           // its processes and their children: the cards'
                                  // memory is named by these
  "ramBytes": 1283457024}         // their RSS; null when ps did not answer

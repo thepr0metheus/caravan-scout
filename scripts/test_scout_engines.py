@@ -66,12 +66,18 @@ class Fleet:
     """The fake machine a ForeignEngines scans: engines' replies by port,
     what listens, the process table and the scout's own cells."""
 
-    def __init__(self, engines=None, listeners=None, processes=None, cells=()):
+    def __init__(self, engines=None, listeners=None, processes=None, cells=(), firewalls=None):
         self.engines = {int(k): v for k, v in (engines or {}).items()}
         self.listen = listeners
         self.procs = processes
         self.cell_ports = list(cells)
+        self.firewalls = dict(firewalls or {})
         self.asked = []   # (port, host)
+        self.fw_asked = []
+
+    def firewall(self, port):
+        self.fw_asked.append(int(port))
+        return self.firewalls.get(int(port), {"state": "unknown"})
 
     def listeners(self):
         return self.listen if self.listen is not None else {"ok": False, "error": "ss: ss", "ports": []}
@@ -253,9 +259,22 @@ def test_scan():
           1234: ([613, 614, 700], (409_600 + 102_400 + 51_200) * 1024)},
          "процессы движка: по имени и все их потомки (раннер, помощник) — as-is: два Ollama одной машины "
          "делят процессы своего имени; RAM — сумма RSS")
-    same(sorted(views[2]), ["api", "kind", "label", "listen", "models", "pids", "port", "ramBytes", "state",
-                            "version"],
-         "вид движка: вид, имя, порт, где слушает, версия, модели, процессы, память")
+    same(sorted(views[2]), ["api", "firewall", "kind", "label", "listen", "models", "pids", "port", "ramBytes",
+                            "state", "version"],
+         "вид движка: вид, имя, порт, где слушает, файрвол, версия, модели, процессы, память")
+
+    print("файрвол у порта движка (2.13):")
+    fw = Fleet(engines={11434: ollama(), 41000: ollama(), 1234: Answers({"/api/v1/models": (200, LMS_V1)})},
+               listeners=json.loads(json.dumps(LISTEN)), processes={},
+               firewalls={11434: {"state": "blocked", "allowedFrom": []},
+                          41000: {"state": "restricted", "allowedFrom": ["10.0.0.0/24"]}})
+    views = fw.scanner().scan()
+    same({v["port"]: v["firewall"] for v in views},
+         {11434: {"state": "blocked", "allowedFrom": []}, 41000: {"state": "restricted", "allowedFrom": ["10.0.0.0/24"]},
+          1234: None},
+         "слушает сеть — сказано, кого ufw пускает на его порт, как у ячейки: никого, или только этих")
+    same(sorted(fw.fw_asked), [11434, 41000],
+         "negative: движок только на 127.0.0.1 — ufw не спрашивается: снаружи к нему и так не попасть")
 
     for name, answer, proc, port, shown in (
             ("хочет токен, процесс его", {"/api/v1/models": (401, None)}, "LM Studio", 1234, True),
@@ -394,7 +413,7 @@ def test_report_carries_scan():
                   listeners={"ok": True, "ports": [{"port": 11434, "proc": "ollama", "pid": 5100,
                                                     "addrs": ["0.0.0.0"]}]})
     quiet = {"gpus": lambda: [], "compute_apps": lambda: [], "cpu_ram": lambda: {}, "address": lambda: "10.0.0.5",
-             "listeners": fleet.listeners, "processes": fleet.processes}
+             "listeners": fleet.listeners, "processes": fleet.processes, "firewall": fleet.firewall}
     with patched(scout.machine, **quiet), patched(scout.engines, ask=fleet.ask), \
             patched(socket, gethostname=lambda: "box-a.lan"), contextlib.redirect_stdout(io.StringIO()):
         before = (scout.report.public()["engines"], scout.report.heartbeat()["engines"])

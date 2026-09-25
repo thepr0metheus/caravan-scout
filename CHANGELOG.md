@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.13.0 — 2026-09-25
+
+- **An engine open to the network says who its firewall lets in.** An
+  engine that listens beyond 127.0.0.1 could still be closed to the
+  controller's proxy: ufw on its machine had no rule for its port, and the
+  board offered to route to it. Each engine's view carries `firewall` —
+  `{state, allowedFrom}`, the same reading a cell's port gets (open, all,
+  restricted, blocked, unknown) — or `null` for an engine on 127.0.0.1 only,
+  where no rule matters and ufw is not asked.
+
 ## 2.12.1 — 2026-09-25
 
 - **The engines snapshot's example address is a documentation one.** 2.12.0's
