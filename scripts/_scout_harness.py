@@ -173,7 +173,34 @@ def make_scout(config=None, state=None):
     (home / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
     if state is not None:
         (home / "state.json").write_text(json.dumps(state), encoding="utf-8")
-    return Scout(home / "config.json", home / "state.json")
+    scout = Scout(home / "config.json", home / "state.json")
+    # The engines' servers (2.16) read /proc and the user's home: a snapshot
+    # sees a machine of its own — an empty home, and processes nobody can name.
+    (home / "home").mkdir()
+    scout.engines.servers.procs = QuietProcs()
+    scout.engines.servers._home = home / "home"
+    return scout
+
+
+class QuietProcs:
+    """The machine's side of an engine's server in a snapshot: no process
+    can be named, and nothing is started or stopped for real."""
+
+    @staticmethod
+    def uid():
+        return None
+
+    @staticmethod
+    def info(pid):
+        return None
+
+    @staticmethod
+    def spawn(argv, env, kind):
+        raise RealCallBlocked(f"an engine server spawned in a snapshot: {argv[:1]!r}")
+
+    @staticmethod
+    def terminate(pid, grace):
+        raise RealCallBlocked(f"an engine server stopped in a snapshot: {pid}")
 
 
 class Served:

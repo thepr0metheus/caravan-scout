@@ -112,6 +112,10 @@ class Api:
             # contextLength?}; answered at once, the act runs on its own.
             "/api/engines/load": lambda body: self._engine("load", body),
             "/api/engines/unload": lambda body: self._engine("unload", body),
+            # The engine's server itself started or stopped (2.16): {kind,
+            # port}; answered at once, the start or stop runs on its own.
+            "/api/engines/start": lambda body: self._server("start", body),
+            "/api/engines/stop": lambda body: self._server("stop", body),
         }
 
     def _start(self, body) -> tuple[Any, int]:
@@ -125,6 +129,10 @@ class Api:
         b = body()
         return self.scout.engines.act(op, str(b.get("kind") or ""), b.get("port"), str(b.get("model") or ""),
                                       b.get("contextLength"), force=b.get("force") is True, hold=b.get("hold")), 200
+
+    def _server(self, op, body) -> tuple[Any, int]:
+        b = body()
+        return self.scout.engines.serve(op, str(b.get("kind") or ""), b.get("port")), 200
 
     def _autostart(self, body) -> tuple[Any, int]:
         b = body()

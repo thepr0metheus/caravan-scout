@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.16.0 — 2026-09-25
+
+- **An engine's server is started and stopped from the board.** `POST
+  /api/engines/start|stop {kind, port}`, answered at once; a start waits up
+  to 60 s for the server to answer, a stop up to 20 s for it to go quiet,
+  and what failed stays as `serverError`. Only this scout's user's servers:
+  another user's — a system service — is named (`runBy: "other"`) and left
+  to the operator. How to start a server again is learned from its run
+  (Ollama: its binary and `OLLAMA_*` / device variables; LM Studio: its
+  `lms`, port and address) or from where it installs itself in the home,
+  and kept in `state.json` (`engineServers`); a stop is offered only when a
+  start can follow. A known server that is not running is an engine of its
+  own, `state: "stopped"`, whose only control is `start`. Ollama runs in a
+  session of its own, with the scout's engine mark — never a cell's, so the
+  stray-cell reaper cannot take it — output in `engine-logs/ollama.log`;
+  stopped with SIGTERM, SIGKILL for it and its children after 10 s. LM
+  Studio: `lms daemon up` + `lms server start`, `lms daemon down` (`lms
+  server stop` where no daemon runs). A server started from the board
+  starts again when the machine boots — once per boot — until it is
+  stopped from the board.
+
 ## 2.15.0 — 2026-09-25
 
 - **A load that would not fit into the cards' free memory asks first.** A

@@ -89,6 +89,10 @@ class ReportSample:
     # its REST list does not say.
     LMS_PS = [{"identifier": "google/gemma-3-4b", "modelKey": "google/gemma-3-4b", "ttlMs": 3_600_000,
                "lastUsedTime": (NOW - 600) * 1000}]
+    # Who runs the engines' servers (2.16): LM Studio this scout's user, the
+    # Ollama on the network another user — a system service.
+    PROCESS_OWNERS = {613: {"uid": 1000, "exe": "/opt/lm-studio/lm-studio", "args": ["lm-studio"], "env": {},
+                            "marked": False}}
     CPU = {"loadPct": 12.5, "load1": 1.5, "ncpu": 12, "logicalCores": 12, "availableCores": 12,
            "physicalCores": 6, "ram": {"usedGb": 18.2, "totalGb": 62.7}}
     METRICS = {"promptTps": 812.5, "genTps": 41.3, "requestsProcessing": 1, "ctxMax": 8192, "ctxUsed": 2048}
@@ -162,7 +166,8 @@ class ReportSample:
                 patched(sys, platform="linux"), patched(report_module, APP_VERSION=self.VERSION), \
                 patched(scout.engines, ask=lambda port, host="127.0.0.1":
                         (lambda path: self.ENGINE_ANSWERS.get((port, path), (404, None))),
-                        kinds=(Ollama(), LmStudio(cli=SampleLms(self.LMS_PS)))):
+                        kinds=(Ollama(), LmStudio(cli=SampleLms(self.LMS_PS)))), \
+                patched(scout.engines.servers, procs=SampleProcs(self.PROCESS_OWNERS)):
             # The engines are scanned by their own thread; here, once, by hand.
             scout.engines.refresh()
             # Acts on them from the board (2.14): one that failed, with the
@@ -185,6 +190,21 @@ class ReportSample:
 
     def write(self) -> None:
         self.PATH.write_text(self.text(), encoding="utf-8")
+
+
+class SampleProcs:
+    """The machine's side of the engines' servers in the sample: the scout
+    runs as uid 1000, and the processes it can name are the ones given."""
+
+    def __init__(self, owners):
+        self.owners = owners
+
+    @staticmethod
+    def uid():
+        return 1000
+
+    def info(self, pid):
+        return self.owners.get(int(pid))
 
 
 class SampleLms:

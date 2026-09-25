@@ -116,6 +116,7 @@ systemd/launchd units); the code lives in the package:
 | `scout.py` | `Scout` — the machine's scout, put together: the config, the state, the identity (settled before anything reads hostId), the machine, the cells (and their model cache), the llama.cpp builds, the saved configs, the report and the heartbeat |
 | `http.py` | `Api` — the `:8092` surface as tables, one line per path, behind the fleet-token gate; `ScoutHandler` — one request answered from them; `Power` — reboot and poweroff, each on its own path |
 | `webui.py` | `PairingPage` — the read-only page on `GET /`: the machine, its pairing, the address to enter on the controller; reads the open `/api/pairing` |
+| `engine_servers.py` | `EngineServers` — the engines' servers the board turns on and off (2.16): how each is started again (learned from the run of this scout's user, or from where it installs itself in the home — `state.json` `engineServers`), who runs each (`runBy`), the stopped ones as engines of their own, and the start once per boot; `EngineProcs` — the machine's side: a process as /proc says it, a server started in a session of its own (its own environment mark, never a cell's), SIGTERM then SIGKILL with its children |
 | `app.py` | The process entry point: arguments, the scout, re-adoption, the heartbeat, watchdog, telemetry and engines threads, the server |
 
 The shape is guarded: `scripts/check_oop.py` (in CI, with a self-test that

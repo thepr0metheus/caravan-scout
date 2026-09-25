@@ -225,6 +225,31 @@ class EngineKind:
         """Unload `model`: "" when it did, else the engine's own words."""
         raise NotImplementedError
 
+    # ── the server itself (2.16): learned from its run, started, stopped ──
+
+    def recipe(self, info: dict[str, Any] | None, view: dict[str, Any]) -> dict[str, Any] | None:
+        """How to start this kind's server again, learned from the one
+        running now: its process as the machine says it (`info`: exe, args,
+        env — None where /proc does not say) and its view. None when it
+        cannot be told."""
+        return None
+
+    def installed(self, home: Path) -> dict[str, Any] | None:
+        """A recipe for a server never seen running here, from where this
+        kind puts itself in the user's home; None when it is not there. A
+        system-wide install is not offered: its server is the system's."""
+        return None
+
+    def start_server(self, recipe: dict[str, Any], procs) -> str:
+        """Start the server the recipe says: "" when it was started, else
+        why not. Whether it answers is the caller's to wait for."""
+        raise NotImplementedError
+
+    def stop_server(self, recipe: dict[str, Any], pid: int | None, procs) -> str:
+        """Stop the server running as `pid`: "" when it was told to stop,
+        else why not."""
+        raise NotImplementedError
+
     def estimate(self, call, ask, row: dict[str, Any], context_length: int | None) -> dict[str, Any]:
         """What loading `row` takes, as closely as this kind can say:
         {"needBytes", "basis"}. The basis names how it was reached —
@@ -289,6 +314,46 @@ class Ollama(EngineKind):
     def unload(self, call, ask, model):
         status, _payload, words = call("/api/generate", {"model": model, "keep_alive": 0})
         return self.refused(status, words)
+
+    #: What configures a server, by name: kept from the run it was learned from.
+    ENV_KEPT = ("OLLAMA_", "CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")
+    #: Where Ollama's own archive puts it in a home, and pip-style installs.
+    HOME_BINARIES = ("ollama/bin/ollama", ".local/bin/ollama", "bin/ollama")
+    #: How long a server told to stop gets before it is killed.
+    STOP_GRACE = 10.0
+
+    def recipe(self, info, view):
+        """`ollama serve` as it runs: its binary, and the OLLAMA_* and device
+        variables it was started with (what makes it "the one set up")."""
+        exe = str((info or {}).get("exe") or "")
+        args = [str(a) for a in (info or {}).get("args") or []]
+        if Path(exe).name != "ollama" or args[1:2] != ["serve"]:
+            return None
+        env = {k: str(v) for k, v in ((info or {}).get("env") or {}).items() if str(k).startswith(self.ENV_KEPT)}
+        return {"exe": exe, "args": ["serve"], "env": env}
+
+    def installed(self, home):
+        for relative in self.HOME_BINARIES:
+            exe = Path(home) / relative
+            if os.access(exe, os.X_OK):
+                return {"exe": str(exe), "args": ["serve"], "env": {}}
+        return None
+
+    def start_server(self, recipe, procs):
+        """`ollama serve`, detached from the scout (a scout restart leaves it
+        running, as it leaves its cells), its output in a log of its own."""
+        exe = str(recipe.get("exe") or "")
+        if not os.access(exe, os.X_OK):
+            return f"{exe or 'ollama'} is not there to run"
+        return procs.spawn([exe, *[str(a) for a in recipe.get("args") or ["serve"]]],
+                           {str(k): str(v) for k, v in (recipe.get("env") or {}).items()}, self.id)
+
+    def stop_server(self, recipe, pid, procs):
+        """SIGTERM: Ollama unloads its models and stops its runners; one that
+        does not go in STOP_GRACE seconds is killed, runners and all."""
+        if not pid:
+            return "nothing listens on its port"
+        return procs.terminate(int(pid), self.STOP_GRACE)
 
     def estimate(self, call, ask, row, context_length):
         """The file, and — when a window is asked for — its cache, from the
@@ -395,6 +460,42 @@ class LmStudio(EngineKind):
         """Only its native API (0.4+) loads and unloads; 0.3's /api/v0 has no
         such verbs, and is read, not driven."""
         return ["load", "unload"] if seen.get("state") == "ok" and seen.get("api") == "v1" else []
+
+    def recipe(self, info, view):
+        """Its own command line starts and stops it; what is learned is where
+        it listens — the port, and whether only this machine may call."""
+        if not self.cli.available():
+            return None
+        return {"port": int(view.get("port") or self.default_port),
+                "bind": "127.0.0.1" if view.get("listen") == "loopback" else "0.0.0.0"}
+
+    def installed(self, home):
+        """Installed where its command line is — the app and its windowless
+        daemon alike; its server on its usual port, this machine only (LM
+        Studio's own default)."""
+        if not LmsCli(home=home).available():
+            return None
+        return {"port": self.default_port, "bind": "127.0.0.1"}
+
+    def start_server(self, recipe, procs):
+        """`lms daemon up`, then `lms server start` on the learned port and
+        address. The command line returns when the server has started."""
+        code, text = self.cli(["daemon", "up"], timeout=LmsCli.LOAD)
+        if code != 0:
+            return LmsCli.said(text) or f"lms daemon up exited with {code}"
+        code, text = self.cli(["server", "start", "-p", str(int(recipe.get("port") or self.default_port)),
+                               "--bind", str(recipe.get("bind") or "127.0.0.1")], timeout=LmsCli.LOAD)
+        return "" if code == 0 else (LmsCli.said(text) or f"lms server start exited with {code}")
+
+    def stop_server(self, recipe, pid, procs):
+        """`lms daemon down` — the daemon holds the loaded models, and only
+        its going frees their memory; where there is no daemon (the app
+        runs the server), `lms server stop`."""
+        code, text = self.cli(["daemon", "down"], timeout=LmsCli.LOAD)
+        if code == 0:
+            return ""
+        code, text = self.cli(["server", "stop"], timeout=LmsCli.LOAD)
+        return "" if code == 0 else (LmsCli.said(text) or f"lms server stop exited with {code}")
 
     def holds(self, seen):
         """Its REST load has no idle limit; only `lms load --ttl` sets one —
@@ -536,13 +637,23 @@ class ForeignEngines:
     #: in seconds (2.15): a minute to a week; -1 or none — until unloaded.
     HOLD_RANGE = (60, 7 * 24 * 3600)
 
+    #: Seconds a started server has to answer, and a stopped one to go quiet.
+    START_WAIT = 60.0
+    STOP_WAIT = 20.0
+
     def __init__(self, machine, cells, ask: Callable[..., Any] = EngineAsk, call: Callable[..., Any] = EngineCall,
                  clock: Callable[[], float] | None = None, spawn: Callable[..., Any] | None = None,
-                 kinds: tuple[EngineKind, ...] | None = None):
+                 kinds: tuple[EngineKind, ...] | None = None, servers=None,
+                 pause: Callable[[float], None] | None = None):
         self.machine = machine
         self.cells = cells
         self.ask = ask
         self.call = call
+        # The servers themselves (2.16, engine_servers.py): who runs each,
+        # and starting and stopping them. None — looking and loading only.
+        self.servers = servers
+        # How a start or stop waits between looks; a test does not wait.
+        self.pause = pause or (lambda sec: time.sleep(sec))
         # The kinds it looks for; a test hands in kinds with their command
         # line stood in for.
         self.kinds = kinds or self.KINDS
@@ -569,7 +680,12 @@ class ForeignEngines:
 
     def with_actions(self, view: dict[str, Any]) -> dict[str, Any]:
         """A copy of one engine's view, each model carrying `action` while an
-        action on it runs and `actionError` when the last one failed."""
+        action on it runs and `actionError` when the last one failed; the
+        engine itself `serverAction` and `serverError` — its start or stop
+        (2.16), keyed by no model."""
+        server = (view["kind"], int(view["port"]), "")
+        view = {**view, **({"serverAction": dict(self._actions[server])} if server in self._actions else {}),
+                **({"serverError": dict(self._failures[server])} if server in self._failures else {})}
         if not isinstance(view.get("models"), list):
             return dict(view)
         rows = []
@@ -700,6 +816,91 @@ class ForeignEngines:
                 "error": f"{row.get('name')} needs {least}about {need / 1024 ** 3:.1f} GiB of VRAM, "
                          f"the cards have {free / 1024 ** 3:.1f} GiB free"}
 
+    def serve(self, op: str, kind_id: str, port: Any) -> dict[str, Any]:
+        """Start an engine's server, or stop it (2.16) — on a thread of its
+        own: a start waits for the server to answer, a stop for it to go
+        quiet. Answered at once with the engines as they are now, the engine
+        marked `serverAction`. Only what its view offers (`controls`): a
+        stop for a server this scout's user runs, a start for a known one
+        that is not running."""
+        from caravan_scout.errors import AppError
+        if op not in ("start", "stop"):
+            raise AppError(f"unknown server action {op!r}", 400)
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            raise AppError("port must be a number", 400)
+        kind = next((k for k in self.kinds if k.id == kind_id), None)
+        key = (kind_id, port, "")
+        with self._lock:
+            view = next((v for v in self._views or [] if v.get("kind") == kind_id and v.get("port") == port), None)
+            if kind is None or view is None or self.servers is None:
+                raise AppError(f"no {kind_id or 'engine'} on port {port} here", 404)
+            if op not in (view.get("controls") or []):
+                raise AppError(f"{view.get('label')} on port {port} cannot {op} from here", 409)
+            if key in self._actions:
+                doing = {"start": "started", "stop": "stopped"}[self._actions[key]["op"]]
+                raise AppError(f"{view.get('label')} is being {doing} already", 409)
+            self._actions[key] = {"op": op, "since": int(self.clock())}
+            self._failures.pop(key, None)
+        listener = self.listener_of(port)
+        pid = int((listener or {}).get("pid") or 0) or None
+        host = self.ask_host(listener)
+        self.spawn(lambda: self._serve_run(kind, op, key, pid, host))
+        return {"ok": True, "engines": self.views()}
+
+    def _serve_run(self, kind, op, key, pid, host) -> None:
+        kind_id, port, _none = key
+        try:
+            reason = self.servers.start(kind, port) if op == "start" else self.servers.stop(kind, pid)
+            if not reason:
+                reason = self._await(kind, port, host, answering=(op == "start"))
+        except Exception as exc:  # noqa: BLE001 — a start that crashed failed; it must not stay "under way"
+            reason = f"{type(exc).__name__}: {exc}"[:300]
+        with self._lock:
+            self._actions.pop(key, None)
+            if reason:
+                self._failures[key] = {"op": op, "error": reason, "at": int(self.clock())}
+        print(f"[engines] {op} {kind_id}:{port}: {reason or 'done'}")
+        try:
+            self.refresh()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[engines] scan after {op} failed: {exc}")
+
+    def _await(self, kind, port, host, answering: bool) -> str:
+        """Wait until the engine answers on its port (a start) or stops
+        answering (a stop): "" when it did, else what did not happen."""
+        wait = self.START_WAIT if answering else self.STOP_WAIT
+        deadline = self.clock() + wait
+        while True:
+            seen = kind.read(self.ask(port, host))
+            up = bool(seen) and seen.get("state") in ("ok", "auth")
+            if up == answering:
+                return ""
+            if self.clock() >= deadline:
+                return (f"it did not answer on port {port} in {wait:.0f} s" if answering
+                        else f"it still answers on port {port} after {wait:.0f} s")
+            self.pause(1.0)
+
+    def start_at_boot(self) -> list[str]:
+        """The servers started from here and not stopped since, started when
+        the machine has booted (EngineServers.due_at_boot). Returns the kinds
+        asked to start."""
+        if self.servers is None:
+            return []
+        started = []
+        for kind_id in self.servers.due_at_boot(self.machine.boot_id()):
+            view = next((v for v in self.views() or [] if v.get("kind") == kind_id), None)
+            if view is None or "start" not in (view.get("controls") or []):
+                print(f"[engines] {kind_id} is running already or cannot start here — not started at boot")
+                continue
+            try:
+                self.serve("start", kind_id, view["port"])
+                started.append(kind_id)
+            except Exception as exc:  # noqa: BLE001 — one server's failure is not the others'
+                print(f"[engines] {kind_id} did not start at boot: {exc}")
+        return started
+
     def listener_of(self, port: int) -> dict[str, Any] | None:
         """Who listens on `port` now, as the OS says — to reach the engine at
         the address it is bound to; None when the OS will not say."""
@@ -732,10 +933,15 @@ class ForeignEngines:
         return views
 
     def run(self, sleep: Callable[[float], None] = time.sleep) -> None:
-        """The loop the scout runs it in (a daemon thread)."""
+        """The loop the scout runs it in (a daemon thread). After the first
+        scan — when it is known what runs — the servers due at boot start."""
+        first = True
         while True:
             try:
                 self.refresh()
+                if first:
+                    first = False
+                    self.start_at_boot()
             except Exception as exc:  # noqa: BLE001 — one bad scan must not end the watch
                 print(f"[engines] scan failed: {exc}")
             sleep(self.PERIOD)
@@ -759,6 +965,8 @@ class ForeignEngines:
                 if seen["state"] == "unreachable" and not (by_name and port == kind.default_port):
                     continue
                 found.append(self.view(kind, port, listener, seen, procs))
+        if self.servers is not None:
+            found = self.servers.annotate(self.kinds, found, rows)
         return found
 
     def candidates(self, kind, rows, own) -> list[tuple[int, dict[str, Any] | None]]:
