@@ -26,6 +26,7 @@ from _scout_harness import Checks, FakeRun, make_scout, patched  # noqa: E402
 import urllib.request  # noqa: E402
 from caravan_scout import __version__  # noqa: E402
 from caravan_scout.errors import AppError  # noqa: E402
+from caravan_scout.machine import Machine  # noqa: E402
 
 CHECKS = Checks("scout report")
 check = CHECKS.check
@@ -359,6 +360,18 @@ def test_local_ip():
               "адрес интерфейса, что смотрит на контроллер")
         make_scout({"controllerUrl": ""}).machine.address()
         check(FakeSocket.connected[-1] == ("8.8.8.8", 80), "negative: контроллер не задан — на 8.8.8.8:80")
+        # The controller on this very machine, paired over loopback (2.10.2):
+        # 127.0.0.1 reaches nobody else, so the scout names the address the
+        # network knows the machine by — the interface of the default route.
+        looped = []
+        for url in ("http://127.0.0.1:7990", "http://localhost:7990", "http://[::1]:7990", "http://127.0.1.1:7990"):
+            FakeSocket.connected = []
+            looped.append((make_scout({"controllerUrl": url}).machine.address(), FakeSocket.connected[-1]))
+        check(looped == [("10.0.0.5", ("8.8.8.8", 80))] * 4,
+              f"контроллер на этой же машине (127.0.0.1, localhost, ::1, 127.0.1.1) — адрес сети, а не петли (got {looped})")
+        check([Machine.is_loopback(h) for h in ("127.0.0.1", "LOCALHOST", "::1", "127.1.2.3", "10.0.0.1", "caravan.lan", "")]
+              == [True, True, True, True, False, False, False],
+              "negative: петля — только localhost, 127/8 и ::1; адрес сети и имя хоста — не петля")
         FakeSocket.fail = True
         check(make_scout().machine.address() == "127.0.0.1",
               "as-is: маршрута нет — 127.0.0.1, и контроллер получит адрес петли")

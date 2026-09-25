@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.10.2 — 2026-09-25
+
+- **The controller's own machine is shown at its network address.** The
+  scout names the address the controller reaches it at; on the controller's
+  own machine it was paired over 127.0.0.1 and named 127.0.0.1, so the board
+  showed that machine's cells at `127.0.0.1:<port>` — an address nobody else
+  reaches, and a link that opened the viewer's own computer. A controller on
+  loopback (localhost, 127.0.0.0/8, ::1) now makes the scout name the address
+  of its default route instead. The cells already listened on every
+  interface; the proxy's routes carry their own upstream address and do not
+  change.
+
 ## 2.10.1 — 2026-09-25
 
 - **The identity snapshot's example machine is a made-up one.** 2.10.0's

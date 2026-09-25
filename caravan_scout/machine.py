@@ -3,6 +3,7 @@ processes on them, CPU and memory, who the firewall lets in, what listens,
 and which address faces the controller."""
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 import socket
@@ -94,15 +95,19 @@ class Machine:
     # ── who this machine is ─────────────────────────────────────────────────
 
     def address(self) -> str:
-        """The address the controller can reach this machine at.
+        """The address others can reach this machine at.
 
         UDP-connect trick: no packet is sent; the kernel just picks the
-        interface that routes towards the target. Aim at the controller so
-        multi-homed hosts report the address the controller can reach."""
+        interface that routes towards the target. Aimed at the controller, so
+        a multi-homed host reports the address the controller can reach — but
+        not when the controller runs on this very machine and was paired over
+        loopback: 127.0.0.1 reaches nobody else, and the board's links to the
+        machine's cells opened the viewer's own computer. Then it is aimed at
+        the default route: the address the network knows the machine by."""
         target, port = "8.8.8.8", 80
         try:
             parsed = urlparse(str(self.config.get("controllerUrl") or ""))
-            if parsed.hostname:
+            if parsed.hostname and not self.is_loopback(parsed.hostname):
                 target, port = parsed.hostname, int(parsed.port or 80)
         except Exception:
             pass
@@ -112,6 +117,16 @@ class Machine:
                 return sock.getsockname()[0]
         except Exception:
             return "127.0.0.1"
+
+    @staticmethod
+    def is_loopback(host: str) -> bool:
+        """localhost, 127.0.0.0/8 or ::1: a controller on this very machine."""
+        if str(host).lower() == "localhost":
+            return True
+        try:
+            return ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            return False
 
     def name(self) -> str:
         """What this machine is called where one word is wanted."""
