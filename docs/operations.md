@@ -151,8 +151,10 @@ start), `llama-node-configs/`, `var/server-cells/<port>/`, the model cache
   want one card — and refuses with the numbers and the cells holding the card.
   No nvidia-smi, or no such card: no check, as on the controller.
 - **Memory limits (2.6+).** On Linux a cell is launched in its own systemd
-  user scope with the limits of the controller's cells (`lama-cell@.service`):
-  `MemoryHigh=70%`, `MemoryMax=80%`, `MemorySwapMax=2G` of this machine's RAM.
+  user scope with the limits the controller's cells had in their
+  `lama-cell@.service` (the unit went in the controller's step 6.9; the scout
+  is these values' one home): `MemoryHigh=70%`, `MemoryMax=80%`,
+  `MemorySwapMax=2G` of this machine's RAM.
   A model that eats the memory is slowed and then killed alone, not the
   machine with the scout on it. The scout asks once per run, launching a scope
   and reading its `memory.max`; the answer is one `[cells] …` line in the

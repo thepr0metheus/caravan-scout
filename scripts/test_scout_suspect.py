@@ -17,7 +17,6 @@ Run: python3 scripts/test_scout_suspect.py
 """
 import contextlib
 import io
-import re
 import sys
 from pathlib import Path
 
@@ -191,23 +190,27 @@ def test_the_route():
           "POST /api/llama-node/suspect-dismiss скрывает для этой сборки")
 
 
-def test_the_controllers_words():
-    CHECKS.section("слова и числа — контроллера:")
-    status = ROOT.parent / "lama-caravan" / "caravan" / "admin" / "status.py"
-    if not status.exists():
-        print("  (контроллера рядом нет — сверка пропущена)")
+def test_the_rule_is_ours():
+    # The controller read the same words and numbers from its own cells'
+    # journal, and this test compared the two. Its cells — and that rule — went
+    # in its step 6.9 (their machine runs them through its scout), so the
+    # banner comes from this rule alone.
+    CHECKS.section("правило — скаута (2.9.1):")
+    check(CrashSuspect.MARKERS.pattern == r"CUDA error|GGML_ABORT|SIGSEGV|SIGABRT|Aborted \(core dumped\)",
+          "слова смерти движка: CUDA error, GGML_ABORT, SIGSEGV, SIGABRT, дамп ядра")
+    check([CrashSuspect.MIN_CRASHES, CrashSuspect.FRESH_SEC // 3600, CrashSuspect.WINDOW_SEC // 60] == [3, 6, 15],
+          "3 падения, 6 часов, 15 минут — правило баннера")
+    repo = ROOT.parent / "lama-caravan"
+    if not repo.is_dir():
+        print("  (репозитория контроллера рядом нет — его сторона не проверена)")
         return
-    text = status.read_text(encoding="utf-8")
-    check(f'r"{CrashSuspect.MARKERS.pattern}"' in text, "слова смерти движка те же, что читает журнал контроллера")
-    numbers = (re.search(r'LLAMA_SUSPECT_MIN_CRASHES"\) or (\d+)', text), re.search(r'LLAMA_SUSPECT_BUILD_AGE_H"\) or (\d+)', text),
-               re.search(r'"--since", "-(\d+) minutes"', text))
-    check([int(n.group(1)) if n else None for n in numbers]
-          == [CrashSuspect.MIN_CRASHES, CrashSuspect.FRESH_SEC // 3600, CrashSuspect.WINDOW_SEC // 60],
-          "3 падения, 6 часов, 15 минут — как у контроллера: один баннер, одно правило")
+    own = [str(p.relative_to(repo)) for p in (repo / "caravan").rglob("*.py")
+           if "LLAMA_SUSPECT_MIN_CRASHES" in p.read_text(encoding="utf-8")]
+    check(own == [], f"negative: своего правила у контроллера нет (ушло с его ячейками в шаге 6.9) — одно правило, у скаута (got {own})")
 
 
 for fn in (test_three_in_fifteen_minutes, test_what_does_not_raise_it, test_it_stays, test_a_new_build, test_dismissed,
-           test_the_build_offered, test_the_route, test_the_controllers_words):
+           test_the_build_offered, test_the_route, test_the_rule_is_ours):
     fn()
 
 sys.exit(CHECKS.finish())

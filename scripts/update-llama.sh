@@ -22,7 +22,6 @@ have() { command -v "$1" &>/dev/null; }
 LLAMA_DIR="${HOME}/llama.cpp"
 LLAMA_TAG=""
 FORCE=0
-RESTART=1
 
 ACTION=""
 RESTORE_ID=""
@@ -32,7 +31,7 @@ while [[ $# -gt 0 ]]; do
     --llama-tag)   LLAMA_TAG="$2"; shift ;;
     --llama-dir)   LLAMA_DIR="$2"; shift ;;
     --force)       FORCE=1 ;;
-    --no-restart)  RESTART=0 ;;
+    --no-restart)  ;;   # accepted for old callers: nothing here restarts cells (their scouts run them)
     --list-builds) ACTION="list-builds" ;;
     --restore)     ACTION="restore"; RESTORE_ID="${2:-}"; shift ;;
     --archive-current) ACTION="archive" ;;
@@ -223,6 +222,15 @@ fi
 
 # ── clone / update ────────────────────────────────────────────────────────────
 if [[ -d "${LLAMA_DIR}/.git" ]]; then
+  # A stale index.lock blocks every git command in this clone — and since the
+  # clone is a build artifact nobody hand-edits, a lock with NO live git
+  # process behind it can only be the corpse of a crashed/killed run (one from
+  # July sat here for 17 days failing every GUI update at "fetching"). Remove
+  # it only under that exact condition; with a live git process we still stop.
+  if [[ -f "${LLAMA_DIR}/.git/index.lock" ]] && ! pgrep -f "git.*$(basename "$LLAMA_DIR")" >/dev/null 2>&1; then
+    warn "removing stale ${LLAMA_DIR}/.git/index.lock (no live git process owns it)"
+    rm -f "${LLAMA_DIR}/.git/index.lock"
+  fi
   info "llama.cpp exists at ${LLAMA_DIR} — fetching ..."
   git -C "$LLAMA_DIR" fetch --tags -q
   # -f: the clone is a build artifact, not a workspace — discard local edits
@@ -414,20 +422,6 @@ fi
 if [[ ! -f "$LLAMA_BIN" ]]; then
   err "Build finished but ${LLAMA_BIN} is missing."
   exit 1
-fi
-
-# ── restart lama-cell services ────────────────────────────────────────────────
-if [[ "$RESTART" == "1" ]] && have systemctl; then
-  CELLS=$(systemctl --user list-units 'lama-cell@*.service' --no-pager --plain 2>/dev/null \
-    | awk '{print $1}' | grep 'lama-cell@')
-  if [[ -n "$CELLS" ]]; then
-    info "Restarting lama-cell services to pick up new binary ..."
-    for svc in $CELLS; do
-      systemctl --user restart "$svc" && info "  restarted $svc" || warn "  could not restart $svc"
-    done
-  else
-    info "No active lama-cell services found — start them from the UI."
-  fi
 fi
 
 # ── faster-whisper ASR server ─────────────────────────────────────────────────

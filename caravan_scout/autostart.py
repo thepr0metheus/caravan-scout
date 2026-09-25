@@ -10,9 +10,10 @@ from caravan_scout.errors import AppError
 class Autostart:
     """The cells this machine starts by itself when it boots.
 
-    The controller does it for its own cells with `systemctl enable
+    The controller did it for its own cells with `systemctl enable
     lama-cell@<port>`; a scout's cells had nothing, and a reboot left them
-    down. An entry keeps the start request the controller last sent for its
+    down. (The controller's machine runs its cells through its scout since
+    the controller's step 6.8, and those units went in 6.9.) An entry keeps the start request the controller last sent for its
     port, so the scout starts the cell with no controller at hand — a model
     read in place or cached needs none.
 

@@ -9,12 +9,14 @@ from typing import Any, Callable
 
 
 class CrashSuspect:
-    """What the controller's banner says about its own machine — model cells
+    """What the controller's banner said about its own machine — model cells
     crash after a recent llama.cpp build, roll back? — said for this one.
+    (The controller's own rule went with its cells in its step 6.9; the
+    banner comes from this one alone now.)
 
     The watchdog tells it of each crash, with the crash's words (crashed()).
-    Only the words of an engine's death count, the controller's words: CUDA
-    error, GGML_ABORT, SIGSEGV, SIGABRT, a core dump. A cell that will not
+    Only the words of an engine's death count: CUDA error, GGML_ABORT,
+    SIGSEGV, SIGABRT, a core dump. A cell that will not
     start for want of a model or a port is not the build's fault. With the
     binary younger than 6 hours, 3 such crashes in 15 minutes make an
     incident. It is kept in state.json under this build (commit and binary

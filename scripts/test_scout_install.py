@@ -181,7 +181,10 @@ def test_the_firewall_hint():
     check(bool(rng) and f"{rng.group(1)}–{rng.group(2)}" in installer and "${CELL_RANGE}" in installer,
           "install.sh называет диапазон ячеек контроллера и команду, открывающую его контроллеру — "
           "тот же диапазон в словах и в команде")
-    sibling = ROOT.parent / "lama-caravan" / "caravan" / "admin" / "paths.py"
+    repo = ROOT.parent / "lama-caravan"
+    sibling = repo / "caravan" / "admin" / "paths.py"
+    if repo.is_dir():
+        check(sibling.exists(), f"у контроллера есть {sibling.relative_to(repo)} — диапазон есть с чем сверять")
     if rng and sibling.exists():
         text = sibling.read_text(encoding="utf-8")
         base = re.search(r'CARAVAN_CELL_BASE_PORT", "(\d+)"', text)
@@ -240,8 +243,31 @@ def test_one_build_at_a_time():
               "тот же файл замка у install-llama.sh контроллера — иначе замки разные и не мешают друг другу")
 
 
+def test_the_synced_copy():
+    CHECKS.section("копия install-llama.sh контроллера (2.9.1):")
+    ours = read_real("update-llama.sh")
+    check("lama-cell" not in ours,
+          "negative: юниты lama-cell@ скрипт не перезапускает — их нет с шага 6.9 контроллера, "
+          "а у ячеек скаута их не было никогда")
+    check("    --no-restart)  ;;" in ours,
+          "--no-restart принимается и ничего не делает: его передаёт задача сборки скаута")
+    repo = ROOT.parent / "lama-caravan"
+    if not repo.is_dir():
+        print("  (репозитория контроллера рядом нет — сверка копии пропущена)")
+        return
+    theirs = repo / "scripts" / "install-llama.sh"
+    check(theirs.exists(), f"у контроллера рядом есть {theirs.name}: копии есть с чем сверяться")
+    if theirs.exists():
+        # The copy's head names itself and says it is a copy (lines 2-5); the
+        # rest is the controller's script line for line — a fix made there and
+        # not here (the stale index.lock guard was one) turns this red.
+        mine, orig = ours.splitlines(), theirs.read_text(encoding="utf-8").splitlines()
+        check(mine[:1] == orig[:1] and mine[5:] == orig[2:],
+              "копия совпадает с install-llama.sh контроллера строка в строку, кроме шапки")
+
+
 for fn in (test_the_installer, test_one_command, test_the_rule_can_fail, test_a_rerun_changes_nothing,
-           test_the_firewall_hint, test_one_build_at_a_time):
+           test_the_firewall_hint, test_one_build_at_a_time, test_the_synced_copy):
     fn()
 
 sys.exit(CHECKS.finish())

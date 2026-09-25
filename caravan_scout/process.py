@@ -204,10 +204,11 @@ class CellLog:
 
 
 class MemoryScope:
-    """The memory limits a cell of the controller has from its systemd unit
-    (MemoryHigh 70 %, MemoryMax 80 %, swap 2 GB — the same values as
-    systemd/lama-cell@.service in the controller): a model that eats the RAM
-    dies alone instead of taking the machine with it.
+    """The memory limits a cell had from the controller's systemd unit
+    (MemoryHigh 70 %, MemoryMax 80 %, swap 2 GB): a model that eats the RAM
+    dies alone instead of taking the machine with it. That unit went in the
+    controller's step 6.9 — its machine's cells run through its scout too —
+    so this is the values' one home.
 
     On Linux with a user systemd a cell is launched in its own transient
     scope with those limits: `systemd-run --user --scope` registers the scope

@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.9.1 — 2026-09-25
+
+- **The build script is the controller's copy again.** `update-llama.sh` is a
+  synced copy of the controller's `install-llama.sh`, and it had fallen two
+  changes behind. It still restarted the controller's `lama-cell@` units after
+  a build: they went in the controller's step 6.9, a scout's cells never had
+  one, and the scout's own job passes `--no-restart` anyway. It also lacked
+  the guard that removes a stale `.git/index.lock` nobody holds (one sat for
+  17 days and failed every update at "fetching"). The copy is synced, and a
+  test compares it with the controller's line for line whenever the
+  controller's repository is next to it.
+- **What the controller no longer has is the scout's own fact.** The memory
+  limits (MemoryHigh 70 %, MemoryMax 80 %, swap 2 GB) and the crash-banner
+  rule (the engine-death words; 3 crashes in 15 minutes on a build younger
+  than 6 hours) were checked against the controller's copies. Those copies
+  went with the controller's own cells. The limits check then said "no
+  controller next to us, skipped" with the controller right there, and the
+  rule check failed. Both are pinned by value here now. A check that finds
+  the controller's repository but not the file it reads fails instead of
+  skipping.
+
 ## 2.9.0 — 2026-09-25
 
 - **vLLM on this machine, its versions and its updates.** The controller

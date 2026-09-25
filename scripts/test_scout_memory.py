@@ -16,7 +16,6 @@ Run: python3 scripts/test_scout_memory.py
 """
 import contextlib
 import io
-import re
 import shutil
 import subprocess
 import sys
@@ -148,19 +147,24 @@ def test_asked_once():
           "ответ — одной строкой в журнал скаута, и только раз")
 
 
-def test_the_controllers_limits():
-    CHECKS.section("те же лимиты, что у контроллера:")
-    unit = ROOT.parent / "lama-caravan" / "systemd" / "lama-cell@.service"
-    if not unit.exists():
-        print("  (контроллера рядом нет — сверка лимитов пропущена)")
+def test_the_limits():
+    # The values came from the controller's cell unit, and this test compared
+    # the two. The unit went in the controller's step 6.9 — and the comparison
+    # then said "no controller next to us, skipped" with the controller right
+    # there: an absence drawn as a pass. The scout is the values' one home now.
+    CHECKS.section("лимиты — факт скаута (2.9.1):")
+    check(MemoryScope.LIMITS == ("MemoryHigh=70%", "MemoryMax=80%", "MemorySwapMax=2G"),
+          f"MemoryHigh 70 %, MemoryMax 80 %, своп 2 ГБ — те, что были у юнита ячеек контроллера (got {MemoryScope.LIMITS})")
+    repo = ROOT.parent / "lama-caravan"
+    if not repo.is_dir():
+        print("  (репозитория контроллера рядом нет — его сторона не проверена)")
         return
-    theirs = tuple(re.findall(r"^(Memory(?:High|Max|SwapMax)=\S+)$", unit.read_text(encoding="utf-8"), re.M))
-    check(theirs == MemoryScope.LIMITS,
-          f"lama-cell@.service контроллера — {theirs}: один факт на оба репозитория")
+    check(not (repo / "systemd" / "lama-cell@.service").exists(),
+          "negative: юнита lama-cell@ у контроллера нет (ушёл в его шаге 6.9) — лимиты живут в одном месте, у скаута")
 
 
 for fn in (test_the_command, test_every_launch_goes_through_it, test_the_probe, test_asked_once,
-           test_the_controllers_limits):
+           test_the_limits):
     fn()
 
 sys.exit(CHECKS.finish())

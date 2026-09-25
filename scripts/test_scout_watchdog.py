@@ -217,9 +217,16 @@ def test_a_signal_by_its_name():
 
 def test_the_card_knows_these_words():
     CHECKS.section("карточка контроллера узнаёт эти слова:")
-    js = ROOT.parent / "lama-caravan" / "static" / "js" / "topology-nodes.js"
+    repo = ROOT.parent / "lama-caravan"
+    if not repo.is_dir():
+        print("  (репозитория контроллера рядом нет — сверка пропущена)")
+        return
+    js = repo / "static" / "js" / "topology-nodes.js"
+    # The repo is here, so a missing file is a moved fact, not a missing
+    # controller: say so instead of skipping (the memory limits' check skipped
+    # like that for a night after the controller's unit went).
+    check(js.exists(), f"у контроллера есть {js.relative_to(repo)} — слова есть с чем сверять")
     if not js.exists():
-        print("  (контроллера рядом нет — сверка пропущена)")
         return
     found = re.search(r"const SCOUT_EXIT_WORDS = /(.+)/;", js.read_text(encoding="utf-8"))
     words = re.compile(found.group(1)) if found else None
