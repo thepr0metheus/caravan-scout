@@ -43,6 +43,9 @@ class FakeProcess:
         self.relaunch_ok = relaunch_ok
         self.log = ""
 
+    def changed_since(self, started_at):
+        return []
+
     def crash(self, reason="CUDA error: out of memory", code=1, log=""):
         self.state = {"running": False, "exitCode": code, "lastError": reason, "crashed": code != 0}
         self.log = log

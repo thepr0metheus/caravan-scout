@@ -536,8 +536,9 @@ def test_node_public_views():
     check(view == {"running": True, "pid": 5353, "adopted": True, "startedAt": NOW - 500, "uptimeSec": 500,
                    "modelPath": "/m/model-q4.gguf", "port": 22021, "phase": "running",
                    "promptTps": 123.46, "genTps": 45.68, "requestsProcessing": 2, "ctxMax": 8192,
-                   "ctxUsed": 2048, "firewall": {"state": "open", "allowedFrom": []}},
-          "живой процесс: фаза running, метрики, окно контекста и файрвол влиты в вид")
+                   "ctxUsed": 2048, "firewall": {"state": "open", "allowedFrom": []}, "launchDiskNewer": []},
+          "живой процесс: фаза running, метрики, окно контекста, файрвол и файлы, изменившиеся после старта "
+          "(2.11; файла модели здесь нет — пусто), влиты в вид")
     check("cmd" not in view, "negative: командная строка процесса (cmd) в вид не попадает")
     check(view.get("phase") == "running", "negative: живой процесс сильнее записанной ошибки старта")
     check([c["url"] for c in web.calls] == ["http://127.0.0.1:22021/metrics", "http://127.0.0.1:22021/props"],

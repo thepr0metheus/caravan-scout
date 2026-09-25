@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.11.0 — 2026-09-25
+
+- **A running cell says which of its files changed on disk.** A process
+  holds the files it opened, not their names: a model, projector or draft
+  replaced under a running cell reaches it only on a restart. The
+  controller measured that for its own cells (⟳ on the card) from the unit's
+  start time; since its step 6.9 every cell is a scout's, and the files are
+  on the scout's machine. A running cell now carries `launchDiskNewer`: the
+  roles of the files it holds whose mtime is after its start (a checkpoint
+  folder by its newest file; a file that cannot be read has not changed).
+
 ## 2.10.2 — 2026-09-25
 
 - **The controller's own machine is shown at its network address.** The
@@ -9,8 +20,9 @@
   reaches, and a link that opened the viewer's own computer. A controller on
   loopback (localhost, 127.0.0.0/8, ::1) now makes the scout name the address
   of its default route instead. The cells already listened on every
-  interface; the proxy's routes carry their own upstream address and do not
-  change.
+  interface. (Correction: the controller builds the routes to this machine's
+  cells from the address its scout names, so they moved from 127.0.0.1 to the
+  network address too — and they work there, checked live.)
 
 ## 2.10.1 — 2026-09-25
 

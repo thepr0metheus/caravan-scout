@@ -485,13 +485,46 @@ class CellProcess:
             log = self._log
         return log.tail()
 
+    #: The files a launch holds, each under its role on the board's card.
+    LAUNCH_FILES = (("modelPath", "model"), ("mmprojPath", "mmproj"), ("specPath", "draft"))
+
     def held_files(self) -> list[str]:
         """The model files this process holds while it runs — what a cache
         purge must leave alone. A process that does not run holds none."""
         if not self.status().get("running"):
             return []
         cfg = self._cfg
-        return [cfg[k] for k in ("modelPath", "mmprojPath", "specPath") if cfg.get(k)]
+        return [cfg[k] for k, _role in self.LAUNCH_FILES if cfg.get(k)]
+
+    def changed_since(self, started_at: int) -> list[str]:
+        """The roles of the launch files that changed on disk after the process
+        started at `started_at` — the weights, the projector, the draft.
+
+        A running process holds the files it opened (their inodes), not their
+        names: a file replaced under it reaches the cell only on a restart, and
+        the board says so (⟳). The controller measured this for its own cells
+        from the unit's start time; since its step 6.9 every cell is a scout's,
+        and this machine is where the files are. A file that cannot be read has
+        not "changed"; a folder (a checkpoint) changed when a file in it did."""
+        started = int(started_at or 0)
+        if not started:
+            return []
+        cfg = self._cfg
+        return [role for key, role in self.LAUNCH_FILES
+                if cfg.get(key) and self.newest_mtime(cfg[key]) > started]
+
+    @staticmethod
+    def newest_mtime(path: str) -> int:
+        """The file's mtime; for a folder, its newest file's (or its own, empty).
+        0 when it cannot be read."""
+        target = Path(str(path)).expanduser()
+        try:
+            if target.is_dir():
+                times = [int(entry.stat().st_mtime) for entry in os.scandir(target) if entry.is_file()]
+                return max(times) if times else int(target.stat().st_mtime)
+            return int(target.stat().st_mtime)
+        except OSError:
+            return 0
 
     def status(self) -> dict[str, Any]:
         with self._lock:

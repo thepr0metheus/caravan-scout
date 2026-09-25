@@ -269,7 +269,10 @@ class Cells:
             p = st.get("port") or port
             metrics = self.probe.metrics(p) if p else {}
             view = {**st, "port": p, "phase": "running", **metrics,
-                    "firewall": self.machine.firewall(p) if p else {}}
+                    "firewall": self.machine.firewall(p) if p else {},
+                    # Which of the files it holds changed on disk after it
+                    # started (2.11): ⟳ on the card — restart to pick them up.
+                    "launchDiskNewer": cell.process.changed_since(st.get("startedAt"))}
             # Whether its port answers here yet: vLLM installs and loads for
             # minutes before it listens, and from the controller a silent
             # port looks the same as a firewall. Not listening, the cell says

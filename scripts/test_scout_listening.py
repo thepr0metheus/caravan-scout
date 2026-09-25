@@ -71,6 +71,9 @@ class Running:
     def log_tail(self):
         return self.tail
 
+    def changed_since(self, started_at):
+        return []
+
 
 def view(listening, tail="[caravan] provisioning vLLM venv\nCollecting vllm==0.24.0"):
     s = make_scout()
