@@ -9,6 +9,9 @@ What it does, and all it does:
 
 - **reports its machine** — GPUs and what runs on them, CPU/RAM, the cells,
   the llama.cpp build — in a heartbeat to the controller;
+- **names the engines next to its cells** — Ollama and LM Studio on the same
+  machine: their models, what is loaded, the memory they hold (read only,
+  2.12);
 - **runs cells** the controller configures: llama.cpp servers and command
   cells (speech recognition, TTS…), models downloaded from the controller and
   cached here, the cells re-adopted after the scout restarts;
@@ -39,7 +42,9 @@ a machine's hardware becomes visible and usable:
 - **A machine without one** can still run CPU cells (speech recognition,
   small models) the same way.
 - Every scout reports GPUs, VRAM, running compute apps and its heartbeat, so
-  the board shows the fleet's real hardware in one place.
+  the board shows the fleet's real hardware in one place — and who else holds
+  it: an Ollama or LM Studio on the same machine is named with its models and
+  memory, not drawn as a mystery "outside" share of the card.
 
 A machine where AI agents run (OpenClaw, Hermes, anything with an OpenAI-style
 `baseUrl`) needs no scout: the operator adds it on the controller's board as a

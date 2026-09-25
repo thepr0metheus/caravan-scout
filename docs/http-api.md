@@ -12,17 +12,48 @@ nothing about the agents or clients on it.
 | `/` | The scout's page (HTML, read-only since 2.1): the machine, whether a controller has paired it, and the address:port to enter on the controller's board. |
 | `/api/pairing` | What the page shows, open even with a token: host id/name/IP, the scout's port, platform, GPU names, cells running/total, `controllerUrl`, `tokenRequired`, heartbeat `{state, lastAt, error}` (`state` is `unpaired` until a controller adds it) — never the controller's reply. The controller reads it first when the operator adds the scout. |
 | `/api/health` | Liveness, open even with a token: `{ok, service, version, tokenRequired, time}`. |
-| `/api/state` | The machine: host identity/IP, GPUs, CPU/RAM, compute apps, heartbeat status, llama.cpp build and update status (`llamaUpdate`), the scout's own version (`scoutVersion`), per-cell `llamaNodes` (a running cell's `promptTps`, `genTps` and `requestsProcessing` from its /metrics — a vLLM cell's also `requestsWaiting`, and its rates from its token counters, 2.7+; `listening` — whether a running cell's port listens on this machine yet, and while it does not, `startingTail`, the last lines of its log, 2.7+; `launchDiskNewer` — the roles (`model`, `mmproj`, `draft`) of the files a running cell holds that changed on disk after it started, so a restart would pick them up (a folder by its newest file), 2.11+; a cell that crashed since it was last started by hand carries `crash: {count, at, reason, tail?, gaveUp?}`, 2.5+; `tail` — the last 8 lines of the crashed run's log, keys scrubbed, 2.6+), `autostart` — the ports that start with the machine, stopped ones too (2.4+), and `llamaSuspect` — `{suspect: false}` or the incident of cells crashing after a fresh llama.cpp build: `crashes15m`, `builtAt`, `currentCommit`, `firstSeenAt`, `lastSeenAt`, `restoreCandidate` (the archived build to offer, or null) (2.6+). The heartbeat pushes the same facts under the same names. |
+| `/api/state` | The machine: host identity/IP, GPUs, CPU/RAM, compute apps (`[{gpuUuid, pid, name, usedMiB}]` — `name` is the process's executable, "" when nvidia-smi cannot name it, 2.12+), `engines` — the model engines on this machine that are not its cells (2.12+, below), heartbeat status, llama.cpp build and update status (`llamaUpdate`), the scout's own version (`scoutVersion`), per-cell `llamaNodes` (a running cell's `promptTps`, `genTps` and `requestsProcessing` from its /metrics — a vLLM cell's also `requestsWaiting`, and its rates from its token counters, 2.7+; `listening` — whether a running cell's port listens on this machine yet, and while it does not, `startingTail`, the last lines of its log, 2.7+; `launchDiskNewer` — the roles (`model`, `mmproj`, `draft`) of the files a running cell holds that changed on disk after it started, so a restart would pick them up (a folder by its newest file), 2.11+; a cell that crashed since it was last started by hand carries `crash: {count, at, reason, tail?, gaveUp?}`, 2.5+; `tail` — the last 8 lines of the crashed run's log, keys scrubbed, 2.6+), `autostart` — the ports that start with the machine, stopped ones too (2.4+), and `llamaSuspect` — `{suspect: false}` or the incident of cells crashing after a fresh llama.cpp build: `crashes15m`, `builtAt`, `currentCommit`, `firstSeenAt`, `lastSeenAt`, `restoreCandidate` (the archived build to offer, or null) (2.6+). The heartbeat pushes the same facts under the same names. |
 | `/api/llama-node/status` | Just the cells: `{ok, nodes: [...]}`. |
 | `/api/monitor/nvidia-smi` | A raw `nvidia-smi` snapshot for the controller's monitor drawer. |
 | `/api/telemetry?since=<epoch>` | The machine second by second (2.8+): samples newer than `since` — `{t, gpus: [{index, memUsedMiB, memTotalMiB, utilPct, powerW, tempC}], cpuPct, ram}` — ten minutes kept, one a second while watched and one in ten seconds otherwise; each ask marks the machine watched for 30 s. `since` 0 or missing returns the whole ten minutes. |
-| `/api/host/listeners` | TCP ports listening on this machine, with the owning process where the OS says: `{ok, ports: [{port, proc, pid}]}` — the controller's port picker. |
+| `/api/host/listeners` | TCP ports listening on this machine, with the owning process where the OS says: `{ok, ports: [{port, proc, pid, addrs}]}` — the controller's port picker. `addrs` (2.12+): the addresses the port is bound on (`127.0.0.1` only — this machine alone reaches it). `ss` on Linux, `lsof` where there is none (macOS, 2.12+); a tool that fails is `{ok: false, error}`, not an empty machine. |
 | `/api/llama-node/configs` | Saved launch configs stored on this client (`llama-node-configs/`). |
 | `/api/llama-node/list-cache` | Contents of the local model cache. |
 | `/api/llama-node/update-status` | The llama.cpp update job: running/done, return code, the last 200 lines. |
 | `/api/llama-node/builds` | Archived llama.cpp builds on this host, newest first. |
 | `/api/vllm` | vLLM in this machine's `~/vllm-venv` (2.9+): `{ok, installed, version, venv, history: [{version, seenAt}], job}` — the version read from its dist-info folder, the versions the venv has had (newest first, five kept: the rollback candidates) and the install job, briefly. |
 | `/api/vllm/update-status` | The vLLM install job: running/done, return code, the last 200 lines (2.9+). |
+
+### `engines` (2.12+)
+
+Ollama and LM Studio next to the cells, found where each listens by default
+(11434, 1234) or where a process of its name listens — never on a cell's
+port — and read through their own APIs, GET only: the scout changes nothing
+in them. Rescanned every 10 s by a thread of its own, so a hung engine never
+holds a report. `null` before the first scan, `[]` when none was found.
+
+```json
+{"kind": "ollama", "label": "Ollama", "port": 11434,
+ "listen": "network",            // "loopback": this machine only; "": the OS did not say
+ "state": "ok",                  // "auth": wants a token; "unreachable": its port is silent
+ "version": "0.12.3",            // "" when the engine does not say (LM Studio)
+ "api": "v1",                    // LM Studio only: its native API, or 0.3's "v0"
+ "installedKnown": false,        // only when the installed list did not answer
+ "models": [{"name": "qwen3:8b", "type": "", "format": "gguf", "family": "qwen3",
+             "params": "8.2B", "quant": "Q4_K_M", "fileBytes": 5225388164,
+             "remote": false,    // an Ollama cloud model: it does not run here
+             "loaded": true,     // null when the engine did not say
+             "memBytes": 6591830464, "vramBytes": 5333539264,   // Ollama only
+             "contextLength": 4096, "maxContextLength": null,
+             "expiresAt": "2026-09-22T17:00:00+00:00",          // Ollama's keep_alive
+             "instances": null}],                               // LM Studio's loaded copies
+ "pids": [5100, 5151],           // its processes and their children: the cards'
+                                 // memory is named by these
+ "ramBytes": 1283457024}         // their RSS; null when ps did not answer
+```
+
+A model the engine does not describe keeps `null`, never a zero. `models` is
+`null` for an engine that did not list them (`auth`, `unreachable`).
 
 ## POST
 

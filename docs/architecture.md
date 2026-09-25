@@ -31,7 +31,8 @@ scout host                                    controller host
 `<controllerUrl>/api/topology/client-heartbeat` every `heartbeatIntervalSeconds`
 (60 s), dropping to every 5 s while any cell is resolving/downloading/loading
 so the board shows live progress. The payload carries host identity, GPU/CPU
-inventory, compute apps, the llama.cpp build and its update job, the scout's
+inventory, compute apps, the engines next to the cells (Ollama, LM Studio —
+the last scan of their own thread), the llama.cpp build and its update job, the scout's
 version (`scoutVersion`), and per-cell `llamaNodes` — the same fields, under
 the same names, as `/api/state`.
 
@@ -92,7 +93,8 @@ systemd/launchd units); the code lives in the package:
 |---|---|
 | `paths.py` | Env-driven constants, the `{{…}}` placeholder contract, `DEFAULT_CONFIG` |
 | `errors.py` | `AppError` (HTTP-visible failures) |
-| `machine.py` | `Machine` — the host as its OS tells it: NVIDIA GPUs and the processes on them, CPU/RAM, who ufw lets in, listening ports, raw `nvidia-smi`, the address facing the controller; the caches that keep polling cheap |
+| `machine.py` | `Machine` — the host as its OS tells it: NVIDIA GPUs and the processes on them (with their names, 2.12), CPU/RAM, who ufw lets in, listening ports and where they are bound (`ss`, or `lsof` on macOS), the process table (`ps`), raw `nvidia-smi`, the address facing the controller; the caches that keep polling cheap |
+| `engines.py` | `ForeignEngines` — the model engines on this machine that are not its cells, rescanned every 10 s on a thread of their own; `EngineKind` → `Ollama`, `LmStudio` — the kinds as a table: default port, process names, how the API is read; `EngineAsk` — a GET on an engine's port (the only verb: the scout never changes an engine) |
 | `process.py` | `CellProcess` — one cell's process: start, adopt, stop, status; `CellLog` — the log kept across runs and read for a crash reason; `HostProcesses` — a process found again by its command line or by the port it serves; a cell's launch files that changed on disk since it started (`changed_since`, 2.11); `MemoryScope` — the memory limits a cell is launched with (the values the controller's cell unit had, in a systemd user scope; the scout is their one home since the controller's step 6.9) |
 | `report.py` | `Report` — what the scout says about its machine: `public()` for /api/state, `heartbeat()` for the beat (same facts, same names), `pairing()` for the scout's page and the controller's first look |
 | `heartbeat.py` | `Heartbeat` — one beat to the controller, the loop of beats, and pairing; each outcome written to state.json |
@@ -114,7 +116,7 @@ systemd/launchd units); the code lives in the package:
 | `scout.py` | `Scout` — the machine's scout, put together: the config, the state, the identity (settled before anything reads hostId), the machine, the cells (and their model cache), the llama.cpp builds, the saved configs, the report and the heartbeat |
 | `http.py` | `Api` — the `:8092` surface as tables, one line per path, behind the fleet-token gate; `ScoutHandler` — one request answered from them; `Power` — reboot and poweroff, each on its own path |
 | `webui.py` | `PairingPage` — the read-only page on `GET /`: the machine, its pairing, the address to enter on the controller; reads the open `/api/pairing` |
-| `app.py` | The process entry point: arguments, the scout, re-adoption, the heartbeat thread, the server |
+| `app.py` | The process entry point: arguments, the scout, re-adoption, the heartbeat, watchdog, telemetry and engines threads, the server |
 
 The shape is guarded: `scripts/check_oop.py` (in CI, with a self-test that
 plants each breakage) refuses a `*Mixin` class, a module of functions not on

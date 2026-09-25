@@ -155,41 +155,121 @@ class Machine:
     # ── asked on demand ─────────────────────────────────────────────────────
 
     def listeners(self) -> dict[str, Any]:
-        """TCP ports LISTENing on this host, with the owning process where the
-        OS will say.
+        """TCP ports LISTENing on this host: the owning process where the OS
+        will say, and the addresses each port is bound on.
 
         The controller's cell-port picker can only see its own box, so a
         listener on a CLIENT — someone's dev server, a leftover service — was
         invisible: the picker painted the number free, the cell reserved fine
         and then failed to bind. This is the client half of that answer.
 
-        `ss -ltnp` only reveals pids for our own processes without root; an
-        unknown owner still reports the port, with an empty proc. Knowing the
-        number is taken matters more than knowing by whom.
+        `ss -ltnpH` on Linux, `lsof` where there is no ss (macOS, where this
+        answered nothing at all before 2.12). Neither reveals the pid of
+        another user's process without root; an unknown owner still reports
+        the port, with an empty proc. Knowing the number is taken matters more
+        than knowing by whom.
+
+        `addrs` (2.12): where the port accepts connections — 127.0.0.1 only,
+        or the network. An engine on this machine (ForeignEngines) that
+        listens on loopback alone cannot be reached by the controller's proxy.
+
+        A tool that fails is no answer: {"ok": false} — not "nothing listens".
+        A failed ss read as an empty machine until 2.12.
         """
-        rows: list[dict[str, Any]] = []
-        try:
-            res = subprocess.run(["ss", "-ltnpH"], text=True, capture_output=True, timeout=6)
-            for line in (res.stdout or "").splitlines():
-                parts = line.split()
-                if len(parts) < 4:
-                    continue
-                _, _, port = parts[3].rpartition(":")
-                if not port.isdigit():
-                    continue
-                m = re.search(r'\("([^"]+)",pid=(\d+)', line)
-                rows.append({"port": int(port),
-                             "proc": m.group(1) if m else "",
-                             "pid": int(m.group(2)) if m else 0})
-        except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "error": str(exc)[:160], "ports": []}
+        rows: list[dict[str, Any]] | None = None
+        errors = []
+        for tool, read in (("ss", self._ss_rows), ("lsof", self._lsof_rows)):
+            try:
+                rows = read()
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{tool}: {exc}")
+                continue
+            if rows is not None:
+                break
+            errors.append(f"{tool} failed")
+        if rows is None:
+            return {"ok": False, "error": "; ".join(errors)[:160], "ports": []}
         # One row per port: a socket bound on both v4 and v6 is one listener.
         best: dict[int, dict[str, Any]] = {}
         for r in rows:
             cur = best.get(r["port"])
-            if cur is None or (not cur.get("proc") and r.get("proc")):
-                best[r["port"]] = r
+            if cur is None:
+                best[r["port"]] = cur = {"port": r["port"], "proc": r["proc"], "pid": r["pid"], "addrs": []}
+            elif not cur.get("proc") and r.get("proc"):
+                cur["proc"], cur["pid"] = r["proc"], r["pid"]
+            if r["addr"] and r["addr"] not in cur["addrs"]:
+                cur["addrs"].append(r["addr"])
         return {"ok": True, "ports": sorted(best.values(), key=lambda r: r["port"])}
+
+    @staticmethod
+    def _ss_rows() -> list[dict[str, Any]] | None:
+        """`ss -ltnpH`, one row per socket; None when ss failed."""
+        res = subprocess.run(["ss", "-ltnpH"], text=True, capture_output=True, timeout=6)
+        if res.returncode != 0:
+            return None
+        rows = []
+        for line in (res.stdout or "").splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            addr, _, port = parts[3].rpartition(":")
+            if not port.isdigit():
+                continue
+            m = re.search(r'\("([^"]+)",pid=(\d+)', line)
+            rows.append({"port": int(port), "addr": addr,
+                         "proc": m.group(1) if m else "",
+                         "pid": int(m.group(2)) if m else 0})
+        return rows
+
+    @staticmethod
+    def _lsof_rows() -> list[dict[str, Any]] | None:
+        """`lsof` for where there is no ss: one row per socket; None when it
+        failed. `+c 0` keeps a command's whole name, and lsof writes a space
+        in it as \\x20 ("LM\\x20Studio"). Exit 1 with nothing on stderr is
+        lsof's "no such sockets" — nothing listens."""
+        res = subprocess.run(["lsof", "+c", "0", "-nP", "-iTCP", "-sTCP:LISTEN"],
+                             text=True, capture_output=True, timeout=6)
+        if res.returncode != 0 and (res.returncode != 1 or (res.stderr or "").strip()):
+            return None
+        rows = []
+        for line in (res.stdout or "").splitlines()[1:]:
+            parts = line.split()
+            if len(parts) < 9 or not parts[1].isdigit():
+                continue
+            name = parts[-2] if parts[-1] == "(LISTEN)" else parts[-1]
+            addr, _, port = name.rpartition(":")
+            if not port.isdigit():
+                continue
+            rows.append({"port": int(port), "addr": addr,
+                         "proc": parts[0].replace("\\x20", " "), "pid": int(parts[1])})
+        return rows
+
+    def processes(self) -> dict[int, dict[str, Any]] | None:
+        """Every process on this machine: pid -> {ppid, rssKb, name}, the name
+        being the executable's own (its path's last part). None when ps will
+        not say — not "no processes".
+
+        `ps -A` sees every user's processes where `ss -p` does not: an engine
+        run as a service user (Ollama's installer makes one) shows here with
+        its name and memory. On Linux the name is cut at 15 characters by the
+        kernel; on macOS it is the whole path, spaces and all — so it is the
+        last column.
+        """
+        try:
+            res = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,rss=,comm="],
+                                 text=True, capture_output=True, timeout=5)
+        except Exception:
+            return None
+        if res.returncode != 0:
+            return None
+        table: dict[int, dict[str, Any]] = {}
+        for line in (res.stdout or "").splitlines():
+            parts = line.split(None, 3)
+            if len(parts) < 4 or not (parts[0].isdigit() and parts[1].isdigit() and parts[2].isdigit()):
+                continue
+            table[int(parts[0])] = {"ppid": int(parts[1]), "rssKb": int(parts[2]),
+                                    "name": parts[3].strip().rsplit("/", 1)[-1]}
+        return table
 
     def nvidia_smi(self) -> dict[str, Any]:
         """nvidia-smi as its own table, for the admin's monitor panel."""
@@ -272,18 +352,27 @@ class Machine:
             })
         return gpus
 
-    @staticmethod
-    def nvidia_apps() -> list[dict[str, Any]]:
+    #: What nvidia-smi answers "who is on the card" with, in this order: the
+    #: card, the process, its name (2.12) and the memory it holds.
+    APPS_QUERY = "--query-compute-apps=gpu_uuid,pid,process_name,used_memory"
+
+    #: How nvidia-smi says it cannot name a process (another PID namespace,
+    #: a process gone between two reads).
+    NO_PROCESS_NAME = ("[not found]", "[n/a]", "n/a", "[insufficient permissions]")
+
+    @classmethod
+    def nvidia_apps(cls) -> list[dict[str, Any]]:
         """Per-process GPU memory via nvidia-smi, so the admin can map a llama-server
         PID to the GPU(s) it occupies (many-to-many: N servers per GPU, or one
-        server split across N GPUs). Returns [{gpuUuid, pid, usedMiB}]."""
+        server split across N GPUs). Returns [{gpuUuid, pid, name, usedMiB}].
+
+        `name` (2.12) is the process's executable, its path's last part, ""
+        when nvidia-smi cannot name it: the board names the memory that is
+        not a cell's — "ollama 6.1 GB" instead of "outside 6.1 GB". A name
+        with a comma in it stays whole: the memory is the last column."""
         try:
             result = subprocess.run(
-                [
-                    "nvidia-smi",
-                    "--query-compute-apps=gpu_uuid,pid,used_memory",
-                    "--format=csv,noheader,nounits",
-                ],
+                ["nvidia-smi", cls.APPS_QUERY, "--format=csv,noheader,nounits"],
                 text=True,
                 capture_output=True,
                 timeout=5,
@@ -295,12 +384,16 @@ class Machine:
         apps: list[dict[str, Any]] = []
         for line in result.stdout.splitlines():
             parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 3 or not parts[1].isdigit():
+            if len(parts) < 4 or not parts[1].isdigit():
                 continue
+            name = ",".join(parts[2:-1]).strip()
+            if name.lower() in cls.NO_PROCESS_NAME:
+                name = ""
             apps.append({
                 "gpuUuid": parts[0],
                 "pid": int(parts[1]),
-                "usedMiB": int(parts[2]) if parts[2].isdigit() else 0,
+                "name": name.rsplit("/", 1)[-1],
+                "usedMiB": int(parts[-1]) if parts[-1].isdigit() else 0,
             })
         return apps
 

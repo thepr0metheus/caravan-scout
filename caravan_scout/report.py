@@ -23,8 +23,11 @@ class Report:
     other every minute.
     """
 
-    def __init__(self, config, state, machine, cells, builds, autostart, suspect, telemetry, identity=None):
+    def __init__(self, config, state, machine, cells, builds, autostart, suspect, telemetry, identity=None,
+                 engines=None):
         self.config = config
+        # Ollama, LM Studio on this machine (2.12): their last scan.
+        self.engines = engines
         # The name the board shows follows the machine's hostname (a rename
         # shows at the next report); without one, the configured name.
         self.identity = identity
@@ -70,6 +73,9 @@ class Report:
                 "controllerUrl": self.config.get("controllerUrl"),
                 "gpus": gpus,
                 "computeApps": compute_apps,
+                # Model engines on this machine that are not its cells (2.12):
+                # None before the first scan, [] when none were found.
+                "engines": self.engines.views() if self.engines else None,
                 "cpu": cpu_ram,
                 "platform": sys.platform,
                 "heartbeat": self.state.get("heartbeat", {}),
@@ -119,6 +125,7 @@ class Report:
             "host": state["host"],
             "gpus": state.get("gpus", []),
             "computeApps": state.get("computeApps", []),
+            "engines": state["engines"],
             "cpu": state.get("cpu", {}),
             "platform": state.get("platform", ""),
             "llamaNode": self.cells.first_view(),

@@ -7,6 +7,7 @@ from caravan_scout.autostart import Autostart
 from caravan_scout.builds import LlamaBuilds
 from caravan_scout.cells import Cells
 from caravan_scout.config import ScoutConfig
+from caravan_scout.engines import ForeignEngines
 from caravan_scout.heartbeat import Heartbeat
 from caravan_scout.identity import HostIdentity
 from caravan_scout.machine import Machine
@@ -48,7 +49,10 @@ class Scout:
         self.autostart = Autostart(self.state, self.cells, self.machine)
         self.suspect = CrashSuspect(self.state, self.builds)
         self.telemetry = Telemetry(self.machine)
+        # Ollama, LM Studio: model engines on this machine that are not its
+        # cells — who holds the cards' memory besides them (read only).
+        self.engines = ForeignEngines(self.machine, self.cells)
         self.watchdog = Watchdog(self.cells, self.suspect)
         self.report = Report(self.config, self.state, self.machine, self.cells, self.builds, self.autostart,
-                             self.suspect, self.telemetry, identity=self.identity)
+                             self.suspect, self.telemetry, identity=self.identity, engines=self.engines)
         self.heartbeat = Heartbeat(self.config, self.state, self.report, self.cells)

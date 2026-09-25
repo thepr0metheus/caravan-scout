@@ -31,6 +31,8 @@ def main(argv: list[str] | None = None) -> int:
     threading.Thread(target=agent.watchdog.run, daemon=True).start()
     # The machine second by second while a board watches it (Telemetry).
     threading.Thread(target=agent.telemetry.run, daemon=True).start()
+    # The engines next to the cells (ForeignEngines), rescanned on their own.
+    threading.Thread(target=agent.engines.run, daemon=True).start()
     heartbeat = threading.Thread(target=agent.heartbeat.loop, daemon=True)
     heartbeat.start()
 

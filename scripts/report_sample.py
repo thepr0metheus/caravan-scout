@@ -45,7 +45,43 @@ class ReportSample:
            "memoryTotalMiB": "24576", "memoryUsedMiB": "20480", "memoryFreeMiB": "4096",
            "utilizationGpuPct": "37", "temperatureC": "61", "powerDrawW": "212.40",
            "uuid": "GPU-00000000-0000-0000-0000-000000000000"}
-    APP = {"gpuUuid": "GPU-00000000-0000-0000-0000-000000000000", "pid": 4242, "usedMiB": 20000}
+    APP = {"gpuUuid": "GPU-00000000-0000-0000-0000-000000000000", "pid": 4242, "name": "llama-server",
+           "usedMiB": 20000}
+    # Ollama's runner on the same card (2.12): its memory is named by its engine.
+    OLLAMA_APP = {"gpuUuid": "GPU-00000000-0000-0000-0000-000000000000", "pid": 5151, "name": "ollama",
+                  "usedMiB": 3500}
+    # What listens and runs besides the cells (2.12): Ollama on the network
+    # with its runner, LM Studio on this machine only.
+    LISTENERS = {"ok": True, "ports": [
+        {"port": 1234, "proc": "LM Studio", "pid": 613, "addrs": ["127.0.0.1"]},
+        {"port": 11434, "proc": "", "pid": 0, "addrs": ["0.0.0.0", "[::]"]},
+        {"port": 22001, "proc": "llama-server", "pid": 4242, "addrs": ["0.0.0.0"]}]}
+    PROCESSES = {5100: {"ppid": 1, "rssKb": 204800, "name": "ollama"},
+                 5151: {"ppid": 5100, "rssKb": 1048576, "name": "ollama"},
+                 613: {"ppid": 1, "rssKb": 409600, "name": "LM Studio"},
+                 4242: {"ppid": 1, "rssKb": 2097152, "name": "llama-server"}}
+    # The engines' own answers, by port and path.
+    ENGINE_ANSWERS = {
+        (11434, "/api/version"): (200, {"version": "0.12.3"}),
+        (11434, "/api/ps"): (200, {"models": [
+            {"name": "qwen3:8b", "model": "qwen3:8b", "size": 6_591_830_464, "size_vram": 5_333_539_264,
+             "context_length": 4096, "expires_at": "2026-09-22T17:00:00+00:00",
+             "details": {"format": "gguf", "family": "qwen3", "parameter_size": "8.2B",
+                         "quantization_level": "Q4_K_M"}}]}),
+        (11434, "/api/tags"): (200, {"models": [
+            {"name": "qwen3:8b", "model": "qwen3:8b", "size": 5_225_388_164,
+             "details": {"format": "gguf", "family": "qwen3", "parameter_size": "8.2B",
+                         "quantization_level": "Q4_K_M"}},
+            {"name": "gpt-oss:120b-cloud", "model": "gpt-oss:120b-cloud", "size": 384,
+             "remote_host": "https://ollama.com:443", "details": {"format": "", "family": "gptoss",
+                                                                 "parameter_size": "116.8B",
+                                                                 "quantization_level": "MXFP4"}}]}),
+        (1234, "/api/v1/models"): (200, {"models": [
+            {"type": "llm", "publisher": "google", "key": "google/gemma-3-4b", "display_name": "Gemma 3 4B",
+             "architecture": "gemma3", "quantization": {"name": "Q4_K_M", "bits_per_weight": 4},
+             "size_bytes": 3_340_000_000, "params_string": "4B", "max_context_length": 131072, "format": "gguf",
+             "loaded_instances": [{"id": "google/gemma-3-4b", "config": {"context_length": 8192, "parallel": 4}}]}]}),
+    }
     CPU = {"loadPct": 12.5, "load1": 1.5, "ncpu": 12, "logicalCores": 12, "availableCores": 12,
            "physicalCores": 6, "ram": {"usedGb": 18.2, "totalGb": 62.7}}
     METRICS = {"promptTps": 812.5, "genTps": 41.3, "requestsProcessing": 1, "ctxMax": 8192, "ctxUsed": 2048}
@@ -90,7 +126,10 @@ class ReportSample:
         scout.cells.report(22002, phase="downloading", modelPath="models/org/other-q8.gguf",
                            downloadedBytes=1_000_000, totalBytes=4_000_000, downloadingFile="other-q8.gguf",
                            startedAt=self.NOW - 30)
-        machine = {"gpus": lambda: [dict(self.GPU)], "compute_apps": lambda: [dict(self.APP)],
+        machine = {"gpus": lambda: [dict(self.GPU)],
+                   "compute_apps": lambda: [dict(self.APP), dict(self.OLLAMA_APP)],
+                   "listeners": lambda: json.loads(json.dumps(self.LISTENERS)),
+                   "processes": lambda: {pid: dict(p) for pid, p in self.PROCESSES.items()},
                    "cpu_ram": lambda: json.loads(json.dumps(self.CPU)), "address": lambda: "10.0.0.5",
                    "firewall": lambda port: {"state": "open", "allowedFrom": []},
                    "listening_ports": lambda: {22001, 22012}}
@@ -113,7 +152,11 @@ class ReportSample:
                                                                       else {})), \
                 patched(CellProcess, pid_alive=staticmethod(lambda pid: pid in (4242, 4343, 4444))), \
                 patched(socket, gethostname=lambda: "box-a.lan"), patched(time, time=lambda: float(self.NOW)), \
-                patched(sys, platform="linux"), patched(report_module, APP_VERSION=self.VERSION):
+                patched(sys, platform="linux"), patched(report_module, APP_VERSION=self.VERSION), \
+                patched(scout.engines, ask=lambda port, host="127.0.0.1":
+                        (lambda path: self.ENGINE_ANSWERS.get((port, path), (404, None)))):
+            # The engines are scanned by their own thread; here, once, by hand.
+            scout.engines.refresh()
             return {"heartbeat": scout.report.heartbeat(), "state": scout.report.public()}
 
     def text(self) -> str:

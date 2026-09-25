@@ -186,7 +186,7 @@ GPU_QUERY = ["nvidia-smi",
              "--query-gpu=index,name,memory.total,memory.used,memory.free,"
              "utilization.gpu,temperature.gpu,power.draw,uuid",
              "--format=csv,noheader,nounits"]
-APPS_QUERY = ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,used_memory",
+APPS_QUERY = ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
               "--format=csv,noheader,nounits"]
 UUID_A = "GPU-00000000-0000-0000-0000-00000000000a"
 UUID_B = "GPU-00000000-0000-0000-0000-00000000000b"
@@ -267,13 +267,22 @@ LISTEN 0      4096            [::]:9100          [::]:*
 garbage
 LISTEN 0      128             [::]:ssh           [::]:*
 """
-LISTENERS = [{"port": 22, "proc": "", "pid": 0},
-             {"port": 80, "proc": "nginx", "pid": 10},
-             {"port": 3000, "proc": "node", "pid": 777},
-             {"port": 8092, "proc": "python3", "pid": 900},
-             {"port": 9000, "proc": "first", "pid": 1},
-             {"port": 9100, "proc": "exporter", "pid": 55},
-             {"port": 22001, "proc": "llama-server", "pid": 4242}]
+LISTENERS = [{"port": 22, "proc": "", "pid": 0, "addrs": ["0.0.0.0", "[::]"]},
+             {"port": 80, "proc": "nginx", "pid": 10, "addrs": ["0.0.0.0"]},
+             {"port": 3000, "proc": "node", "pid": 777, "addrs": ["127.0.0.1"]},
+             {"port": 8092, "proc": "python3", "pid": 900, "addrs": ["0.0.0.0", "[::]"]},
+             {"port": 9000, "proc": "first", "pid": 1, "addrs": ["0.0.0.0", "[::]"]},
+             {"port": 9100, "proc": "exporter", "pid": 55, "addrs": ["0.0.0.0", "[::]"]},
+             {"port": 22001, "proc": "llama-server", "pid": 4242, "addrs": ["0.0.0.0", "[::]"]}]
+
+# lsof on macOS (+c 0: whole names; a space in one is written \x20).
+LSOF_LISTEN = """COMMAND     PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+ollama      512 op     3u  IPv4 0x1111111111111111      0t0  TCP 127.0.0.1:11434 (LISTEN)
+LM\\x20Studio 613 op    41u  IPv6 0x2222222222222222      0t0  TCP *:1234 (LISTEN)
+LM\\x20Studio 613 op    42u  IPv4 0x3333333333333333      0t0  TCP *:1234 (LISTEN)
+ssh         821 op     5u  IPv6 0x4444444444444444      0t0  TCP [::1]:9119 (LISTEN)
+garbage
+"""
 
 
 def by_port(rows, port):
@@ -321,20 +330,32 @@ def test_nvidia_gpus():
 
 def test_nvidia_apps():
     CHECKS.section("память карт по процессам:")
-    out = (f"{UUID_A}, 4242, 20480\n{UUID_B}, 4242, 18000\n{UUID_A}, 5151, [N/A]\n"
-           f"{UUID_A}, [N/A], 100\n{UUID_B}, 6161\n\n")
+    out = (f"{UUID_A}, 4242, /opt/llama/llama-server, 20480\n{UUID_B}, 4242, /opt/llama/llama-server, 18000\n"
+           f"{UUID_A}, 5151, python3, [N/A]\n"
+           f"{UUID_A}, [N/A], ollama, 100\n{UUID_B}, 6161, 7\n\n")
     run = KwRun({("nvidia-smi",): (0, out)})
     with patched(subprocess, run=run):
         got = outcome(Machine.nvidia_apps)
-    same(got, [{"gpuUuid": UUID_A, "pid": 4242, "usedMiB": 20480},
-               {"gpuUuid": UUID_B, "pid": 4242, "usedMiB": 18000},
-               {"gpuUuid": UUID_A, "pid": 5151, "usedMiB": 0}],
+    same(got, [{"gpuUuid": UUID_A, "pid": 4242, "name": "llama-server", "usedMiB": 20480},
+               {"gpuUuid": UUID_B, "pid": 4242, "name": "llama-server", "usedMiB": 18000},
+               {"gpuUuid": UUID_A, "pid": 5151, "name": "python3", "usedMiB": 0}],
          "pid→карта многие-ко-многим: один сервер на двух картах — две строки; pid и память числами")
-    same(run.calls, [APPS_QUERY], "запрос compute-apps: gpu_uuid, pid, used_memory")
+    same(run.calls, [APPS_QUERY], "запрос compute-apps: gpu_uuid, pid, process_name, used_memory (2.12)")
     same([k.get("timeout") for k in run.kwargs], [5], "таймаут 5 с")
+    same(dig(got, 0, "name"), "llama-server", "имя процесса — последняя часть пути, без каталога (2.12)")
     same(dig(got, 2, "usedMiB"), 0, "as-is: память «[N/A]» читается как 0 МиБ — неизвестное нарисовано нулём")
     same(len(got) if isinstance(got, list) else got, 3,
-         "negative: pid «[N/A]», строка из двух полей и пустая строка пропускаются")
+         "negative: pid «[N/A]», строка из трёх полей и пустая строка пропускаются")
+
+    names = (f"{UUID_A}, 700, [Not Found], 512\n{UUID_A}, 701, [N/A], 256\n"
+             f"{UUID_A}, 702, /srv/odd, name/tool, 128\n{UUID_A}, 703, , 64\n")
+    with patched(subprocess, run=KwRun({("nvidia-smi",): (0, names)})):
+        got = outcome(Machine.nvidia_apps)
+    same([dig(r, "name") for r in got] if isinstance(got, list) else got, ["", "", "tool", ""],
+         "negative: «[Not Found]» и «[N/A]» — имени нет, а не имя «[N/A]»; имя с запятой целое, от него — последняя часть; "
+         "пустое — пусто")
+    same([dig(r, "usedMiB") for r in got] if isinstance(got, list) else got, [512, 256, 128, 64],
+         "память — последняя колонка, даже когда в имени запятая")
     for name, answer in (("код возврата не 0", (9, SMI_BROKEN)),
                          ("nvidia-smi нет", FileNotFoundError(2, "No such file or directory"))):
         with patched(subprocess, run=KwRun({("nvidia-smi",): answer})):
@@ -563,20 +584,21 @@ def test_gpus_cache():
 def test_compute_apps_cache():
     CHECKS.section("кэш памяти по процессам на скауте (5 с):")
     clock = FakeClock()
-    run = KwRun({("nvidia-smi",): (0, f"{UUID_A}, 4242, 20480\n")})
+    run = KwRun({("nvidia-smi",): (0, f"{UUID_A}, 4242, llama-server, 20480\n")})
     scout = make_scout()
     with patched(time, time=clock.time), patched(subprocess, run=run):
         first = outcome(scout.machine.compute_apps)
-        run.table[("nvidia-smi",)] = (0, f"{UUID_A}, 5151, 1024\n")
+        run.table[("nvidia-smi",)] = (0, f"{UUID_A}, 5151, ollama, 1024\n")
         clock.now = T0 + 4.9
         cached = outcome(scout.machine.compute_apps)
         calls_cached = len(run.calls)
         clock.now = T0 + 5
         fresh = outcome(scout.machine.compute_apps)
         calls_fresh = len(run.calls)
-    same(first, [{"gpuUuid": UUID_A, "pid": 4242, "usedMiB": 20480}], "первый опрос — живая карта процессов")
+    same(first, [{"gpuUuid": UUID_A, "pid": 4242, "name": "llama-server", "usedMiB": 20480}],
+         "первый опрос — живая карта процессов")
     same((cached, calls_cached), (first, 1), "в пределах 5 с — из кэша")
-    same((fresh, calls_fresh), ([{"gpuUuid": UUID_A, "pid": 5151, "usedMiB": 1024}], 2),
+    same((fresh, calls_fresh), ([{"gpuUuid": UUID_A, "pid": 5151, "name": "ollama", "usedMiB": 1024}], 2),
          "boundary: ровно через 5 с — опрос заново и новый ответ")
 
     clock = FakeClock()
@@ -647,26 +669,45 @@ def test_listeners():
         got = outcome(scout.machine.listeners)
     same(got, {"ok": True, "ports": LISTENERS}, "по строке на порт, по возрастанию порта, владелец где ОС его назвала")
     rows = dig(got, "ports")
-    same(by_port(rows, 8092), {"port": 8092, "proc": "python3", "pid": 900},
-         "v4 без владельца и v6 с владельцем — одна строка, с владельцем")
-    same(by_port(rows, 9100), {"port": 9100, "proc": "exporter", "pid": 55},
+    same(by_port(rows, 8092), {"port": 8092, "proc": "python3", "pid": 900, "addrs": ["0.0.0.0", "[::]"]},
+         "v4 без владельца и v6 с владельцем — одна строка, с владельцем и обоими адресами")
+    same(by_port(rows, 9100), {"port": 9100, "proc": "exporter", "pid": 55, "addrs": ["0.0.0.0", "[::]"]},
          "negative: владелец из первой строки не затирается пустой второй")
-    same(by_port(rows, 9000), {"port": 9000, "proc": "first", "pid": 1}, "boundary: два владельца — первый")
-    same(by_port(rows, 80), {"port": 80, "proc": "nginx", "pid": 10}, "несколько процессов на сокете — первый")
-    same(by_port(rows, 22), {"port": 22, "proc": "", "pid": 0},
+    same(by_port(rows, 9000), {"port": 9000, "proc": "first", "pid": 1, "addrs": ["0.0.0.0", "[::]"]},
+         "boundary: два владельца — первый")
+    same(by_port(rows, 80), {"port": 80, "proc": "nginx", "pid": 10, "addrs": ["0.0.0.0"]},
+         "несколько процессов на сокете — первый")
+    same(by_port(rows, 22), {"port": 22, "proc": "", "pid": 0, "addrs": ["0.0.0.0", "[::]"]},
          "владелец неизвестен (не наш процесс, без root) — порт всё равно занят; as-is: pid 0")
-    same(run.calls, [["ss", "-ltnpH"]], "ss -ltnpH: с процессами")
+    same(dig(by_port(rows, 3000), "addrs"), ["127.0.0.1"],
+         "адрес, на котором слушает порт: только 127.0.0.1 — с другой машины его не достать (2.12)")
+    same(run.calls, [["ss", "-ltnpH"]], "ss -ltnpH: с процессами; есть ss — lsof не спрашивается")
     same([k.get("timeout") for k in run.kwargs], [6], "таймаут 6 с")
 
+    lsof = KwRun({("lsof",): (0, LSOF_LISTEN)})
+    with patched(subprocess, run=lsof):
+        got = outcome(scout.machine.listeners)
+    same(got, {"ok": True, "ports": [
+        {"port": 1234, "proc": "LM Studio", "pid": 613, "addrs": ["*"]},
+        {"port": 9119, "proc": "ssh", "pid": 821, "addrs": ["[::1]"]},
+        {"port": 11434, "proc": "ollama", "pid": 512, "addrs": ["127.0.0.1"]}]},
+         "нет ss (macOS) — lsof: имя целиком, «\\x20» — пробел, два сокета порта — одна строка (2.12; раньше — ничего)")
+    same(lsof.calls, [["ss", "-ltnpH"], ["lsof", "+c", "0", "-nP", "-iTCP", "-sTCP:LISTEN"]],
+         "сначала ss, потом lsof с целыми именами команд")
+    with patched(subprocess, run=KwRun({("lsof",): (1, "")})):
+        same(outcome(scout.machine.listeners), {"ok": True, "ports": []},
+             "boundary: lsof с кодом 1 и пустым stderr — его «таких сокетов нет»: никто не слушает")
+
     with patched(subprocess, run=KwRun({})):
-        same(outcome(scout.machine.listeners), {"ok": False, "error": "ss", "ports": []},
-             "negative: ss нет — ok false с текстом ошибки и пустым списком, а не «никто не слушает»")
+        same(outcome(scout.machine.listeners), {"ok": False, "error": "ss: ss; lsof: lsof", "ports": []},
+             "negative: ни ss, ни lsof — ok false с текстом обеих ошибок и пустым списком, а не «никто не слушает»")
     with patched(subprocess, run=KwRun({("ss",): OSError("x" * 300)})):
-        same(outcome(scout.machine.listeners), {"ok": False, "error": "x" * 160, "ports": []},
+        same(outcome(scout.machine.listeners), {"ok": False, "error": ("ss: " + "x" * 300)[:160], "ports": []},
              "boundary: текст ошибки обрезан до 160")
     with patched(subprocess, run=KwRun({("ss",): (1, "ss: unknown option -- H")})):
-        same(outcome(scout.machine.listeners), {"ok": True, "ports": []},
-             "as-is: код возврата ss не смотрится — упавший ss читается как «никто не слушает»")
+        same(outcome(scout.machine.listeners), {"ok": False, "error": "ss failed; lsof: lsof", "ports": []},
+             "negative: упавший ss — не «никто не слушает» (до 2.12 читался так): спрашивается lsof, "
+             "нет и его — ok false")
 
 
 def test_nvidia_smi():

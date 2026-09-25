@@ -1,5 +1,34 @@
 # Changelog
 
+## 2.12.1 — 2026-09-25
+
+- **The engines snapshot's example address is a documentation one.** 2.12.0's
+  test bound an engine to a made-up 192.168 address, which the public
+  mirror's leak scan cannot tell from a real one; it is 203.0.113.20
+  (TEST-NET-3) now. No change to the scout itself.
+
+## 2.12.0 — 2026-09-25
+
+- **The engines next to the cells are named.** Ollama or LM Studio on the
+  same machine held part of a card, and the board could only say "outside
+  6.1 GB". The report now carries `engines`: each one found where it listens
+  by default (11434, 1234) or where a process of its name listens — never on
+  a cell's port — with its version, whether it takes connections from the
+  network or from this machine only, its models (what is loaded, the memory
+  and VRAM a loaded Ollama model holds, the window it serves, when
+  keep_alive unloads it; an Ollama cloud model marked as not running here),
+  its processes and their memory. Read only: GET on the engine's own API,
+  nothing loaded, unloaded or stopped. Rescanned every 10 s on a thread of
+  its own, so a hung engine never holds a report; `null` before the first
+  scan, `[]` when none was found.
+- **The processes on a card have names.** `computeApps` rows carry `name`,
+  the executable nvidia-smi names ("" when it cannot) — so memory that is not
+  a cell's can be named even when it is no engine.
+- **Listeners on macOS, and where they are bound.** `/api/host/listeners`
+  used `ss` only and answered nothing on macOS; `lsof` stands in where there
+  is no ss. Each port says the addresses it is bound on (`addrs`). A failed
+  ss read as "nothing listens"; a tool that fails is `{ok: false}` now.
+
 ## 2.11.0 — 2026-09-25
 
 - **A running cell says which of its files changed on disk.** A process
