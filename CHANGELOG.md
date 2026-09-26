@@ -1,5 +1,29 @@
 # Changelog
 
+## 2.20.0 — 2026-09-26
+
+- **A cell answers to its key (`cellKey`).** Step 1 of keys on every
+  cell's door: the controller will derive one key per port and its proxy
+  will present it. A start request may now carry `cellKey`; the process
+  gets it as `LLAMA_API_KEY`, `VLLM_API_KEY` and `CARAVAN_CELL_KEY` (each
+  server reads its own), and the scout's own requests to the cell —
+  `/metrics`, `/props`, its health at re-adoption — carry it, or a closed
+  cell would lose its speeds and the context window the routes are sized
+  by. The key stays out of the command line, start.sh and cell.json
+  (start.sh reads it from `cell.key`, 0600), the report and the log tails.
+  Each running cell's view says `door`: `closed` when a request without
+  the key is refused, `open` when it is served — asked once per start.
+  A controller that sends no key gets cells as before: open, and said so.
+- **A command cell takes `env` too.** It was dropped without a word; the
+  names the scout sets itself (the key's, and the marker it finds its cells
+  by) are refused in `env`, and the marker is set last, so no environment a
+  start carries can take it away.
+- **Secrets on disk are the owner's only.** `config.json` holds the fleet
+  token and `state.json` the cells' start requests, now with their keys;
+  written with the machine's umask they were 0664, readable by every user
+  of the machine. Both are now written 0600, through a temp file as before.
+  `var/` is ignored by git.
+
 ## 2.19.1 — 2026-09-26
 
 - **The driver facts say what the firmware and dpkg say, not a guess.**

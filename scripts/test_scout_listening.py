@@ -74,12 +74,16 @@ class Running:
     def changed_since(self, started_at):
         return []
 
+    def launch_spec(self):
+        return None
+
 
 def view(listening, tail="[caravan] provisioning vLLM venv\nCollecting vllm==0.24.0"):
     s = make_scout()
     cell = s.cells.at(22013)
     cell.process = Running(tail)
-    with patched(s.cells.probe, metrics=lambda port: {}), \
+    with patched(s.cells.probe, metrics=lambda port, headers=None: {}), \
+            patched(s.cells.door, measure=lambda port, identity: None), \
             patched(s.machine, firewall=lambda port: {}, listening_ports=lambda: listening):
         return s.cells.view(cell)
 

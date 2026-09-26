@@ -12,16 +12,24 @@ from pathlib import Path
 from typing import Any
 
 from caravan_scout.cell_assets import CellAssets
+from caravan_scout.cell_key import CellKey
 from caravan_scout.errors import AppError
 from caravan_scout.paths import (LLAMA_PATH_PLACEHOLDER_MMPROJ, LLAMA_PATH_PLACEHOLDER_MODEL,
                                  LLAMA_PATH_PLACEHOLDER_SPEC, SERVER_CELLS_DIR)
+from caravan_scout.private_file import PrivateFile
+from caravan_scout.process import HostProcesses
 
 
 class CellArtifacts:
     """What a llama cell leaves next to itself under var/server-cells/<port>/:
     start.sh — the exact command, runnable by hand — and cell.json — what it
     was started with. Both are replaced atomically: a reader of the old file
-    sees it whole."""
+    sees it whole.
+
+    The cell's key (CellKey) is in neither: start.sh is 0755, and both are
+    what a person opens to see how the cell runs. It goes to cell.key, 0600,
+    and start.sh reads it from there — run by hand, the cell is as closed as
+    the one this scout started, and without the file it does not start."""
 
     def __init__(self, config):
         self.config = config
@@ -38,8 +46,17 @@ class CellArtifacts:
         start_path = cell_dir / "start.sh"
         json_path = cell_dir / "cell.json"
         cmd = [str(Path(bin_path).expanduser()), *[str(a) for a in args]]
-        env = dict(env or {})
+        key = CellKey.of_env(env)
+        env = CellKey.public(env)
         exports = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in env.items())
+        key_path = cell_dir / "cell.key"
+        if key.value:
+            PrivateFile(key_path).write(key.value + "\n")
+            exports += ("# The cell's key, kept in cell.key (0600): the caravan's proxy presents it.\n"
+                        "CELL_KEY=\"$(cat \"$(dirname \"$0\")/cell.key\")\"\n"
+                        "export " + " ".join(f'{name}="$CELL_KEY"' for name in CellKey.ENV) + "\n")
+        else:
+            key_path.unlink(missing_ok=True)   # an earlier start's key is not this one's
         script = ("#!/usr/bin/env bash\nset -euo pipefail\n\n" + exports + "exec "
                   + " ".join(shlex.quote(x) for x in cmd) + " \"$@\"\n")
         tmp_start = start_path.with_suffix(".sh.tmp")
@@ -54,6 +71,7 @@ class CellArtifacts:
             "runtime": runtime_cfg,
             "cmd": cmd,
             "env": env,
+            "keyed": bool(key.value),
             "generatedAt": int(time.time()),
             "startScript": str(start_path),
         }
@@ -91,6 +109,34 @@ class CellStart:
 
     def run(self) -> dict[str, Any]:
         raise NotImplementedError
+
+    #: What a shell accepts as a variable name.
+    ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+    def process_env(self) -> dict[str, str]:
+        """The environment the cell starts with over this scout's own: the
+        controller's `env` (NAME -> value) — a CPU-only llama cell gets
+        CUDA_VISIBLE_DEVICES="", since a CUDA build of llama.cpp still wakes
+        the card at -ngl 0 and dies of out-of-memory when a neighbour fills
+        it — and the cell's key under the names its server reads (CellKey).
+
+        Refused when malformed: a cell started with a guess at its environment
+        is the wrong cell. The key's names and the marker this scout finds its
+        cells by are the scout's to set, not the controller's: the key comes
+        as `cellKey`, so it is known for a secret wherever it goes next."""
+        key = CellKey.from_payload(self.payload)
+        env = self.payload.get("env")
+        if env is None:
+            env = {}
+        if not isinstance(env, dict) or not all(
+                isinstance(k, str) and self.ENV_NAME.fullmatch(k) and isinstance(v, str)
+                for k, v in env.items()):
+            raise AppError("env must map variable names to strings", 400)
+        reserved = sorted(set(env) & {*CellKey.ENV, HostProcesses.CELL_ENV})
+        if reserved:
+            raise AppError(f"env may not set {', '.join(reserved)} — the scout sets them "
+                           f"(the key comes as cellKey)", 400)
+        return {**env, **key.env()}
 
     def hints(self) -> dict[str, Any]:
         """Where the controller reads each model file, keyed by the path this
@@ -194,7 +240,7 @@ class LlamaStart(CellStart):
         model_path_raw = str(payload.get("modelPath") or config.get("MODEL_FILE") or "").strip()
         if not model_path_raw:
             raise AppError("modelPath is required", 400)
-        env = self.engine_env()
+        env = self.process_env()
         if not config:
             config = self.config = {
                 "MODEL_FILE": model_path_raw,
@@ -231,25 +277,6 @@ class LlamaStart(CellStart):
         threading.Thread(target=launch.run, daemon=True).start()
         return {"ok": True, "status": "starting", "phase": "resolving", "port": port}
 
-    #: What a shell accepts as a variable name.
-    ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-
-    def engine_env(self) -> dict[str, str]:
-        """The environment llama-server starts with over this scout's own
-        (`env`, NAME -> value) — the one the controller's start.sh exports:
-        a CPU-only cell gets CUDA_VISIBLE_DEVICES="", since a CUDA build of
-        llama.cpp still wakes the card at -ngl 0 and dies of out-of-memory
-        when a neighbour fills it. This scout used to start that cell with the
-        card in view. Refused when malformed: an engine started with a guess
-        at its environment is the wrong engine."""
-        env = self.payload.get("env")
-        if env is None:
-            return {}
-        if not isinstance(env, dict) or not all(
-                isinstance(k, str) and self.ENV_NAME.fullmatch(k) and isinstance(v, str)
-                for k, v in env.items()):
-            raise AppError("env must map variable names to strings", 400)
-        return dict(env)
 
 
 class LlamaLaunch:
@@ -262,7 +289,7 @@ class LlamaLaunch:
                  cache_models: bool = False, args: list[str] | None = None,
                  hints: dict[str, Any] | None = None, env: dict[str, str] | None = None):
         self.hints = dict(hints or {})   # where the controller reads each file
-        self.env = dict(env or {})       # what the engine starts with (LlamaStart.engine_env)
+        self.env = dict(env or {})       # what the engine starts with (CellStart.process_env)
         self.cells = cells
         self.port = port
         self.bin_path = bin_path
@@ -438,6 +465,7 @@ class CommandStart(CellStart):
                          str(payload.get("command") or config.get("COMMAND") or "").strip()).strip()
         if not command:
             raise AppError("command is required for a command cell", 400)
+        env = self.process_env()
         port = self.port()
         refusal = self.busy(port) or self.short_of_vram(port)
         if refusal:
@@ -502,7 +530,7 @@ class CommandStart(CellStart):
         except Exception as exc:  # noqa: BLE001
             print(f"[llama-node] cell-assets :{port} skipped ({exc})")
         result = cell.process.start_command(shell_line, cfg, log_path=log_path,
-                                            extra_env=self.models_root(model_raw, model_abs))
+                                            extra_env={**env, **self.models_root(model_raw, model_abs)})
         cells.report(port, phase="running" if result.get("ok") else "error",
                      error="" if result.get("ok") else (result.get("error") or "start failed"))
         if result.get("ok"):

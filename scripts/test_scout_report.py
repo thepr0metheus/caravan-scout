@@ -110,8 +110,11 @@ def test_state():
     scout.state.save()
     text = scout.state.path.read_text(encoding="utf-8")
     check(json.loads(text)["x"] == "ü" and '"ü"' in text and "\n  " in text
-          and not scout.state.path.with_suffix(".tmp").exists(),
+          and not scout.state.path.with_name("state.json.tmp").exists(),
           "запись — через .tmp и замену, с отступом, без \\u-экранирования")
+    check(scout.state.path.stat().st_mode & 0o777 == 0o600,
+          "state.json — 0600 (2.20): в нём запросы старта и запуски ячеек, а с ними их ключи; с umask машины "
+          "(002) он был 0664 — его читал любой пользователь")
 
 
 def test_token():
@@ -163,6 +166,28 @@ def test_pairing():
           "defect-history: «http://» — отказ; раньше снятие хвостового / давало «http:», "
           "та получала второй http:// и проходила хостом «http»")
 
+
+
+def test_private_files():
+    CHECKS.section("файлы с секретами — только владельцу (2.20):")
+    from caravan_scout.private_file import PrivateFile
+    scout = make_scout()
+    scout.config.pair("http://10.0.0.2:7990", "tok-" + "x" * 20)
+    check(scout.config.path.stat().st_mode & 0o777 == 0o600,
+          "config.json после сопряжения — 0600: в нём токен флота (был 0664)")
+    target = scout.state.path.with_name("private-test.json")
+    target.write_text("old", encoding="utf-8")
+    reader = target.with_name("private-test.reader")
+    os.link(target, reader)
+    leftover = target.with_name("private-test.json.tmp")
+    leftover.write_text("crash leftovers", encoding="utf-8")
+    leftover.chmod(0o644)
+    PrivateFile(target).write("new")
+    check(target.read_text(encoding="utf-8") == "new" and target.stat().st_mode & 0o777 == 0o600
+          and not leftover.exists(),
+          "временный файл, оставшийся от аварии с правами 0644, не передаёт их: новый файл — 0600, временного нет")
+    check(reader.read_text(encoding="utf-8") == "old" and reader.stat().st_ino != target.stat().st_ino,
+          "negative: запись атомарна — читатель старого файла видит его целым")
 
 @contextlib.contextmanager
 def _stub_probes(scout, gpus=None, nodes=None):
@@ -429,7 +454,8 @@ def test_live_numbers():
     props = json.dumps({"default_generation_settings": {"n_ctx": 8192}}).encode()
     asked = []
 
-    def urlopen(url, timeout=None):
+    def urlopen(req, timeout=None):
+        url = getattr(req, "full_url", req)   # a Request since the probes carry the cell's key (2.20)
         asked.append(url)
         return FakeResponse(metrics if url.endswith("/metrics") else props)
     clock = [1000.0]
@@ -471,8 +497,8 @@ def test_live_numbers_vllm():
                 {"prompt": 10.0, "gen": 5.0, "gen2": 0.0}]
     clock = [5000.0]
 
-    def urlopen(url, timeout=None):
-        if url.endswith("/props"):
+    def urlopen(req, timeout=None):
+        if getattr(req, "full_url", req).endswith("/props"):
             raise OSError("404")
         return FakeResponse((VLLM_METRICS % readings[0]).encode())
     probe = make_scout().cells.probe
@@ -494,8 +520,8 @@ def test_live_numbers_vllm():
               "negative: счётчики уменьшились (vLLM перезапущен) — скорости нет, а не отрицательная")
     late = [{"prompt": 500.0}, {"prompt": 900.0, "gen": 800.0}]
 
-    def partial(url, timeout=None):
-        if url.endswith("/props"):
+    def partial(req, timeout=None):
+        if getattr(req, "full_url", req).endswith("/props"):
             raise OSError("404")
         body = "".join(f'vllm:{k}_tokens_total{{engine="0"}} {v}\n'
                        for k, v in (("prompt", late[0].get("prompt")), ("generation", late[0].get("gen"))) if v)
@@ -524,7 +550,7 @@ def test_report_sample():
         check(not sample.current(), "negative: поле в пульсе добавлено или переименовано — образец уже не совпадает")
 
 
-for fn in (test_config, test_state, test_token, test_pairing, test_public_state, test_heartbeat_payload,
+for fn in (test_config, test_state, test_private_files, test_token, test_pairing, test_public_state, test_heartbeat_payload,
            test_heartbeat_once, test_heartbeat_pace, test_unpair, test_local_ip, test_binary_version,
            test_live_numbers, test_live_numbers_vllm, test_report_sample):
     fn()

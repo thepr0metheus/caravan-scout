@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 from caravan_scout.errors import AppError
 from caravan_scout.paths import DEFAULT_CONFIG
+from caravan_scout.private_file import PrivateFile
 
 
 class ScoutConfig:
@@ -120,7 +121,5 @@ class ScoutConfig:
         return {}
 
     def _write(self, raw: dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        tmp.replace(self.path)
+        # 0600 (2.20): the fleet token is in it.
+        PrivateFile(self.path).write(json.dumps(raw, ensure_ascii=False, indent=2) + "\n")

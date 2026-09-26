@@ -46,6 +46,9 @@ class FakeProcess:
     def changed_since(self, started_at):
         return []
 
+    def launch_spec(self):
+        return None
+
     def crash(self, reason="CUDA error: out of memory", code=1, log=""):
         self.state = {"running": False, "exitCode": code, "lastError": reason, "crashed": code != 0}
         self.log = log
@@ -167,7 +170,8 @@ def test_the_last_lines():
           "падение — заметка берёт последние строки лога упавшего запуска")
     clock.now += 10
     ticks(dog)
-    with patched(s.cells.probe, metrics=lambda port: {}), \
+    with patched(s.cells.probe, metrics=lambda port, headers=None: {}), \
+            patched(s.cells.door, measure=lambda port, identity: None), \
             patched(s.cells.machine, firewall=lambda port: {}, listening_ports=lambda: {22021}):
         view = s.cells.view(cell)
     check(proc.relaunches == 1 and (view.get("crash") or {}).get("tail") == "E load: tensor data is not within the file bounds\nE main: exiting",

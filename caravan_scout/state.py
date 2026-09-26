@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from caravan_scout.private_file import PrivateFile
+
 
 class ScoutState(dict):
     """state.json as the document it is: the heartbeat's last outcome, when
@@ -48,7 +50,6 @@ class ScoutState(dict):
         return {}
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(self.path)
+        # 0600 (2.20): the cells' start requests and launches are in it, and
+        # with them their keys.
+        PrivateFile(self.path).write(json.dumps(self, ensure_ascii=False, indent=2))

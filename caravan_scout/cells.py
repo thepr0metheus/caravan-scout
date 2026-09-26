@@ -8,10 +8,12 @@ import signal
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
+from caravan_scout.cell_key import CellKey
 from caravan_scout.models import ModelFetcher
 from caravan_scout.process import CellProcess, HostProcesses
 from caravan_scout.starts import CellStart
@@ -48,7 +50,9 @@ class ServerProbe:
     rate. Lines with labels (vLLM's engine, model) are summed per name.
 
     A server that does not answer says nothing: no metrics, a window of 0 —
-    and that silence is kept as long as an answer would be.
+    and that silence is kept as long as an answer would be. Both paths are
+    closed on a cell with a key (2.20): the requests carry the cell's key
+    (`headers`, CellKey), or a closed cell would say nothing at all.
     """
 
     #: Read as they are: Prometheus name -> the view's key.
@@ -68,7 +72,7 @@ class ServerProbe:
     def now(self) -> float:
         return self.clock() if self.clock else time.time()
 
-    def metrics(self, port) -> dict[str, Any]:
+    def metrics(self, port, headers: dict[str, str] | None = None) -> dict[str, Any]:
         """Scrape the cell's /metrics (Prometheus) for live token rates and
         its queue. Cached ~2s. Returns {promptTps, genTps, requestsProcessing,
         requestsWaiting (vLLM)} — each only when the server says it."""
@@ -79,7 +83,8 @@ class ServerProbe:
         out: dict[str, Any] = {}
         counted: dict[str, float] = {}
         try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{int(port)}/metrics", timeout=1) as r:
+            with urllib.request.urlopen(urllib.request.Request(
+                    f"http://127.0.0.1:{int(port)}/metrics", headers=dict(headers or {})), timeout=1) as r:
                 for line in r.read().decode("utf-8", "replace").splitlines():
                     if line.startswith("#") or not line.strip():
                         continue
@@ -111,7 +116,7 @@ class ServerProbe:
                         out[self.COUNTERS[name]] = round((value - prev) / (now - before[0]), 2)
             self._counted[port] = (now, counted)
         # Context window the server launched with + live KV-cache occupancy.
-        ctx_max = self.ctx_max(port)
+        ctx_max = self.ctx_max(port, headers)
         ratio = out.pop("_kvRatio", None)
         if ctx_max:
             out["ctxMax"] = ctx_max
@@ -120,7 +125,7 @@ class ServerProbe:
         self._metrics[port] = (now, out)
         return out
 
-    def ctx_max(self, port) -> int:
+    def ctx_max(self, port, headers: dict[str, str] | None = None) -> int:
         """n_ctx the llama-server was launched with, from /props. Cached ~30s
         PER PORT (same single-slot thrash as Machine.firewall — see its note)."""
         now = self.now()
@@ -129,7 +134,8 @@ class ServerProbe:
             return hit[1]
         ctx = 0
         try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{int(port)}/props", timeout=1) as r:
+            with urllib.request.urlopen(urllib.request.Request(
+                    f"http://127.0.0.1:{int(port)}/props", headers=dict(headers or {})), timeout=1) as r:
                 props = json.loads(r.read().decode("utf-8", "replace"))
             gen = props.get("default_generation_settings") or {}
             ctx = int(gen.get("n_ctx") or props.get("n_ctx") or 0)
@@ -137,6 +143,57 @@ class ServerProbe:
             ctx = 0
         self._ctx[port] = (now, ctx)
         return ctx
+
+
+class CellDoor:
+    """Whether a running cell lets in a request that carries no key (2.20).
+
+    The controller derives a key per cell and the proxy presents it; a cell
+    started with one refuses everyone else. Whether it does is measured, not
+    assumed from the start request: a GET without a key to a path under /v1
+    that no server serves. llama-server, vLLM and the caravan's cell servers
+    all check a key before they route, so the answer says it:
+
+    - "closed": 401 or 403 — the key was asked for;
+    - "open": any other answer the server gave (200, 404…) — it served a
+      request that had no key: a cell started before keys, or a server that
+      checks none;
+    - None: it could not say — still loading (5xx), refused, timed out.
+
+    A process's key is fixed when it starts, so a definite answer holds for
+    that process (`identity`: its pid and start). It is asked once per start,
+    and again only while unknown, at most every RETRY seconds: every refusal
+    is a warning line in the engine's log.
+    """
+
+    PATH = "/v1/caravan-door"
+    RETRY = 30
+
+    def __init__(self, clock: Callable[[], float] | None = None):
+        self.clock = clock
+        self._known: dict[Any, tuple[Any, str | None, float]] = {}
+
+    def measure(self, port, identity) -> str | None:
+        now = self.clock() if self.clock else time.time()
+        hit = self._known.get(port)
+        if hit and hit[0] == identity and (hit[1] is not None or now - hit[2] < self.RETRY):
+            return hit[1]
+        answer = self.ask(port)
+        self._known[port] = (identity, answer, now)
+        return answer
+
+    def ask(self, port) -> str | None:
+        try:
+            with urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{int(port)}{self.PATH}"),
+                                        timeout=1) as resp:
+                code = int(getattr(resp, "status", 200) or 200)
+        except urllib.error.HTTPError as exc:
+            code = int(exc.code)
+        except Exception:
+            return None
+        if code in (401, 403):
+            return "closed"
+        return None if code >= 500 else "open"
 
 
 class CellRecords:
@@ -206,6 +263,7 @@ class Cells:
         self.by_port: dict[int, Cell] = {}
         self._lock = threading.Lock()
         self.probe = ServerProbe()
+        self.door = CellDoor()
         self.records = CellRecords(state)
         self.processes = HostProcesses()
         # The model files are the cells': downloads report into a cell's
@@ -267,7 +325,8 @@ class Cells:
         phase = startup.get("phase")
         if st.get("running"):
             p = st.get("port") or port
-            metrics = self.probe.metrics(p) if p else {}
+            key = CellKey.of_env((cell.process.launch_spec() or {}).get("extraEnv"))
+            metrics = self.probe.metrics(p, key.headers()) if p else {}
             view = {**st, "port": p, "phase": "running", **metrics,
                     "firewall": self.machine.firewall(p) if p else {},
                     # Which of the files it holds changed on disk after it
@@ -282,6 +341,11 @@ class Cells:
                 view["listening"] = int(p) in listening
                 if not view["listening"]:
                     view["startingTail"] = cell.process.log_tail()
+            # Whether it answers a request without its key (2.20) — said only
+            # once measured; a cell that cannot say yet has no `door`.
+            door = self.door.measure(p, (st.get("pid"), st.get("startedAt"))) if p else None
+            if door:
+                view["door"] = door
             return view
         # Crashed shortly after start (non-zero exit) — surface as error even if
         # the startup worker already marked it "running".
@@ -365,7 +429,9 @@ class Cells:
                     self.records.forget(port)
                     continue
                 if not self.processes.healthy(port, timeout=4.0, attempts=3,
-                                              health_path=rec.get("healthPath") or "/health"):
+                                              health_path=rec.get("healthPath") or "/health",
+                                              headers=CellKey.of_env((rec.get("launch") or {})
+                                                                     .get("extraEnv")).headers()):
                     # Something owns the port but stayed quiet. On a loaded host
                     # that is a timeout, not a death — and unregistering here
                     # stranded a live cell as "stopped" forever while its process
