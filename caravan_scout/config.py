@@ -23,6 +23,7 @@ class ScoutConfig:
     def __init__(self, path: Path):
         self.path = Path(path)
         self._lock = threading.Lock()
+        PrivateFile(self.path).narrow()   # the fleet token is in it
         self.data = self.load()
 
     def load(self) -> dict[str, Any]:

@@ -22,6 +22,7 @@ class ScoutState(dict):
     STALE_1X = ("assignments", "applyStatus")
 
     def __init__(self, path: Path):
+        PrivateFile(path).narrow()   # the cells' start requests and keys are in it
         super().__init__(self.read_file(Path(path)))
         self.path = Path(path)
         self.lock = threading.Lock()

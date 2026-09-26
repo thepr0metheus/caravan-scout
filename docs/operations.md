@@ -79,8 +79,9 @@ cell's folder holds its key.
 
 Files that hold a secret are 0600 (2.20): `config.json` (the fleet token),
 `state.json` (the cells' start requests and launches, with their keys) and a
-cell's `var/server-cells/<port>/cell.key`. They are rewritten 0600 on their
-next save; before 2.20 the machine's umask made the first two 0664.
+cell's `var/server-cells/<port>/cell.key`. Before 2.20 the machine's umask
+made the first two 0664; since 2.20.1 the scout narrows them to 0600 when it
+starts (config.json is otherwise written only when the scout is paired).
 
 ## Known quirks
 

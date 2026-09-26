@@ -35,3 +35,17 @@ class PrivateFile:
             if fd is not None:
                 os.close(fd)
         tmp.replace(self.path)
+
+    def narrow(self) -> bool:
+        """An existing file that others may read or write, made the owner's
+        only — at start, so a file written before 2.20 is not left 0664 until
+        its next save (config.json is saved only when the scout is paired).
+        True when it was narrowed; a missing file is not created."""
+        try:
+            mode = self.path.stat().st_mode & 0o777
+        except OSError:
+            return False
+        if not mode & 0o077:
+            return False
+        self.path.chmod(self.MODE)
+        return True

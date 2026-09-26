@@ -188,6 +188,32 @@ def test_private_files():
           "временный файл, оставшийся от аварии с правами 0644, не передаёт их: новый файл — 0600, временного нет")
     check(reader.read_text(encoding="utf-8") == "old" and reader.stat().st_ino != target.stat().st_ino,
           "negative: запись атомарна — читатель старого файла видит его целым")
+    from caravan_scout.config import ScoutConfig
+    from caravan_scout.state import ScoutState
+    legacy = scout.state.path.with_name("legacy")
+    legacy.mkdir(exist_ok=True)
+    (legacy / "config.json").write_text('{"controllerToken": "t"}', encoding="utf-8")
+    (legacy / "state.json").write_text("{}", encoding="utf-8")
+    for name in ("config.json", "state.json"):
+        (legacy / name).chmod(0o664)
+    ScoutConfig(legacy / "config.json")
+    ScoutState(legacy / "state.json")
+    check([(legacy / n).stat().st_mode & 0o777 for n in ("config.json", "state.json")] == [0o600, 0o600],
+          "файлы, записанные до 2.20 (0664), сужаются до 0600 уже при старте скаута — config.json иначе ждал бы "
+          "следующего сопряжения")
+    fresh = scout.state.path.with_name("fresh")
+    fresh.mkdir(exist_ok=True)
+    ScoutConfig(fresh / "config.json")
+    check(not (fresh / "config.json").exists() and PrivateFile(fresh / "config.json").narrow() is False,
+          "negative: файла нет — ничего не создаётся")
+    (fresh / "own.json").write_text("{}", encoding="utf-8")
+    (fresh / "own.json").chmod(0o600)
+    check(PrivateFile(fresh / "own.json").narrow() is False and (fresh / "own.json").stat().st_mode & 0o777 == 0o600,
+          "negative: уже 0600 — не трогается")
+    (fresh / "group.json").write_text("{}", encoding="utf-8")
+    (fresh / "group.json").chmod(0o640)
+    check(PrivateFile(fresh / "group.json").narrow() is True and (fresh / "group.json").stat().st_mode & 0o777 == 0o600,
+          "boundary: читает только группа (0640) — тоже сужается: секрет не для группы")
 
 @contextlib.contextmanager
 def _stub_probes(scout, gpus=None, nodes=None):

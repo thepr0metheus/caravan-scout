@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.20.1 — 2026-09-26
+
+- **A secret file written before 2.20 is narrowed at start.** On the fleet
+  after 2.20.0, state.json was 0600 at its first save but config.json — the
+  fleet token — stayed 0664: it is written only when the scout is paired.
+  The scout now makes both the owner's only when it starts, a group-readable
+  one too; a missing file is not created.
+
 ## 2.20.0 — 2026-09-26
 
 - **A cell answers to its key (`cellKey`).** Step 1 of keys on every
