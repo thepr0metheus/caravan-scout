@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.19.1 — 2026-09-26
+
+- **The driver facts say what the firmware and dpkg say, not a guess.**
+  Looked at on the fleet the day 2.19.0 went out: a machine without
+  `mokutil` reported Secure Boot as unknown while its firmware said "off",
+  and a machine with both `nvidia-driver-550` and `nvidia-driver-580`
+  installed, running 580, was reported as 550 — the first in the list.
+  `secureBoot` now comes from the firmware's own `SecureBoot` variable
+  (readable without root), is `false` on a machine that did not boot
+  through EFI, and falls back to `mokutil` only when the variable cannot
+  be read. `package` is the installed package whose version is the
+  library's, and `null` when none is.
+
 ## 2.19.0 — 2026-09-26
 
 - **The NVIDIA driver as the next boot will meet it (`driver`).** On

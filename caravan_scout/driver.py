@@ -42,6 +42,12 @@ class DriverFacts:
     #: enrolled at the console (MOK); a build signed by an unenrolled key is
     #: refused under Secure Boot just like an unsigned one.
     DKMS_KEY = Path("/var/lib/shim-signed/mok/MOK.der")
+    #: The firmware's own word on Secure Boot: four bytes of attributes, then
+    #: 1 (on) or 0 (off), readable by anyone. mokutil reads the same and is
+    #: not installed everywhere: a machine without it was "unknown" while its
+    #: firmware said "off" (2.19.1).
+    EFI_DIR = Path("/sys/firmware/efi")
+    SECURE_BOOT_VAR = EFI_DIR / "efivars" / "SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
     LOADED = re.compile(r"Kernel Module(?:\s+for\s+\S+)?\s+(\d+(?:\.\d+)+)")
     COMMON_NAME = re.compile(r"CN\s*=\s*([^,/\n]+)")
     LIBRARY = re.compile(r"^libnvidia-ml\.so\.(\d+(?:\.\d+)+)$")
@@ -81,7 +87,7 @@ class DriverFacts:
             "installed": installed,
             "nextModule": module,
             "dkmsKey": self.dkms_key(),
-            "package": self.driver_package(),
+            "package": self.driver_package(installed),
         }
 
     @staticmethod
@@ -140,6 +146,17 @@ class DriverFacts:
         return {"signer": found.group(1).strip() if found else None, "enrolled": enrolled}
 
     def secure_boot(self) -> bool | None:
+        """The firmware's variable; a machine that did not boot through EFI
+        has no Secure Boot at all (False); mokutil when the variable cannot be
+        read; None when nothing can say."""
+        try:
+            data = self.SECURE_BOOT_VAR.read_bytes()
+        except OSError:
+            data = b""
+        if len(data) == 5 and data[4] in (0, 1):
+            return data[4] == 1
+        if not self.EFI_DIR.exists():
+            return False
         out = self.run_text(["mokutil", "--sb-state"]).lower()
         if "secureboot enabled" in out:
             return True
@@ -147,11 +164,19 @@ class DriverFacts:
             return False
         return None
 
-    def driver_package(self) -> str | None:
-        """The installed nvidia-driver-* package, on a Debian-style system."""
-        out = self.run_text(["dpkg-query", "-W", "-f", "${Package} ${Status}\\n", "nvidia-driver-*"])
+    def driver_package(self, installed: str | None) -> str | None:
+        """The installed nvidia-driver-* package the driver in use comes from,
+        on a Debian-style system: the one whose version is the library's.
+        Several can be installed at once — a machine had 550 and 580 and ran
+        580 — so the first one would be a guess: without the library's
+        version, or with no package of it, None."""
+        if not installed:
+            return None
+        out = self.run_text(["dpkg-query", "-W", "-f", "${Package} ${Version} ${Status}\\n", "nvidia-driver-*"])
         for line in out.splitlines():
-            name, _, status = line.partition(" ")
-            if status.strip() == "install ok installed" and name.startswith("nvidia-driver-"):
+            name, version, status = (line.split(" ", 2) + ["", ""])[:3]
+            upstream = version.split(":", 1)[-1]
+            if (status.strip() == "install ok installed" and name.startswith("nvidia-driver-")
+                    and upstream.startswith(installed + "-")):
                 return name
         return None

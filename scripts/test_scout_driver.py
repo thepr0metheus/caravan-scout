@@ -2,9 +2,9 @@
 """Snapshot of caravan_scout/driver.py — the NVIDIA driver as the next boot
 will meet it (2.19).
 
-Pinned by value on a fake machine: /boot, /proc/driver/nvidia/version and the
-library folder are temp files, mokutil, modinfo and dpkg-query are FakeRun
-answers. What is pinned: each fact read the way the OS writes it, a fact that
+Pinned by value on a fake machine: /boot, /proc/driver/nvidia/version, the
+library folder and the firmware's SecureBoot variable are temp files,
+mokutil, modinfo and dpkg-query are FakeRun answers. What is pinned: each fact read the way the OS writes it, a fact that
 cannot be read is None and not a guess, the whole answer is None where there
 is no NVIDIA driver to speak of, and the minute's cache.
 
@@ -42,8 +42,16 @@ class FakeMachine:
     """/boot, the module's own words and the library folder, in a temp dir."""
 
     def __init__(self, kernels=("6.17.0-14-generic", "7.0.0-31-generic", NEXT), proc=PROC_OPEN,
-                 libraries=("libnvidia-ml.so.610.43.02",), dkms_key=True):
+                 libraries=("libnvidia-ml.so.610.43.02",), dkms_key=True, efi=True, sb_var=None):
         self.root = Path(tempfile.mkdtemp(prefix="scout-driver-"))
+        # No variable by default: the pins below that speak of mokutil read
+        # the fallback; the variable's own pins pass its bytes.
+        self.efi = self.root / "efi"
+        if efi:
+            (self.efi / "efivars").mkdir(parents=True)
+        self.sb_var = self.efi / "efivars" / "SecureBoot-x"
+        if sb_var is not None:
+            self.sb_var.write_bytes(sb_var)
         self.key = self.root / "MOK.der"
         if dkms_key:
             self.key.write_bytes(b"der")
@@ -70,12 +78,13 @@ class FakeMachine:
     def facts(self, run, platform="linux", running="7.0.0-31-generic", clock=lambda: 1000.0):
         driver = DriverFacts(Machine.run_text, platform=platform, kernel=lambda: running, clock=clock)
         with patched(DriverFacts, BOOT=self.boot, PROC_VERSION=self.proc, LIB_DIRS=(self.root / "none", self.lib),
-                     DKMS_KEY=self.key), patched(subprocess, run=run):
+                     DKMS_KEY=self.key, EFI_DIR=self.efi, SECURE_BOOT_VAR=self.sb_var), patched(subprocess, run=run):
             return driver.facts()
 
 
 def host_run(signer=MOK, path=f"/lib/modules/{NEXT}/updates/dkms/nvidia.ko.zst", sb="SecureBoot enabled\n",
-             dpkg="nvidia-driver-610-open install ok installed\nnvidia-driver-590-open deinstall ok config-files\n",
+             dpkg="nvidia-driver-610-open 610.43.02-0ubuntu0.24.04.1 install ok installed\n"
+                  "nvidia-driver-590-open 590.48.01-0ubuntu1 deinstall ok config-files\n",
              subject=f"subject=CN = {MOK}\n", test_key="MOK.der is not enrolled\n"):
     table = {("mokutil", "--sb-state"): (0, sb),
              ("mokutil", "--test-key"): (0, test_key),
@@ -122,8 +131,8 @@ def test_each_fact():
          "610.43.02", "установленная библиотека — самая новая из лежащих")
     same(FakeMachine().facts(host_run(path=None))["nextModule"], None,
          "у следующего ядра модуля nvidia нет — None")
-    same(FakeMachine().facts(host_run(dpkg="nvidia-driver-610-open deinstall ok config-files\n"))["package"], None,
-         "пакет драйвера снят (остались настройки) — None")
+    same(FakeMachine().facts(host_run(dpkg="nvidia-driver-610-open 610.43.02-0ubuntu0.24.04.1 deinstall ok config-files\n"))
+         ["package"], None, "пакет драйвера снят (остались настройки) — None")
     same([FakeMachine().facts(host_run(test_key=answer))["dkmsKey"]["enrolled"]
           for answer in ("MOK.der is already enrolled\n", "MOK.der is not enrolled\n", "")],
          [True, False, None], "ключ DKMS записан в прошивку — True, нет — False, mokutil молчит — None")
@@ -132,6 +141,53 @@ def test_each_fact():
     same(FakeMachine().facts(host_run(subject=""))["dkmsKey"], {"signer": None, "enrolled": False},
          "openssl не прочёл ключ — имени нет (None), а записан ли он, всё равно сказано")
     same(FakeMachine(dkms_key=False).facts(host_run())["dkmsKey"], None, "ключа DKMS на машине нет — None")
+
+
+ON, OFF = b"\x06\x00\x00\x00\x01", b"\x06\x00\x00\x00\x00"
+
+
+def asked(run, *prefix):
+    return any(call[:len(prefix)] == list(prefix) for call in run.calls)
+
+
+def test_the_firmware():
+    CHECKS.section("Secure Boot — слово прошивки (2.19.1):")
+    run = host_run(sb="")
+    same(FakeMachine(sb_var=ON).facts(run)["secureBoot"], True, "переменная прошивки говорит 1 — включён")
+    check(not asked(run, "mokutil", "--sb-state"), "negative: переменная прочитана — mokutil не спрашивается")
+    run = host_run(sb="SecureBoot enabled\n")
+    same(FakeMachine(sb_var=OFF).facts(run)["secureBoot"], False,
+         "переменная говорит 0 — выключен, что бы ни сказал mokutil (машина без mokutil была «неизвестно», "
+         "а прошивка говорила «выключен»)")
+    same(FakeMachine(sb_var=b"\x06\x00").facts(host_run(sb="SecureBoot enabled\n"))["secureBoot"], True,
+         "boundary: переменная не по форме (не 5 байт, последний байт 0) — не читается как «выключен», "
+         "говорит mokutil")
+    same(FakeMachine(sb_var=b"\x06\x00\x00\x00\x02").facts(host_run(sb=""))["secureBoot"], None,
+         "boundary: в переменной не 0 и не 1, а mokutil молчит — None, а не догадка")
+    run = host_run(sb="SecureBoot enabled\n")
+    same(FakeMachine(efi=False).facts(run)["secureBoot"], False,
+         "машина загрузилась не через EFI — Secure Boot'а у неё нет вовсе (False), mokutil не спрашивается")
+    check(not asked(run, "mokutil", "--sb-state"), "negative: без EFI mokutil не спрашивается")
+
+
+def test_the_package():
+    CHECKS.section("пакет драйвера — тот, чья версия у библиотеки (2.19.1):")
+    two = ("nvidia-driver-550 550.163.01-0ubuntu0.24.04.2 install ok installed\n"
+           "nvidia-driver-580 580.173.02-0ubuntu0.24.04.1 install ok installed\n"
+           "nvidia-driver-binary  unknown ok not-installed\n")
+    same(FakeMachine(libraries=("libnvidia-ml.so.580.173.02",)).facts(host_run(dpkg=two))["package"], "nvidia-driver-580",
+         "установлены 550 и 580, библиотека 580.173.02 — пакет 580, а не первый в списке")
+    same(FakeMachine(libraries=("libnvidia-ml.so.610.43.02",)).facts(host_run(dpkg=two))["package"], None,
+         "negative: ни одного пакета той версии, что у библиотеки, — None, а не первый попавшийся")
+    same(FakeMachine(libraries=("libnvidia-ml.so.580.173",)).facts(host_run(dpkg=two))["package"], None,
+         "boundary: версия библиотеки — лишь начало версии пакета (580.173 и 580.173.02) — не она")
+    same(FakeMachine(libraries=("libnvidia-ml.so.580.173.02",)).facts(
+        host_run(dpkg="nvidia-driver-580 1:580.173.02-1 install ok installed\n"))["package"], "nvidia-driver-580",
+         "версия пакета с эпохой (1:…) — сравнивается без неё")
+    run = host_run()
+    got = FakeMachine(libraries=()).facts(run)
+    check(got["package"] is None and not asked(run, "dpkg-query"),
+          "библиотеки нет — версии не с чем сравнить: None, и dpkg не спрашивается")
 
 
 def test_nothing_to_say():
@@ -156,8 +212,8 @@ def test_the_minute():
     now = [1000.0]
     driver = DriverFacts(Machine.run_text, platform="linux", kernel=lambda: "7.0.0-31-generic", clock=lambda: now[0])
     run = host_run()
-    with patched(DriverFacts, BOOT=machine.boot, PROC_VERSION=machine.proc, LIB_DIRS=(machine.lib,)), \
-            patched(subprocess, run=run):
+    with patched(DriverFacts, BOOT=machine.boot, PROC_VERSION=machine.proc, LIB_DIRS=(machine.lib,),
+                 EFI_DIR=machine.efi, SECURE_BOOT_VAR=machine.sb_var), patched(subprocess, run=run):
         first = driver.facts()
         calls = len(run.calls)
         now[0] += DriverFacts.TTL - 1
@@ -172,6 +228,8 @@ def test_the_minute():
 if __name__ == "__main__":
     test_the_morning_before()
     test_each_fact()
+    test_the_firmware()
+    test_the_package()
     test_nothing_to_say()
     test_the_minute()
     sys.exit(CHECKS.finish())

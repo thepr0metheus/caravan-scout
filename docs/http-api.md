@@ -36,14 +36,14 @@ Read at most once a minute.
 
 | Field | What it is |
 |---|---|
-| `secureBoot` | `true`/`false` from `mokutil --sb-state`; `null` when it cannot say |
+| `secureBoot` | `true`/`false` from the firmware's `SecureBoot` variable (`/sys/firmware/efi/efivars`, readable without root); `false` on a machine that did not boot through EFI; `mokutil --sb-state` when the variable cannot be read; `null` when nothing can say |
 | `kernelRunning` | the running kernel (`uname -r`) |
 | `kernelNext` | the newest `vmlinuz-<version>` in `/boot` — what the default boot entry starts; `null` when there is none |
 | `loaded` | the version of the module loaded now (`/proc/driver/nvidia/version`), `null` when none is |
 | `installed` | the userspace driver's version (its `libnvidia-ml.so.<version>`), `null` when none is installed |
 | `nextModule` | the `nvidia` module the next kernel would load: `{path, version, signer}` from `modinfo -k`, `signer` `""` when nobody signed it; `null` when it has none |
 | `dkmsKey` | the key DKMS signs its builds with (`/var/lib/shim-signed/mok/MOK.der`): `{signer, enrolled}` — its name as a module's `signer` reads it, and whether the firmware trusts it (`mokutil --test-key`; `null` when it cannot say). A build signed by an unenrolled key is refused under Secure Boot like an unsigned one. `null` when there is no such key |
-| `package` | the installed `nvidia-driver-*` package (dpkg), `null` when none |
+| `package` | the installed `nvidia-driver-*` package whose version is the library's (`installed`) — several can be installed at once; `null` when none is, or `installed` is unknown |
 
 The heartbeat carries it under the same name.
 
