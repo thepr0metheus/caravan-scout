@@ -172,7 +172,7 @@ def test_kind_start_stop():
 
     cli = Cli()
     same((LmStudio(cli=cli).start_server({"port": 1235, "bind": "0.0.0.0"}, None), cli.made),
-         ("", [(["daemon", "up"], LmsCli.LOAD), (["server", "start", "-p", "1235", "--bind", "0.0.0.0"], LmsCli.LOAD)]),
+         ("", [(["daemon", "up"], LmsCli.SLOW), (["server", "start", "-p", "1235", "--bind", "0.0.0.0"], LmsCli.SLOW)]),
          "LM Studio: поднять демона, затем сервер на выученных порту и адресе; ждать — минуты")
     cli = Cli({"daemon up": (1, "Loading x\nllmster failed to start\nsee logs")})
     same((LmStudio(cli=cli).start_server({"port": 1234}, None), len(cli.made)),
@@ -180,7 +180,7 @@ def test_kind_start_stop():
     cli = Cli({"server start": (1, "Port 1234 is in use")})
     same(LmStudio(cli=cli).start_server({"port": 1234}, None), "Port 1234 is in use", "сервер не поднялся — его словами")
     cli = Cli()
-    same((LmStudio(cli=cli).stop_server({}, 7, None), cli.made), ("", [(["daemon", "down"], LmsCli.LOAD)]),
+    same((LmStudio(cli=cli).stop_server({}, 7, None), cli.made), ("", [(["daemon", "down"], LmsCli.SLOW)]),
          "LM Studio: остановка — демона целиком: только так уходят загруженные модели и их память")
     cli = Cli({"daemon down": (1, "no daemon")})
     same((LmStudio(cli=cli).stop_server({}, 7, None), [m[0] for m in cli.made]),
@@ -315,12 +315,12 @@ def test_procs():
 
 def views(ollama_state="ok", lms=True):
     rows = [{"kind": "ollama", "label": "Ollama", "port": 11434, "listen": "loopback", "state": ollama_state,
-             "version": "0.34.4", "models": [], "pids": [5100], "controls": ["load", "unload"], "holds": True,
+             "version": "0.34.4", "models": [], "pids": [5100], "controls": ["unload", "delete", "pull"],
              "firewall": None, "ramBytes": 1}]
     if lms:
         rows.append({"kind": "lmstudio", "label": "LM Studio", "port": 1234, "listen": "loopback", "state": "ok",
-                     "version": "", "api": "v1", "models": [], "pids": [700], "controls": ["load", "unload"],
-                     "holds": True, "firewall": None, "ramBytes": 1})
+                     "version": "", "api": "v1", "models": [], "pids": [700], "controls": ["unload", "pull"],
+                     "firewall": None, "ramBytes": 1})
     return rows
 
 
@@ -335,7 +335,7 @@ def test_annotate():
                             home=TMP / "empty-home")
     out = servers.annotate(kinds, views(), LISTEN)
     same([(v["kind"], v["runBy"], v["controls"], v["autostart"]) for v in out],
-         [("ollama", "user", ["load", "unload", "stop"], False), ("lmstudio", "user", ["load", "unload", "stop"], False)],
+         [("ollama", "user", ["unload", "delete", "pull", "stop"], False), ("lmstudio", "user", ["unload", "pull", "stop"], False)],
          "сервер пользователя скаута — «user» и его можно остановить с доски")
     same((state["engineServers"]["ollama"], state["engineServers"]["lmstudio"], state.saves),
          ({"recipe": {"exe": "/home/u/ollama/bin/ollama", "args": ["serve"],
@@ -348,15 +348,15 @@ def test_annotate():
     out = EngineServers(State(), Procs({700: {"uid": 1000, "exe": "", "args": [], "env": {}}}),
                         home=TMP / "empty-home").annotate((Ollama(), LmStudio(cli=Cli(available=False))),
                                                           views()[1:], LISTEN)
-    same((out[0]["runBy"], out[0]["controls"]), ("user", ["load", "unload"]),
+    same((out[0]["runBy"], out[0]["controls"]), ("user", ["unload", "pull"]),
          "negative: как запустить снова — не выучить (LM Studio без lms): и остановить с доски нельзя — в одну сторону")
     state = State()
     servers = EngineServers(state, Procs({5100: {**OLLAMA_INFO, "uid": 999}}), home=TMP / "empty-home")
     out = servers.annotate(kinds, views(lms=False), LISTEN)
-    same((out[0]["runBy"], out[0]["controls"], "engineServers" in state), ("other", ["load", "unload"], False),
+    same((out[0]["runBy"], out[0]["controls"], "engineServers" in state), ("other", ["unload", "delete", "pull"], False),
          "negative: сервер другого пользователя (системная служба) — «other», остановить с доски нельзя, рецепт не учится")
     out = EngineServers(State(), Procs({}), home=TMP / "empty-home").annotate(kinds, views(lms=False), LISTEN)
-    same((out[0]["runBy"], out[0]["controls"]), ("", ["load", "unload"]),
+    same((out[0]["runBy"], out[0]["controls"]), ("", ["unload", "delete", "pull"]),
          "negative: машина не назвала процесс — «» (не знаю), не «user»")
     out = EngineServers(State(), Procs({5100: OLLAMA_INFO}, me=None), home=TMP / "empty-home").annotate(
         kinds, views(lms=False), LISTEN)
@@ -367,11 +367,11 @@ def test_annotate():
     servers = EngineServers(state, Procs({5100: OLLAMA_INFO}), home=TMP / "empty-home")
     out = servers.annotate(kinds, views(ollama_state="unreachable", lms=False), LISTEN)
     same((out[0]["controls"], out[0]["autostart"], state["engineServers"]["ollama"]["recipe"]["env"]),
-         (["load", "unload", "stop"], True, {}),
+         (["unload", "delete", "pull", "stop"], True, {}),
          "молчащий сервер (unreachable) остановить можно — рецепт известен; учится рецепт только у отвечающего")
     out = servers.annotate(kinds, [], [])
     same(out, [{"kind": "ollama", "label": "Ollama", "port": 11434, "listen": "", "state": "stopped", "version": "",
-                "models": None, "pids": [], "controls": ["start"], "holds": False, "firewall": None, "ramBytes": None,
+                "models": None, "pids": [], "controls": ["start"], "firewall": None, "ramBytes": None,
                 "runBy": "", "autostart": True}],
          "известный сервер не запущен — движок «stopped», модели неизвестны (None), можно только запустить")
 
@@ -481,7 +481,7 @@ def test_serve():
     procs = Procs({5100: {**OLLAMA_INFO, "exe": str(exe), "args": [str(exe), "serve"]}})
     engines, machine, queued, clock = rig(up, procs)
     view = engines.views()[0]
-    same((view["runBy"], view["controls"]), ("user", ["load", "unload", "delete", "pull", "stop"]),
+    same((view["runBy"], view["controls"]), ("user", ["unload", "delete", "pull", "stop"]),
          "работает у пользователя скаута — можно остановить")
     got = engines.serve("stop", "ollama", 11434)
     same((got["ok"], got["engines"][0].get("serverAction"), len(queued)), (True, {"op": "stop", "since": 1000}, 1),

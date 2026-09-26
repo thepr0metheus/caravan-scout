@@ -107,10 +107,9 @@ class Api:
             "/api/llama-node/suspect-dismiss": lambda body: (s.suspect.dismiss(), 200),
             "/api/llama-node/purge-cache": lambda body: ({"ok": True, **s.cells.purge_models_safely()}, 200),
             "/api/llama-node/configs/delete": self._delete_config,
-            # A model of an engine next to the cells (Ollama, LM Studio) loaded
-            # or unloaded from the board (2.14): {kind, port, model,
-            # contextLength?}; answered at once, the act runs on its own.
-            "/api/engines/load": lambda body: self._engine("load", body),
+            # A model of an engine next to the cells (Ollama, LM Studio)
+            # unloaded from the board (2.14): {kind, port, model}; answered at
+            # once, the act runs on its own. No load (2.18): a cell loads it.
             "/api/engines/unload": lambda body: self._engine("unload", body),
             # A model downloaded into an engine, or deleted from it (2.17):
             # {kind, port, model}; answered at once, each runs on its own.
@@ -131,8 +130,7 @@ class Api:
 
     def _engine(self, op, body) -> tuple[Any, int]:
         b = body()
-        return self.scout.engines.act(op, str(b.get("kind") or ""), b.get("port"), str(b.get("model") or ""),
-                                      b.get("contextLength"), force=b.get("force") is True, hold=b.get("hold")), 200
+        return self.scout.engines.act(op, str(b.get("kind") or ""), b.get("port"), str(b.get("model") or "")), 200
 
     def _pull(self, body) -> tuple[Any, int]:
         b = body()

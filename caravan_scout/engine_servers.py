@@ -231,7 +231,7 @@ class EngineServers:
                 continue
             port = int(entry.get("port") or recipe.get("port") or kind.default_port)
             out.append({"kind": kind.id, "label": kind.label, "port": port, "listen": "", "state": "stopped",
-                        "version": "", "models": None, "pids": [], "controls": ["start"], "holds": False,
+                        "version": "", "models": None, "pids": [], "controls": ["start"],
                         "firewall": None, "ramBytes": None, "runBy": "", "autostart": entry.get("autostart") is True})
         return out
 

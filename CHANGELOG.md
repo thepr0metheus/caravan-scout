@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.18.0 — 2026-09-26
+
+- **No model is loaded into an engine from the board any more.** The
+  operator's choice (controller 1.3.379): a model of Ollama or LM Studio is
+  reached through a cell in its engine, and the cell loads it when it
+  starts. `POST /api/engines/load` is gone, and with it what only a load
+  used: the window and the idle limit it could be told (`holds` in an
+  engine's view, `lms load --ttl`), and the memory question before it
+  (`short`: Ollama's file-and-cache estimate, LM Studio's
+  `lms load --estimate-only`). An engine's `controls` no longer offer
+  `load`. Unloading, deleting and downloading a model, and starting or
+  stopping the engine's server, are as they were; so is reading how long
+  LM Studio holds what is loaded (`lms ps`).
+
 ## 2.17.0 — 2026-09-25
 
 - **A model is downloaded into an engine, or deleted from it, from the
