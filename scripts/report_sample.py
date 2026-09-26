@@ -50,6 +50,16 @@ class ReportSample:
            "uuid": "GPU-00000000-0000-0000-0000-000000000000"}
     APP = {"gpuUuid": "GPU-00000000-0000-0000-0000-000000000000", "pid": 4242, "name": "llama-server",
            "usedMiB": 20000}
+    # Its NVIDIA driver as the next boot will meet it (2.19): a new kernel is
+    # installed, and all it has of the driver is a DKMS build signed by the
+    # machine's own key, which the firmware does not trust — the state that
+    # took a machine's card on 2026-09-26.
+    DRIVER = {"secureBoot": True, "kernelRunning": "7.0.0-31-generic", "kernelNext": "7.0.0-34-generic",
+              "loaded": "610.43.02", "installed": "610.43.02",
+              "nextModule": {"path": "/lib/modules/7.0.0-34-generic/updates/dkms/nvidia.ko.zst",
+                             "version": "610.43.02", "signer": "linux Secure Boot Module Signature key"},
+              "dkmsKey": {"signer": "linux Secure Boot Module Signature key", "enrolled": False},
+              "package": "nvidia-driver-610-open"}
     # Ollama's runner on the same card (2.12): its memory is named by its engine.
     OLLAMA_APP = {"gpuUuid": "GPU-00000000-0000-0000-0000-000000000000", "pid": 5151, "name": "ollama",
                   "usedMiB": 3500}
@@ -158,6 +168,7 @@ class ReportSample:
                   "binary_mtime": lambda: "2026-09-01T10:00:00", "status_slim": lambda: dict(self.UPDATE),
                   "archive": lambda: archive}
         with patched(scout.machine, **machine), patched(scout.builds, **builds), \
+                patched(scout.driver, facts=lambda: json.loads(json.dumps(self.DRIVER))), \
                 patched(scout.cells.probe, metrics=lambda port: dict(self.VLLM_METRICS if port == 22012
                                                                       else self.METRICS if port == 22001
                                                                       else {})), \

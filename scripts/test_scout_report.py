@@ -174,6 +174,9 @@ def _stub_probes(scout, gpus=None, nodes=None):
         address=lambda: "10.0.0.5",
         cpu_ram=lambda: {"loadPct": 3.0},
     ), patched(
+        scout.driver,
+        facts=lambda: {"secureBoot": True, "kernelRunning": "7.0.0-31-generic"},
+    ), patched(
         scout.builds,
         binary_version=lambda: "version: 9947 (abc1234)",
         binary_mtime=lambda: "2026-09-01T10:00:00",
@@ -202,8 +205,8 @@ def test_public_state():
               "negative: до первого пульса — «pending», а не пусто")
     check(sorted(state) == sorted(["service", "scoutVersion", "llamaBinaryVersion", "llamaBinaryMtime", "llamaUpdate",
                                    "llamaSuspect", "telemetry", "host", "controllerUrl", "gpus", "computeApps",
-                                   "engines", "cpu", "platform", "heartbeat", "llamaNode", "llamaNodes", "autostart",
-                                   "time"]),
+                                   "engines", "cpu", "platform", "driver", "heartbeat", "llamaNode", "llamaNodes",
+                                   "autostart", "time"]),
           "ровно эти поля — только машина: ни агентов, ни найденных VM, ни назначений")
     check(state.get("engines", "absent") is None,
           "negative: движки ещё не искали — None («не смотрели»), а не [] («смотрели, нет») (2.12)")
@@ -232,11 +235,14 @@ def test_heartbeat_payload():
             payload = scout.report.heartbeat()
         except Exception as exc:  # noqa: BLE001 — a crash is a red pin, not a stopped run
             payload = {"__raised__": repr(exc), "agentUrl": None}
-    check(sorted(payload) == sorted(["host", "gpus", "computeApps", "engines", "cpu", "platform", "llamaNode",
+    check(sorted(payload) == sorted(["host", "gpus", "computeApps", "engines", "cpu", "platform", "driver", "llamaNode",
                                      "llamaNodes", "llamaBinaryVersion", "llamaBinaryMtime", "llamaUpdate",
                                      "llamaSuspect", "telemetry", "scoutVersion", "autostart", "agentUrl", "time"]),
           "ровно эти поля — только машина")
     check(payload["agentUrl"] == "http://10.0.0.5:18099", "адрес скаута — его IP и порт, на котором он слушает")
+    check(payload.get("driver") == {"secureBoot": True, "kernelRunning": "7.0.0-31-generic"},
+          "факты о драйвере NVIDIA (2.19) едут в пульсе под тем же именем, что в /api/state, — одна запись хоста у "
+          "контроллера не теряет их между пульсом и опросом")
     check(payload.get("llamaUpdate") == {"running": False, "done": False, "rc": None, "startedAt": 0, "tag": "",
                                          "lastLine": ""},
           "defect-history: статус обновления llama.cpp едет и в пульсе — пульс заменял запись хоста без него, "

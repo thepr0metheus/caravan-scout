@@ -11,6 +11,7 @@ from caravan_scout.engine_servers import EngineProcs, EngineServers
 from caravan_scout.engines import ForeignEngines
 from caravan_scout.heartbeat import Heartbeat
 from caravan_scout.identity import HostIdentity
+from caravan_scout.driver import DriverFacts
 from caravan_scout.machine import Machine
 from caravan_scout.report import Report
 from caravan_scout.saved_configs import SavedConfigs
@@ -57,6 +58,10 @@ class Scout:
         self.engines = ForeignEngines(self.machine, self.cells, servers=EngineServers(
             self.state, EngineProcs(self.state.path.parent / "engine-logs")))
         self.watchdog = Watchdog(self.cells, self.suspect)
+        # What decides whether the NVIDIA card comes back after a reboot
+        # (2.19): the controller warns before the reboot, not after it.
+        self.driver = DriverFacts(Machine.run_text)
         self.report = Report(self.config, self.state, self.machine, self.cells, self.builds, self.autostart,
-                             self.suspect, self.telemetry, identity=self.identity, engines=self.engines)
+                             self.suspect, self.telemetry, identity=self.identity, engines=self.engines,
+                             driver=self.driver)
         self.heartbeat = Heartbeat(self.config, self.state, self.report, self.cells)

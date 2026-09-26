@@ -24,8 +24,10 @@ class Report:
     """
 
     def __init__(self, config, state, machine, cells, builds, autostart, suspect, telemetry, identity=None,
-                 engines=None):
+                 engines=None, driver=None):
         self.config = config
+        # The NVIDIA driver as the next boot will meet it (2.19).
+        self.driver = driver
         # Ollama, LM Studio on this machine (2.12): their last scan.
         self.engines = engines
         # The name the board shows follows the machine's hostname (a rename
@@ -45,6 +47,7 @@ class Report:
         compute_apps = self.machine.compute_apps()
         cpu_ram = self.machine.cpu_ram()
         version = self.builds.binary_version()
+        driver = self.driver.facts() if self.driver else None
         # Before the state's lock: the verdict takes it itself.
         suspect = self.suspect.verdict(version)
         with self.state.lock:
@@ -78,6 +81,9 @@ class Report:
                 "engines": self.engines.views() if self.engines else None,
                 "cpu": cpu_ram,
                 "platform": sys.platform,
+                # The NVIDIA driver as the next boot will meet it (2.19): None
+                # where there is no NVIDIA driver, or not Linux.
+                "driver": driver,
                 "heartbeat": self.state.get("heartbeat", {}),
                 "llamaNode": self.cells.first_view(),
                 "llamaNodes": self.cells.views(),
@@ -128,6 +134,7 @@ class Report:
             "engines": state["engines"],
             "cpu": state.get("cpu", {}),
             "platform": state.get("platform", ""),
+            "driver": state["driver"],
             "llamaNode": self.cells.first_view(),
             "llamaNodes": self.cells.views(),
             "llamaBinaryVersion": state.get("llamaBinaryVersion", ""),

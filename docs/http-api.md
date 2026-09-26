@@ -12,7 +12,7 @@ nothing about the agents or clients on it.
 | `/` | The scout's page (HTML, read-only since 2.1): the machine, whether a controller has paired it, and the address:port to enter on the controller's board. |
 | `/api/pairing` | What the page shows, open even with a token: host id/name/IP, the scout's port, platform, GPU names, cells running/total, `controllerUrl`, `tokenRequired`, heartbeat `{state, lastAt, error}` (`state` is `unpaired` until a controller adds it) — never the controller's reply. The controller reads it first when the operator adds the scout. |
 | `/api/health` | Liveness, open even with a token: `{ok, service, version, tokenRequired, time}`. |
-| `/api/state` | The machine: host identity/IP, GPUs, CPU/RAM, compute apps (`[{gpuUuid, pid, name, usedMiB}]` — `name` is the process's executable, "" when nvidia-smi cannot name it, 2.12+), `engines` — the model engines on this machine that are not its cells (2.12+, below), heartbeat status, llama.cpp build and update status (`llamaUpdate`), the scout's own version (`scoutVersion`), per-cell `llamaNodes` (a running cell's `promptTps`, `genTps` and `requestsProcessing` from its /metrics — a vLLM cell's also `requestsWaiting`, and its rates from its token counters, 2.7+; `listening` — whether a running cell's port listens on this machine yet, and while it does not, `startingTail`, the last lines of its log, 2.7+; `launchDiskNewer` — the roles (`model`, `mmproj`, `draft`) of the files a running cell holds that changed on disk after it started, so a restart would pick them up (a folder by its newest file), 2.11+; a cell that crashed since it was last started by hand carries `crash: {count, at, reason, tail?, gaveUp?}`, 2.5+; `tail` — the last 8 lines of the crashed run's log, keys scrubbed, 2.6+), `autostart` — the ports that start with the machine, stopped ones too (2.4+), and `llamaSuspect` — `{suspect: false}` or the incident of cells crashing after a fresh llama.cpp build: `crashes15m`, `builtAt`, `currentCommit`, `firstSeenAt`, `lastSeenAt`, `restoreCandidate` (the archived build to offer, or null) (2.6+). The heartbeat pushes the same facts under the same names. |
+| `/api/state` | The machine: host identity/IP, GPUs, CPU/RAM, compute apps (`[{gpuUuid, pid, name, usedMiB}]` — `name` is the process's executable, "" when nvidia-smi cannot name it, 2.12+), `engines` — the model engines on this machine that are not its cells (2.12+, below), heartbeat status, llama.cpp build and update status (`llamaUpdate`), the scout's own version (`scoutVersion`), per-cell `llamaNodes` (a running cell's `promptTps`, `genTps` and `requestsProcessing` from its /metrics — a vLLM cell's also `requestsWaiting`, and its rates from its token counters, 2.7+; `listening` — whether a running cell's port listens on this machine yet, and while it does not, `startingTail`, the last lines of its log, 2.7+; `launchDiskNewer` — the roles (`model`, `mmproj`, `draft`) of the files a running cell holds that changed on disk after it started, so a restart would pick them up (a folder by its newest file), 2.11+; a cell that crashed since it was last started by hand carries `crash: {count, at, reason, tail?, gaveUp?}`, 2.5+; `tail` — the last 8 lines of the crashed run's log, keys scrubbed, 2.6+), `autostart` — the ports that start with the machine, stopped ones too (2.4+), `driver` — the NVIDIA driver as the next boot will meet it (2.19+, below), and `llamaSuspect` — `{suspect: false}` or the incident of cells crashing after a fresh llama.cpp build: `crashes15m`, `builtAt`, `currentCommit`, `firstSeenAt`, `lastSeenAt`, `restoreCandidate` (the archived build to offer, or null) (2.6+). The heartbeat pushes the same facts under the same names. |
 | `/api/llama-node/status` | Just the cells: `{ok, nodes: [...]}`. |
 | `/api/monitor/nvidia-smi` | A raw `nvidia-smi` snapshot for the controller's monitor drawer. |
 | `/api/telemetry?since=<epoch>` | The machine second by second (2.8+): samples newer than `since` — `{t, gpus: [{index, memUsedMiB, memTotalMiB, utilPct, powerW, tempC}], cpuPct, ram}` — ten minutes kept, one a second while watched and one in ten seconds otherwise; each ask marks the machine watched for 30 s. `since` 0 or missing returns the whole ten minutes. |
@@ -23,6 +23,29 @@ nothing about the agents or clients on it.
 | `/api/llama-node/builds` | Archived llama.cpp builds on this host, newest first. |
 | `/api/vllm` | vLLM in this machine's `~/vllm-venv` (2.9+): `{ok, installed, version, venv, history: [{version, seenAt}], job}` — the version read from its dist-info folder, the versions the venv has had (newest first, five kept: the rollback candidates) and the install job, briefly. |
 | `/api/vllm/update-status` | The vLLM install job: running/done, return code, the last 200 lines (2.9+). |
+
+### `driver` (2.19+)
+
+The NVIDIA driver as the next boot will meet it — what would have warned
+before the reboot of 2026-09-26, when a kernel the automatic updates had
+installed came up without its Canonical-signed modules and Secure Boot
+refused the unsigned build. Facts only; the controller draws the conclusion.
+`null` where the question does not arise: not Linux, or no NVIDIA driver at
+all (none loaded, no library installed, no module for the next kernel).
+Read at most once a minute.
+
+| Field | What it is |
+|---|---|
+| `secureBoot` | `true`/`false` from `mokutil --sb-state`; `null` when it cannot say |
+| `kernelRunning` | the running kernel (`uname -r`) |
+| `kernelNext` | the newest `vmlinuz-<version>` in `/boot` — what the default boot entry starts; `null` when there is none |
+| `loaded` | the version of the module loaded now (`/proc/driver/nvidia/version`), `null` when none is |
+| `installed` | the userspace driver's version (its `libnvidia-ml.so.<version>`), `null` when none is installed |
+| `nextModule` | the `nvidia` module the next kernel would load: `{path, version, signer}` from `modinfo -k`, `signer` `""` when nobody signed it; `null` when it has none |
+| `dkmsKey` | the key DKMS signs its builds with (`/var/lib/shim-signed/mok/MOK.der`): `{signer, enrolled}` — its name as a module's `signer` reads it, and whether the firmware trusts it (`mokutil --test-key`; `null` when it cannot say). A build signed by an unenrolled key is refused under Secure Boot like an unsigned one. `null` when there is no such key |
+| `package` | the installed `nvidia-driver-*` package (dpkg), `null` when none |
+
+The heartbeat carries it under the same name.
 
 ### `engines` (2.12+)
 

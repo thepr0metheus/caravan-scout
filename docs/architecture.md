@@ -102,6 +102,7 @@ systemd/launchd units); the code lives in the package:
 | `cells.py` | `Cell` (one port); `Cells` — the table by port, startup records, the views the controller reads, re-adoption after a restart, stray reaping, stop, the safe purge, and the model cache the cells own; `CellRecords` (state.json `cells`); `ServerProbe` (a cell server's /metrics and /props: llama.cpp's rates as they are, vLLM's from its token counters) |
 | `autostart.py` | `Autostart` — the cells that start when the machine boots: the kept start requests, refreshed on each start, started on the first scout start of a boot |
 | `watchdog.py` | `Watchdog` — a crashed cell launched again the same way after 10 s, at most 3 times in 10 minutes, and the crash note the board shows |
+| `driver.py` | `DriverFacts` — the NVIDIA driver as the next boot will meet it (2.19): Secure Boot, the kernel running and the one that boots next, the driver version loaded and installed, the module the next kernel would load and who signed it; facts only, a minute's cache, `None` where there is no NVIDIA driver to speak of |
 | `telemetry.py` | `Telemetry` — the machine's cards and processor, a sample a second while a board watches (ten seconds otherwise), ten minutes kept, for the board's charts |
 | `suspect.py` | `CrashSuspect` — cells crashing soon after a fresh llama.cpp build: the incident kept per build, dismissed per build, and the archived build to offer |
 | `builds.py` | `LlamaBuilds` — llama.cpp on this machine: the binary's version and date, the update/restore job, the archive of earlier builds |

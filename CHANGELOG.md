@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.19.0 — 2026-09-26
+
+- **The NVIDIA driver as the next boot will meet it (`driver`).** On
+  2026-09-26 a machine rebooted into a kernel the automatic updates had
+  installed the day before, without the Canonical-signed modules it needed:
+  Secure Boot refused the unsigned build and the card was gone until it was
+  fixed by hand. Nothing had said so before the reboot. The report now
+  carries what would have: Secure Boot, the kernel running and the one that
+  boots next, the driver version loaded and the one installed, and the
+  module the next kernel would load — where it lies and who signed it. Facts
+  only, read at most once a minute; the controller draws the conclusion.
+
 ## 2.18.0 — 2026-09-26
 
 - **No model is loaded into an engine from the board any more.** The
