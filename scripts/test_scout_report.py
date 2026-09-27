@@ -480,8 +480,7 @@ def test_live_numbers():
     props = json.dumps({"default_generation_settings": {"n_ctx": 8192}}).encode()
     asked = []
 
-    def urlopen(req, timeout=None):
-        url = getattr(req, "full_url", req)   # a Request since the probes carry the cell's key (2.20)
+    def urlopen(url, timeout=None):
         asked.append(url)
         return FakeResponse(metrics if url.endswith("/metrics") else props)
     clock = [1000.0]
@@ -523,8 +522,8 @@ def test_live_numbers_vllm():
                 {"prompt": 10.0, "gen": 5.0, "gen2": 0.0}]
     clock = [5000.0]
 
-    def urlopen(req, timeout=None):
-        if getattr(req, "full_url", req).endswith("/props"):
+    def urlopen(url, timeout=None):
+        if url.endswith("/props"):
             raise OSError("404")
         return FakeResponse((VLLM_METRICS % readings[0]).encode())
     probe = make_scout().cells.probe
@@ -546,8 +545,8 @@ def test_live_numbers_vllm():
               "negative: счётчики уменьшились (vLLM перезапущен) — скорости нет, а не отрицательная")
     late = [{"prompt": 500.0}, {"prompt": 900.0, "gen": 800.0}]
 
-    def partial(req, timeout=None):
-        if getattr(req, "full_url", req).endswith("/props"):
+    def partial(url, timeout=None):
+        if url.endswith("/props"):
             raise OSError("404")
         body = "".join(f'vllm:{k}_tokens_total{{engine="0"}} {v}\n'
                        for k, v in (("prompt", late[0].get("prompt")), ("generation", late[0].get("gen"))) if v)

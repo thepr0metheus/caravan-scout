@@ -85,8 +85,7 @@ def test_on_the_card():
     scout = make_scout()
     proc = held(f["model"])
     with patched(proc, status=lambda: {"running": True, "pid": 7, "startedAt": START}), \
-            patched(scout.cells.probe, metrics=lambda port, headers=None: {}), \
-            patched(scout.cells.door, measure=lambda port, identity: None), \
+            patched(scout.cells.probe, metrics=lambda port: {}), \
             patched(scout.machine, firewall=lambda port: {}, listening_ports=lambda: None):
         cell = scout.cells.at(22031)
         cell.process = proc
@@ -94,7 +93,7 @@ def test_on_the_card():
     check(view.get("launchDiskNewer") == ["model"],
           f"работающая ячейка говорит, какие её файлы новее старта (got {view.get('launchDiskNewer')})")
     stopped = scout.cells.at(22032)
-    with patched(scout.cells.probe, metrics=lambda port, headers=None: {}):
+    with patched(scout.cells.probe, metrics=lambda port: {}):
         quiet = scout.cells.view(stopped)
     check("launchDiskNewer" not in quiet, "negative: у стоящей ячейки поля нет — она ничего не держит")
 

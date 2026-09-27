@@ -201,7 +201,6 @@
       "ctxMax": 8192,
       "ctxSize": 8192,
       "ctxUsed": 2048,
-      "door": "closed",
       "firewall": {
         "allowedFrom": [],
         "state": "open"
@@ -235,7 +234,6 @@
         "ctxMax": 8192,
         "ctxSize": 8192,
         "ctxUsed": 2048,
-        "door": "closed",
         "firewall": {
           "allowedFrom": [],
           "state": "open"
@@ -261,7 +259,6 @@
         "adopted": true,
         "cellKind": "command",
         "command": "$HOME/vllm-venv/bin/vllm serve org/model --port \"$PORT\"",
-        "door": "open",
         "firewall": {
           "allowedFrom": [],
           "state": "open"
@@ -548,7 +545,6 @@
       "ctxMax": 8192,
       "ctxSize": 8192,
       "ctxUsed": 2048,
-      "door": "closed",
       "firewall": {
         "allowedFrom": [],
         "state": "open"
@@ -582,7 +578,6 @@
         "ctxMax": 8192,
         "ctxSize": 8192,
         "ctxUsed": 2048,
-        "door": "closed",
         "firewall": {
           "allowedFrom": [],
           "state": "open"
@@ -608,7 +603,6 @@
         "adopted": true,
         "cellKind": "command",
         "command": "$HOME/vllm-venv/bin/vllm serve org/model --port \"$PORT\"",
-        "door": "open",
         "firewall": {
           "allowedFrom": [],
           "state": "open"

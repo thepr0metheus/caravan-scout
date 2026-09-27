@@ -74,14 +74,13 @@ page on `http://<host>:8092/` only reads.
 Runtime files (never in git): `state.json` (heartbeat status, the `cells`
 registry and the pinned `hostId`; a 1.x state's `assignments`/`applyStatus`
 are dropped once at start), `llama-node-configs/`, `var/server-cells/<port>/`, the model cache
-(`~/llama-model-cache` by default). `var/` is in `.gitignore` since 2.20 — a
-cell's folder holds its key.
+(`~/llama-model-cache` by default).
 
-Files that hold a secret are 0600 (2.20): `config.json` (the fleet token),
-`state.json` (the cells' start requests and launches, with their keys) and a
-cell's `var/server-cells/<port>/cell.key`. Before 2.20 the machine's umask
-made the first two 0664; since 2.20.1 the scout narrows them to 0600 when it
-starts (config.json is otherwise written only when the scout is paired).
+Files that hold a secret are 0600 (2.20): `config.json` (the fleet token)
+and `state.json` (the cells' start requests and launches). Before 2.20 the
+machine's umask made them 0664; since 2.20.1 the scout narrows them to 0600
+when it starts (config.json is otherwise written only when the scout is
+paired).
 
 ## Known quirks
 

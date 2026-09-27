@@ -43,7 +43,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _scout_harness import Checks, patched, FakeRun, make_scout, BLOCKED, REAL, TMP  # noqa: E402,F401
+from _scout_harness import Checks, patched, FakeRun, make_scout, BLOCKED, TMP  # noqa: E402,F401
 
 # expanduser(), Path.home() and the cell-asset sync all resolve through $HOME;
 # no pin may write into the real one.
@@ -529,25 +529,20 @@ def test_node_public_views():
     sl.process.adopt(5353, {"modelPath": "/m/model-q4.gguf", "port": 22021, "cmd": ["/opt/llama-server"]},
                   started_at=NOW - 500)
     s.cells.report(22021, phase="error", error="old failure")
-    web = FakeUrlopen({"/metrics": lambda url: FakeResponse(METRICS), "/props": lambda url: FakeResponse(PROPS),
-                       "/v1/caravan-door": urllib.error.HTTPError("u", 404, "Not Found", {}, None)})
+    web = FakeUrlopen({"/metrics": lambda url: FakeResponse(METRICS), "/props": lambda url: FakeResponse(PROPS)})
     run = FakeRun({("sudo", "-n", "ufw", "status"): (0, "Status: inactive\n")})
     with Rig(web=web, run=run, kill=FakeKill(alive={5353})):
         view = s.cells.view(sl)
     check(view == {"running": True, "pid": 5353, "adopted": True, "startedAt": NOW - 500, "uptimeSec": 500,
                    "modelPath": "/m/model-q4.gguf", "port": 22021, "phase": "running",
                    "promptTps": 123.46, "genTps": 45.68, "requestsProcessing": 2, "ctxMax": 8192,
-                   "ctxUsed": 2048, "firewall": {"state": "open", "allowedFrom": []}, "launchDiskNewer": [],
-                   "door": "open"},
-          "живой процесс: фаза running, метрики, окно контекста, файрвол, файлы, изменившиеся после старта "
-          "(2.11; файла модели здесь нет — пусто), и впускает ли он без ключа (2.20: 404 — впустил), влиты в вид")
+                   "ctxUsed": 2048, "firewall": {"state": "open", "allowedFrom": []}, "launchDiskNewer": []},
+          "живой процесс: фаза running, метрики, окно контекста, файрвол и файлы, изменившиеся после старта "
+          "(2.11; файла модели здесь нет — пусто), влиты в вид")
     check("cmd" not in view, "negative: командная строка процесса (cmd) в вид не попадает")
     check(view.get("phase") == "running", "negative: живой процесс сильнее записанной ошибки старта")
-    check([c["url"] for c in web.calls] == ["http://127.0.0.1:22021/metrics", "http://127.0.0.1:22021/props",
-                                            "http://127.0.0.1:22021/v1/caravan-door"],
-          "метрики, /props и дверь спрашиваются у порта процесса")
-    check([c["headers"] for c in web.calls] == [{}, {}, {}],
-          "negative: запущена без ключа (усыновлённая, запуска нет) — ни одна проба ключа не несёт")
+    check([c["url"] for c in web.calls] == ["http://127.0.0.1:22021/metrics", "http://127.0.0.1:22021/props"],
+          "метрики и /props берутся с порта процесса")
     sl = s.cells.at(22022)
     sl.process.adopt(5454, {"modelPath": "/m/x.gguf"}, started_at=NOW)
     web = FakeUrlopen({"/metrics": URLError_("down"), "/props": URLError_("down")})
@@ -797,9 +792,9 @@ def test_cell_artifacts():
     cell = json.loads((d / "cell.json").read_text(encoding="utf-8"))
     check(cell == {"hostId": "box-a", "port": port, "config": config, "runtime": runtime,
                    "cmd": [bin_abs, "--model", "/models/org/model q4.gguf", "--alias", "it's", "--port", "22031"],
-                   "env": {}, "keyed": False, "generatedAt": NOW, "startScript": str(d / "start.sh")},
+                   "env": {}, "generatedAt": NOW, "startScript": str(d / "start.sh")},
           "cell.json: хост, порт, конфиг формы, runtime, argv строками, окружение движка (нет — пусто), "
-          "с ключом ли (нет — 2.20), время и путь start.sh")
+          "время и путь start.sh")
     raw = (d / "cell.json").read_text(encoding="utf-8")
     check("модель" in raw and raw.endswith("}\n") and raw.startswith("{\n  \"hostId\""),
           "cell.json читаем глазами: не-ASCII как есть, отступ 2, перевод строки в конце")
@@ -2066,62 +2061,32 @@ def test_worker_cleanup_when_caching():
 
 
 
-# ── the cell's key (2.20) ─────────────────────────────────────────────────
-
-KEY = "cck1_" + "0123456789abcdef" * 2 + "01234567"      # the controller's shape: cck1_ + 40 hex
-KEY_ENV = {"LLAMA_API_KEY": KEY, "VLLM_API_KEY": KEY, "CARAVAN_CELL_KEY": KEY}
-
-
-def test_cell_key_start():
+def test_cell_env_both_kinds():
     port = 22094
-
-    def launch_env(payload):
-        r = start_llama({"modelPath": MODEL, "args": llama_args(port),
-                         "config": {"MODEL_FILE": MODEL, "PORT": port}, **payload})
-        t = r.threads.made[0] if r.threads.made else None
-        launch = getattr(getattr(t, "target", None), "__self__", None)
-        return r, (launch.env if isinstance(launch, LlamaLaunch) else "no launch")
-    r, env_ = launch_env({"cellKey": KEY, "env": {"CUDA_VISIBLE_DEVICES": ""}})
-    check((r.res or {}).get("ok") is True and env_ == {"CUDA_VISIBLE_DEVICES": "", **KEY_ENV},
-          "llama-ячейка: ключ из cellKey уходит в запуск под тремя именами (llama-server, vLLM, ячейки каравана), "
-          "рядом с окружением движка")
-    check(launch_env({"cellKey": ""})[1] == {} and launch_env({"cellKey": None})[1] == {},
-          "negative: ключа нет (пустой или null — старый контроллер) — ячейка стартует без него, как раньше")
-    for why, bad in (("короче 16", "cck1_short"), ("пробел", "cck1_0123456789 abcdef"), ("перевод строки", KEY + "\nX: y"),
-                     ("не строка", 12345678901234567), ("длиннее 128", "k" * 129)):
-        r = start_llama({"modelPath": MODEL, "args": llama_args(port), "cellKey": bad,
-                         "config": {"MODEL_FILE": MODEL, "PORT": port}})
-        check(err_is(r.err, 400, "cellKey must be 16-128 letters, digits, '_' or '-'")
-              and r.threads.made == [] and r.run.calls == [] and r.s.cells.by_port == {},
-              f"ключ не токен ({why}) — отказ 400 до всего: он идёт в заголовок и в окружение как есть")
-    for name in ("LLAMA_API_KEY", "CARAVAN_CELL_KEY", "CARAVAN_SCOUT_CELL"):
-        r = start_llama({"modelPath": MODEL, "args": llama_args(port), "env": {name: "x"},
-                         "config": {"MODEL_FILE": MODEL, "PORT": port}})
-        check(err_is(r.err, 400, f"env may not set {name} — the scout sets them (the key comes as cellKey)")
-              and r.threads.made == [] and r.run.calls == [],
-              f"env не задаёт {name} — это имя ставит скаут (ключ приходит как cellKey, метка — своя); отказ до всего")
-
+    r = start_llama({"modelPath": MODEL, "args": llama_args(port), "env": {"CARAVAN_SCOUT_CELL": "x"},
+                     "config": {"MODEL_FILE": MODEL, "PORT": port}})
+    check(err_is(r.err, 400, "env may not set CARAVAN_SCOUT_CELL — the scout sets it")
+          and r.threads.made == [] and r.run.calls == [],
+          "env не задаёт метку скаута (по ней он узнаёт свои ячейки) — отказ 400 до всего")
     cport = 22204
     shell = f"set -euo pipefail; export PORT={cport}; exec python3 srv.py"
-    r = start_command({"cellKind": "command", "command": "python3 srv.py", "shellLine": shell, "cellKey": KEY,
+    r = start_command({"cellKind": "command", "command": "python3 srv.py", "shellLine": shell,
                        "env": {"CUDA_VISIBLE_DEVICES": ""}, "config": {"PORT": cport}})
-    spawn = r.popen.calls[0] if r.popen.calls else {}
-    got = spawn.get("env") or {}
-    check(r.res == {"ok": True, "pid": 7070, "port": cport}
-          and {k: got.get(k) for k in [*KEY_ENV, "CUDA_VISIBLE_DEVICES", "CARAVAN_SCOUT_CELL"]}
-          == {**KEY_ENV, "CUDA_VISIBLE_DEVICES": "", "CARAVAN_SCOUT_CELL": str(cport)},
-          "командная ячейка (vLLM, ячейки каравана): тот же ключ и окружение из запроса — раньше env у неё "
-          "молча выбрасывался; ответ ключа не несёт")
-    rec = disk_cells(r.s).get(str(cport), {})
-    check(rec.get("launch", {}).get("extraEnv") == {"CUDA_VISIBLE_DEVICES": "", **KEY_ENV} and KEY not in json.dumps(rec.get("cfg")),
-          "запуск в записи держит ключ (перезапуск после аварии — с ним же), cfg — нет (cfg уходит в отчёт)")
-    check(spawn.get("argv") == ["bash", "-lc", shell] and KEY not in " ".join(spawn.get("argv") or []),
-          "negative: в командной строке ключа нет — её видит любой пользователь машины через ps")
-    r = start_command({"cellKind": "command", "command": "python3 srv.py", "shellLine": shell, "cellKey": "bad key",
-                       "config": {"PORT": cport}})
-    check(err_is(r.err, 400, "cellKey must be 16-128 letters, digits, '_' or '-'")
+    got = (r.popen.calls[0] if r.popen.calls else {}).get("env") or {}
+    check(r.res == {"ok": True, "pid": 7070, "port": cport} and got.get("CUDA_VISIBLE_DEVICES") == ""
+          and got.get("CARAVAN_SCOUT_CELL") == str(cport),
+          "командная ячейка берёт env из запроса (2.20; раньше он молча выбрасывался), метка скаута при ней")
+    check(disk_cells(r.s).get(str(cport), {}).get("launch", {}).get("extraEnv") == {"CUDA_VISIBLE_DEVICES": ""},
+          "env в записи запуска — перезапуск после аварии стартует так же")
+    r = start_command({"cellKind": "command", "command": "python3 srv.py", "shellLine": shell,
+                       "env": {"CARAVAN_SCOUT_CELL": "x"}, "config": {"PORT": cport}})
+    check(err_is(r.err, 400, "env may not set CARAVAN_SCOUT_CELL — the scout sets it")
           and r.popen.calls == [] and r.run.calls == [],
-          "negative: кривой ключ у командной ячейки — отказ до ufw и запуска")
+          "negative: и у командной ячейки — отказ до ufw и запуска")
+    r = start_command({"cellKind": "command", "command": "python3 srv.py", "shellLine": shell,
+                       "env": ["A=1"], "config": {"PORT": cport}})
+    check(err_is(r.err, 400, "env must map variable names to strings") and r.popen.calls == [],
+          "negative: кривой env у командной ячейки — отказ, как у llama-ячейки")
 
 
 def test_cell_env_marker_last():
@@ -2129,133 +2094,6 @@ def test_cell_env_marker_last():
     check(got["CARAVAN_SCOUT_CELL"] == "22095" and got["A"] == "1" and got.get("PATH") == os.environ.get("PATH"),
           "метка ставится последней: окружение запуска её не перекроет, даже записанное в state.json руками — "
           "иначе скаут потерял бы свою ячейку")
-
-
-def test_cell_key_artifacts():
-    s = make_scout()
-    port = 22033
-    d = SERVER_CELLS_DIR / str(port)
-    shutil.rmtree(d, ignore_errors=True)
-    with Rig():
-        CellArtifacts(s.config).write(port, "/usr/bin/env", [], {}, {}, env={"A_B": "x y", **KEY_ENV})
-    script = (d / "start.sh").read_text(encoding="utf-8")
-    check(script == ("#!/usr/bin/env bash\nset -euo pipefail\n\nexport A_B='x y'\n"
-                     "# The cell's key, kept in cell.key (0600): the caravan's proxy presents it.\n"
-                     "CELL_KEY=\"$(cat \"$(dirname \"$0\")/cell.key\")\"\n"
-                     "export LLAMA_API_KEY=\"$CELL_KEY\" VLLM_API_KEY=\"$CELL_KEY\" CARAVAN_CELL_KEY=\"$CELL_KEY\"\n"
-                     "exec /usr/bin/env \"$@\"\n"),
-          "start.sh с ключом: ключ не в тексте — скрипт читает его из cell.key и отдаёт под тремя именами")
-    check((d / "cell.key").read_text(encoding="utf-8") == KEY + "\n" and (d / "cell.key").stat().st_mode & 0o777 == 0o600,
-          "cell.key — ключ, права 0600: его читает только владелец")
-    cell = json.loads((d / "cell.json").read_text(encoding="utf-8"))
-    check(cell.get("env") == {"A_B": "x y"} and cell.get("keyed") is True
-          and KEY not in (d / "cell.json").read_text(encoding="utf-8") and KEY not in script,
-          "cell.json: окружение без ключа и пометка «с ключом»; ключа нет ни в cell.json, ни в start.sh")
-    check((d / "start.sh").stat().st_mode & 0o777 == 0o755, "negative: start.sh остаётся 0755 — секрета в нём нет")
-    # The script itself, run for real: it is "the exact command, runnable by hand".
-    with patched(subprocess, run=REAL["run"], Popen=REAL["Popen"]):
-        ran = subprocess.run(["bash", str(d / "start.sh")], capture_output=True, text=True, timeout=20)
-        lines = set(ran.stdout.splitlines())
-        (d / "cell.key").unlink()
-        broken = subprocess.run(["bash", str(d / "start.sh")], capture_output=True, text=True, timeout=20)
-    check(ran.returncode == 0 and {f"{k}={v}" for k, v in {**KEY_ENV, "A_B": "x y"}.items()} <= lines,
-          "запущенный руками start.sh даёт движку ключ под тремя именами — ячейка закрыта так же, как у скаута")
-    check(broken.returncode != 0 and "LLAMA_API_KEY=" not in broken.stdout,
-          "negative: без cell.key скрипт не доходит до exec — открытой ячейки из него не выйдет")
-    with Rig():
-        CellArtifacts(s.config).write(port, "/usr/bin/env", [], {}, {}, env=KEY_ENV)
-        CellArtifacts(s.config).write(port, "/usr/bin/env", [], {}, {}, env={})
-    check(not (d / "cell.key").exists() and "CELL_KEY" not in (d / "start.sh").read_text(encoding="utf-8")
-          and json.loads((d / "cell.json").read_text(encoding="utf-8")).get("keyed") is False,
-          "следующий старт без ключа убирает cell.key прошлого — в папке не лежит чужой ключ")
-
-
-def test_cell_key_probes():
-    s = make_scout()
-    sl = s.cells.at(22023)
-    sl.process.adopt(5555, {"modelPath": "/m/x.gguf", "port": 22023}, started_at=NOW - 100,
-                     launch={"argv": ["/opt/llama-server"], "extraEnv": dict(KEY_ENV), "log": ""})
-    web = FakeUrlopen({"/metrics": lambda url: FakeResponse(METRICS), "/props": lambda url: FakeResponse(PROPS),
-                       "/v1/caravan-door": urllib.error.HTTPError("u", 401, "Unauthorized", {}, None)})
-    with Rig(web=web, run=FakeRun({("sudo", "-n", "ufw", "status"): (0, "Status: inactive\n")}), kill=FakeKill(alive={5555})):
-        view = s.cells.view(sl)
-    by_path = {c["url"].rsplit(":22023", 1)[-1]: c["headers"] for c in web.calls}
-    check(by_path == {"/metrics": {"Authorization": f"Bearer {KEY}"}, "/props": {"Authorization": f"Bearer {KEY}"},
-                      "/v1/caravan-door": {}},
-          "пробы скаута несут ключ ячейки (иначе у закрытой пропали бы скорости и окно — единственный источник "
-          "окна маршрутов), а дверь спрашивается без ключа")
-    check(view.get("door") == "closed" and view.get("ctxMax") == 8192 and KEY not in json.dumps(view),
-          "401 без ключа — дверь «closed»; окно прочитано с ключом; в виде (он уходит в отчёт) ключа нет")
-
-    port = 22065
-    rec = {"port": port, "kind": "command", "pid": 4747, "marker": f"vllm serve org/model --port {port}",
-           "cfg": {"port": port}, "log": "", "cacheModels": False, "healthPath": "/v1/models", "startedAt": NOW - 60,
-           "launch": {"argv": ["bash", "-lc", "exec vllm serve"], "extraEnv": dict(KEY_ENV), "log": ""}}
-    s = make_scout({}, {"cells": {str(port): rec}})
-    run = FakeRun({("ps", "-p", "4747"): (0, ""), ("ss", "-ltnpH"): (0, ss_line(port, 6262))})
-    web = FakeUrlopen({"/v1/models": FakeResponse(b"{}")})
-    with Rig(run=run, web=web, kill=FakeKill(alive={6262})):
-        s.cells.adopt_survivors()
-    check([c["headers"] for c in web.calls] == [{"Authorization": f"Bearer {KEY}"}],
-          "усыновление по порту: здоровье (/v1/models у vLLM закрыт ключом) спрашивается с ключом из записи запуска")
-
-
-def test_cell_door():
-    from caravan_scout.cells import CellDoor
-    answers = {}
-    for name, answer in (("401", urllib.error.HTTPError("u", 401, "x", {}, None)),
-                         ("403", urllib.error.HTTPError("u", 403, "x", {}, None)),
-                         ("404", urllib.error.HTTPError("u", 404, "x", {}, None)),
-                         ("405", urllib.error.HTTPError("u", 405, "x", {}, None)),
-                         ("200", FakeResponse(b"{}")),
-                         ("503", urllib.error.HTTPError("u", 503, "x", {}, None)),
-                         ("500", urllib.error.HTTPError("u", 500, "x", {}, None)),
-                         ("refused", URLError_("refused")), ("timeout", TimeoutError("timed out"))):
-        web = FakeUrlopen({"/v1/caravan-door": answer})
-        with Rig(web=web):
-            answers[name] = CellDoor().ask(22024)
-    check(answers == {"401": "closed", "403": "closed", "404": "open", "405": "open", "200": "open",
-                      "503": None, "500": None, "refused": None, "timeout": None},
-          "401/403 — «closed»; любой другой ответ сервера (404, 405, 200) — «open»: он обслужил запрос без ключа; "
-          "5xx (грузится), отказ соединения, таймаут — None: сказать нечего")
-    web = FakeUrlopen({"/v1/caravan-door": urllib.error.HTTPError("u", 401, "x", {}, None)})
-    with Rig(web=web):
-        CellDoor().ask(22024)
-    check(web.calls == [{"url": "http://127.0.0.1:22024/v1/caravan-door", "headers": {}, "timeout": 1}],
-          "дверь спрашивается GET-ом без заголовков по пути под /v1, которого нет ни у одного сервера")
-
-    now = [1000.0]
-    door = CellDoor(clock=lambda: now[0])
-    web = FakeUrlopen({"/v1/caravan-door": [urllib.error.HTTPError("u", 401, "x", {}, None)]})
-    with Rig(web=web):
-        first = door.measure(22025, (11, NOW))
-        now[0] += 3600
-        again = door.measure(22025, (11, NOW))
-    check(first == again == "closed" and len(web.calls) == 1,
-          "ответ держится весь процесс: ключ задан при старте — второй раз не спрашивается (каждый отказ — строка "
-          "в логе движка)")
-    web = FakeUrlopen({"/v1/caravan-door": [urllib.error.HTTPError("u", 404, "x", {}, None)]})
-    with Rig(web=web):
-        after = door.measure(22025, (12, NOW + 5))
-    check(after == "open" and len(web.calls) == 1, "другой процесс на порту (pid, старт) — спрашивается заново")
-    web = FakeUrlopen({"/v1/caravan-door": [urllib.error.HTTPError("u", 503, "x", {}, None),
-                                            urllib.error.HTTPError("u", 401, "x", {}, None)]})
-    with Rig(web=web):
-        unknown = door.measure(22026, (13, NOW))
-        now[0] += CellDoor.RETRY - 1
-        held = door.measure(22026, (13, NOW))
-        now[0] += 2
-        known = door.measure(22026, (13, NOW))
-    check((unknown, held, known) == (None, None, "closed") and len(web.calls) == 2,
-          "пока сказать нечего (грузится) — спрашивается снова, но не чаще раза в 30 с")
-
-
-def test_cell_key_scrubbed():
-    from caravan_scout.process import CellLog
-    line = f"srv  load_model: api key {KEY} accepted; fallback cck1_{'f' * 40}"
-    out = CellLog.scrub(line)
-    check(KEY not in out and "f" * 40 not in out and "cck1_…" in out,
-          f"ключ ячейки (cck1_) вычищается из хвоста лога, как ключи маршрутов (got {out!r})")
 
 TESTS = [
     test_slot_plumbing, test_node_public_views, test_nodes_public_list,
@@ -2274,9 +2112,7 @@ TESTS = [
     test_worker_success, test_worker_engine_env, test_worker_download_error, test_worker_log_dir_missing, test_worker_refuses_without_args,
     test_worker_gpu_layers_and_spec, test_worker_cancelled_mid_download, test_worker_stopped_during_start,
     test_worker_corruption_retry, test_worker_corruption_only_own, test_worker_cleanup_when_caching,
-    test_models_in_place,
-    test_cell_key_start, test_cell_env_marker_last, test_cell_key_artifacts, test_cell_key_probes,
-    test_cell_door, test_cell_key_scrubbed,
+    test_models_in_place, test_cell_env_both_kinds, test_cell_env_marker_last,
 ]
 
 

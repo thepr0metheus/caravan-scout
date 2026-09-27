@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.21.0 — 2026-09-27
+
+- **Keys on the cells' doors are cancelled — the operator's decision.** A
+  cell stays what it was before 2.20: a model on its machine's address and
+  a port from the list, reached in the local network without any key. The
+  scout no longer takes `cellKey`, writes no `cell.key`, sends no key with
+  its own requests, and a cell's view no longer says `door` (it could only
+  say `open`). What 2.20 fixed along the way stays: a command cell takes
+  `env`, the scout's marker is set last and cannot be named in `env`,
+  config.json and state.json are 0600, and `var/` is ignored by git.
+
 ## 2.20.1 — 2026-09-26
 
 - **A secret file written before 2.20 is narrowed at start.** On the fleet

@@ -35,7 +35,7 @@ class CellLog:
     TAIL_CHARS = 1500
     SECRETS = (
         # A key by its prefix, wherever it stands.
-        (re.compile(r"\b(lcv1_|cck1_|sk-|hf_|ghp_|glpat-)[A-Za-z0-9_\-]{6,}"), r"\1…"),
+        (re.compile(r"\b(lcv1_|sk-|hf_|ghp_|glpat-)[A-Za-z0-9_\-]{6,}"), r"\1…"),
         (re.compile(r"(?i)\b(bearer)\s+[^\s\"',}]+"), r"\1 …"),
         # A value named as secret: whatever it is.
         (re.compile(r"(?i)\b((?:[a-z0-9]+_)*(?:api[_-]?key|password|passwd|secret))\b(\"?\s*[=:]\s*\"?|\s+)"
@@ -673,7 +673,7 @@ class HostProcesses:
 
     @staticmethod
     def healthy(port: int, timeout: float = 2.0, attempts: int = 1,
-                health_path: str = "/health", headers: dict[str, str] | None = None) -> bool:
+                health_path: str = "/health") -> bool:
         """True if the server on <port> answers its health endpoint with 2xx —
         confirming a real, healthy cell serves the port before we adopt whatever
         pid owns it.
@@ -685,18 +685,14 @@ class HostProcesses:
 
         Retries because this runs at agent startup, which is exactly when the host
         is busiest — a single 2 s probe on a loaded box times out on a cell that is
-        perfectly alive.
-
-        `headers` carry the cell's key (CellKey): a vLLM cell with one refuses
-        /v1/models to a request without it, and a refusal is not health."""
+        perfectly alive."""
         path = str(health_path or "/health").strip() or "/health"
         if not path.startswith("/"):
             path = "/" + path
         for i in range(max(1, int(attempts))):
             try:
-                with urllib.request.urlopen(urllib.request.Request(
-                        f"http://127.0.0.1:{int(port)}{path}", headers=dict(headers or {})),
-                        timeout=timeout) as resp:
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{int(port)}{path}", timeout=timeout) as resp:
                     return 200 <= int(getattr(resp, "status", 200) or 200) < 300
             except Exception:
                 if i + 1 < attempts:

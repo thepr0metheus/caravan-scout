@@ -13,6 +13,6 @@ vllm-versions.json
 config.json.*
 state.json.*
 
-# What the scout keeps at run time: the cells' start scripts, their JSON and
-# their keys (cell.key, 0600). A `git add -A` on a machine must not take them.
+# What the scout keeps at run time: the cells' start scripts and their JSON.
+# A `git add -A` on a machine must not take them.
 var/

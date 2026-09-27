@@ -108,10 +108,6 @@ class ReportSample:
     METRICS = {"promptTps": 812.5, "genTps": 41.3, "requestsProcessing": 1, "ctxMax": 8192, "ctxUsed": 2048}
     # A vLLM cell says its queue, and its rates come from its counters (2.7).
     VLLM_METRICS = {"requestsProcessing": 2, "requestsWaiting": 1, "promptTps": 150.0, "genTps": 40.0}
-    #: Whether a cell lets in a request without its key (2.20), mid-move to
-    #: keys: one restarted with its key, one started before keys; a cell that
-    #: cannot say yet has no `door` at all.
-    DOORS = {22001: "closed", 22012: "open"}
     UPDATE = {"running": False, "done": True, "rc": 0, "startedAt": NOW - 86_400, "tag": "b9947",
               "lastLine": "llama.cpp b9947 installed"}
 
@@ -173,8 +169,7 @@ class ReportSample:
                   "archive": lambda: archive}
         with patched(scout.machine, **machine), patched(scout.builds, **builds), \
                 patched(scout.driver, facts=lambda: json.loads(json.dumps(self.DRIVER))), \
-                patched(scout.cells.door, measure=lambda port, identity: self.DOORS.get(port)), \
-                patched(scout.cells.probe, metrics=lambda port, headers=None: dict(self.VLLM_METRICS if port == 22012
+                patched(scout.cells.probe, metrics=lambda port: dict(self.VLLM_METRICS if port == 22012
                                                                       else self.METRICS if port == 22001
                                                                       else {})), \
                 patched(CellProcess, pid_alive=staticmethod(lambda pid: pid in (4242, 4343, 4444))), \
