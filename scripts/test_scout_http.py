@@ -203,6 +203,38 @@ def test_post_routes():
               "negative: путь, который читает тело, отказывает на теле не-объекте")
 
 
+def test_restore_names_a_build():
+    CHECKS.section("откат сборки — без id он не запускается:")
+    scout = make_scout()
+    started = []
+    with patched(scout.builds, start_update=lambda body: started.append(dict(body)) or {"started": body}), \
+            Served(scout) as srv:
+        refused = (400, {"error": "build id is required"})
+        for label, body in (("тело без id", {}), ("пустой id", {"id": ""}), ("id из пробелов", {"id": "   "}),
+                            ("id — null", {"id": None}), ("пустой restoreId", {"restoreId": ""}),
+                            ("оба поля пустые", {"id": "", "restoreId": ""})):
+            del started[:]
+            check(srv.post("/api/llama-node/restore", body) == refused and started == [],
+                  f"negative: {label} — 400, и задача обновления не стартует (defect-history: пустой id читался "
+                  f"как «не откат» и запускал обычное обновление — pull и пересборку вместо возврата)")
+        del started[:]
+        check(srv.post("/api/llama-node/restore", {"id": "  20260901-1  "}) == (200, {"started": {"restoreId": "20260901-1"}})
+              and started == [{"restoreId": "20260901-1"}],
+              "id с пробелами по краям уходит в задачу без них")
+        del started[:]
+        check(srv.post("/api/llama-node/restore", {"id": "", "restoreId": "20260901-3"})
+              == (200, {"started": {"restoreId": "20260901-3"}}),
+              "boundary: пустой id и заполненный restoreId — берётся restoreId")
+        check(srv.post("/api/llama-node/restore", {"id": "20260901-4", "restoreId": "20260901-5"})
+              == (200, {"started": {"restoreId": "20260901-4"}}),
+              "as-is: оба поля заполнены — id главнее restoreId (так было и до отказа на пустом)")
+        del started[:]
+        check(srv.post("/api/llama-node/update", {"tag": ""}) == (200, {"started": {"tag": ""}}) and started == [{"tag": ""}],
+              "as-is: обновление с пустым тегом остаётся обновлением до последнего релиза — там пустое значит «последний»")
+        check(srv.post("/api/llama-node/restore", raw=b"[1]") == (400, {"error": "body must be a JSON object"}),
+              "негатив: тело не объект — прежний отказ, id не искали")
+
+
 def test_pairing_accepts_the_token_in_the_body():
     CHECKS.section("сопряжение при токене:")
     scout = make_scout({"controllerToken": TOKEN})
@@ -388,7 +420,8 @@ def test_stop_every_slot():
 
 
 TESTS = (test_open_paths, test_the_token_gate, test_pairing_page_reads_an_open_path, test_get_routes,
-         test_errors_become_envelopes, test_post_routes, test_pairing_accepts_the_token_in_the_body,
+         test_errors_become_envelopes, test_post_routes, test_restore_names_a_build,
+         test_pairing_accepts_the_token_in_the_body,
          test_pairing_after_a_token_rotation, test_unpair_route, test_host_power, test_stop, test_stop_every_slot)
 
 for test in TESTS:

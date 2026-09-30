@@ -11,11 +11,11 @@ What it does, and all it does:
   the llama.cpp build — in a heartbeat to the controller;
 - **names the engines next to its cells** — Ollama and LM Studio on the same
   machine: their models, what is loaded, the memory they hold (2.12), and
-  loads or unloads their models when the board asks (2.14) — for as long as
-  the board says to hold them, asking first when a model would not fit into
-  the cards' free memory (2.15) — and starts and stops the engines' servers
-  themselves, starting them again when the machine boots (2.16), and downloads
-  models into them or deletes them (2.17);
+  unloads or deletes their models when the board asks (2.14, 2.17) — and
+  starts and stops the engines' servers themselves, starting them again when
+  the machine boots (2.16). No model is loaded from here (2.18: a cell in the
+  engine loads its model when it starts) and none is downloaded (2.22: an
+  engine's own tools bring one);
 - **runs cells** the controller configures: llama.cpp servers and command
   cells (speech recognition, TTS…), models downloaded from the controller and
   cached here, the cells re-adopted after the scout restarts;
@@ -175,7 +175,8 @@ connection test, and the machine's ✕ on the board lets go of it: the scout
 forgets the controller and waits to be added again.
 
 A scout nobody has added yet is open on the LAN, like any fresh install;
-once paired, everything but its page and `/api/health` asks for the fleet
+once paired, everything but its page, `/api/pairing`, `/api/health` and
+`/openapi.json` (the scout's own description, OpenAPI 3.1, 2.22) asks for the fleet
 token. After the token is regenerated on the controller, adding the scout
 again hands over the new one.
 
@@ -261,7 +262,7 @@ restart the scout`. No `scp`. Runtime files (`state.json`, `var/`,
 
 Open until a controller adds it, on a trusted LAN; once the controller has
 handed over its fleet token, every endpoint except the scout's page,
-`/api/pairing` and `/api/health` requires it — including letting go of the
+`/api/pairing`, `/api/health` and `/openapi.json` requires it — including letting go of the
 scout, which only its controller can do. A pairing with a new token passes
 only when the same controller accepts that token. Command cells execute
 controller-supplied shell — do not expose the port beyond your LAN.

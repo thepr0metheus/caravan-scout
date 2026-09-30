@@ -50,6 +50,7 @@ jobs:
           curl -sf http://127.0.0.1:18092/api/health
           curl -sf -o /dev/null http://127.0.0.1:18092/api/state
           curl -sf -o /dev/null http://127.0.0.1:18092/
+          curl -sf http://127.0.0.1:18092/openapi.json | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["openapi"] == "3.1.0" and d["paths"]'
           echo "smoke OK"
 
   # The macOS scout runs on the system's Python 3.9. The snapshots ran only on

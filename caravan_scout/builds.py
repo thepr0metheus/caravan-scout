@@ -85,6 +85,17 @@ class LlamaBuilds:
                 rows.append(row)
         return {"ok": True, "builds": rows}
 
+    def restore(self, build_id: Any) -> dict:
+        """POST /api/llama-node/restore {id} — the update job told to put an
+        archived build back. A restore that names no build is refused: the job
+        reads an empty restoreId as "no restore" and builds the latest release
+        instead — a pull and a rebuild on a machine whose operator asked to go
+        back."""
+        build_id = str(build_id or "").strip()
+        if not build_id:
+            raise AppError("build id is required", 400)
+        return self.start_update({"restoreId": build_id})
+
     def start_update(self, body: dict) -> dict:
         """POST /api/llama-node/update {tag?} — empty tag = latest release; a
         commit sha works too (checkout -f accepts either), which is how the

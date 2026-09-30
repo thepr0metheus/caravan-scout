@@ -1,5 +1,35 @@
 # Changelog
 
+## 2.22.0 — 2026-09-30
+
+- **The scout describes itself: `GET /openapi.json`.** OpenAPI 3.1, open like
+  `/api/health` (the token gate stands after it), `info.version` the version
+  `/api/health` names. It is written from the one list of rows the scout
+  answers by (`caravan_scout/routes.py`), so a path is in it exactly when the
+  scout answers it: the path, a summary, who may ask (the page, `/api/pairing`,
+  `/api/health` and `/openapi.json` are open, the rest need the fleet token in
+  `X-Caravan-Token`), the query and body fields the scout reads, and "may read
+  more" on the start request that is passed on whole. Types of fields and shapes
+  of answers are said not to be described yet. The endpoint tables of
+  `docs/http-api.md` are rendered from the same rows and a test fails when the
+  page and the list disagree; the hand-written ones had drifted — they still
+  described a load dropped in 2.18. The home rule for every app with an HTTP
+  API; the controller has served its own since 1.3.405.
+- **A restore that names no build is refused.** `POST /api/llama-node/restore`
+  with no `id`, a blank one or null turned into an ordinary update — the job
+  reads an empty `restoreId` as "no restore" and builds the latest release, a
+  `git pull` and a rebuild on a machine whose operator asked to go back. It is
+  now 400 "build id is required" before any job is touched; the controller has
+  refused such a request itself since its 1.3.406. `POST /api/llama-node/update`
+  is unchanged: an empty tag there is the latest release.
+- **Nothing is downloaded into an engine through the scout.** The operator's
+  decision, kept by the controller since its 1.3.401: a model reaches Ollama or
+  LM Studio by that engine's own tools. Gone: `POST /api/engines/pull` (404
+  now), the `pull` control of both engines, the `downloading` and
+  `downloadError` marks on an engine's view, and the code behind them.
+  Deleting a model from Ollama stays, and so does the download of a model file
+  for a cell, which is another thing.
+
 ## 2.21.0 — 2026-09-27
 
 - **Keys on the cells' doors are cancelled — the operator's decision.** A
