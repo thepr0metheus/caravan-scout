@@ -58,6 +58,13 @@ class RuntimeTests(unittest.TestCase):
                      ("linux", "aarch64", "13.0", "cuda"), ("linux", "x86_64", "", "typo")):
             with self.subTest(args=args), self.assertRaises(AppError): PrismRuntime.asset(*args)
 
+    def test_nvidia_headers_old_and_610(self):
+        for header, expected in (("CUDA Version: 12.8", "linux-cuda-12.8-x64"),
+                                 ("CUDA UMD Version: 13.3", "linux-cuda-13.3-x64")):
+            with self.subTest(header=header), patched(self.runtime, run=lambda *a, **k:
+                    SimpleNamespace(returncode=0, stdout=header, stderr="")):
+                self.assertEqual(self.runtime.selected_asset(), expected)
+
     def test_install_and_reuse(self):
         progress = []
         binary = self.runtime.ensure(progress=lambda *args: progress.append(args))

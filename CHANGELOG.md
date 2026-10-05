@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.23.1 — 2026-10-02
+
+Recognize the NVIDIA 610 `CUDA UMD Version` header when selecting a PrismML CUDA archive.
+
 ## 2.23.0 — 2026-10-02
 
 Add an isolated PrismML runtime for Bonsai cells: pinned official archives with SHA-256 verification, on-demand installation, platform/CUDA selection, option validation, progress reporting and restart/adoption through the normal cell lifecycle. Report the runtime separately from stock llama.cpp.

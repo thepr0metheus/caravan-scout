@@ -75,7 +75,7 @@ class PrismRuntime:
         if self.system == "linux":
             try:
                 result = self.run(["nvidia-smi"], capture_output=True, text=True, timeout=10)
-                match = re.search(r"CUDA Version:\s*(\d+\.\d+)", result.stdout or "")
+                match = re.search(r"CUDA(?: UMD)? Version:\s*(\d+\.\d+)", result.stdout or "")
                 cuda = match.group(1) if result.returncode == 0 and match else ""
             except (OSError, subprocess.SubprocessError):
                 pass
