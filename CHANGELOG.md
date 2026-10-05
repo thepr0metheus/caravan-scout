@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.23.2 — 2026-10-02
+
+Recover PrismML/llama.cpp token speeds from cumulative token and compute-time
+counters when scrape-window gauges are zero or absent. Keep the last measured
+speed while idle; calculate new work from counter deltas without including idle
+wall time. The first reading uses the server's accumulated average. Discard old
+rates when the process-start header changes or counters decrease, and omit
+unavailable/nonfinite samples. vLLM throughput calculation stays unchanged.
+
 ## 2.23.1 — 2026-10-02
 
 Recognize the NVIDIA 610 `CUDA UMD Version` header when selecting a PrismML CUDA archive.

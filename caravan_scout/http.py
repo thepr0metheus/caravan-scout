@@ -129,6 +129,7 @@ class Api:
                   "model engines on this machine that are not its cells (2.12+, below), heartbeat status, llama.cpp "
                   "build and update status (`llamaUpdate`), the scout's own version (`scoutVersion`), per-cell "
                   "`llamaNodes` (a running cell's `promptTps`, `genTps` and `requestsProcessing` from its /metrics — "
+                  "llama.cpp/Prism speeds from gauges or token/compute-time counters, retained while idle (2.23.2+); "
                   "a vLLM cell's also `requestsWaiting`, and its rates from its token counters, 2.7+; `listening` — "
                   "whether a running cell's port listens on this machine yet, and while it does not, "
                   "`startingTail`, the last lines of its log, 2.7+; `launchDiskNewer` — the roles (`model`, "

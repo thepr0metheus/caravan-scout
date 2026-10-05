@@ -3,6 +3,7 @@ they look like from outside, and what outlives a scout restart."""
 from __future__ import annotations
 
 import json
+import math
 import os
 import signal
 import subprocess
@@ -42,7 +43,11 @@ class ServerProbe:
     llama-server was launched with from /props (kept ~30 s).
 
     llama-server and vLLM tell the same facts under different names.
-    llama.cpp reports its rates itself. vLLM 0.24 (engine V1) exports only
+    llama.cpp reports rates for the window since the last scrape; newer
+    builds (including PrismML) reset that window after every scrape. Its
+    cumulative token/compute-time pairs recover the speed even if another
+    reader consumed the window, and keep the last measured speed while idle.
+    vLLM 0.24 (engine V1) exports only
     token counters, so its rates are the counters' growth per second between
     two readings — the aggregate throughput its old avg_*_throughput gauges
     used to say; a first reading has nothing to compare with and says no
@@ -58,6 +63,11 @@ class ServerProbe:
               "vllm:num_requests_running": "requestsProcessing", "vllm:num_requests_waiting": "requestsWaiting"}
     #: Counted: the growth per second between two readings is the rate.
     COUNTERS = {"vllm:prompt_tokens_total": "promptTps", "vllm:generation_tokens_total": "genTps"}
+    #: Token counts divided by engine compute seconds, not elapsed wall time.
+    TIMED_COUNTERS = {
+        "promptTps": ("llamacpp:prompt_tokens_total", "llamacpp:prompt_seconds_total"),
+        "genTps": ("llamacpp:tokens_predicted_total", "llamacpp:tokens_predicted_seconds_total"),
+    }
 
     def __init__(self, clock: Callable[[], float] | None = None):
         # None asks time.time at each reading, so a patched clock is seen.
@@ -65,6 +75,7 @@ class ServerProbe:
         self._metrics: dict[Any, tuple[float, dict[str, Any]]] = {}
         self._ctx: dict[Any, tuple[float, int]] = {}
         self._counted: dict[Any, tuple[float, dict[str, float]]] = {}
+        self._timed: dict[Any, tuple[str, dict[str, float], dict[str, float]]] = {}
 
     def now(self) -> float:
         return self.clock() if self.clock else time.time()
@@ -79,8 +90,11 @@ class ServerProbe:
             return hit[1]
         out: dict[str, Any] = {}
         counted: dict[str, float] = {}
+        timed: dict[str, float] = {}
+        start = ""
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{int(port)}/metrics", timeout=1) as r:
+                start = r.headers.get("Process-Start-Time-Unix", "")
                 for line in r.read().decode("utf-8", "replace").splitlines():
                     if line.startswith("#") or not line.strip():
                         continue
@@ -89,13 +103,21 @@ class ServerProbe:
                         num = float(line.rsplit(None, 1)[-1])
                     except (ValueError, IndexError):
                         continue
+                    if not math.isfinite(num) or num < 0:
+                        continue
                     if name in self.GAUGES:
                         key = self.GAUGES[name]
                         out[key] = out.get(key, 0.0) + num
                     elif name in self.COUNTERS:
                         counted[name] = counted.get(name, 0.0) + num
+                    elif any(name in pair for pair in self.TIMED_COUNTERS.values()):
+                        timed[name] = timed.get(name, 0.0) + num
         except Exception:
-            out, counted = {}, {}
+            out, counted, timed = {}, {}, {}
+        if timed:
+            for key, value in self.timed_rates(port, timed, start, out).items():
+                if not out.get(key):
+                    out[key] = value
         for key in ("promptTps", "genTps"):
             if key in out:
                 out[key] = round(out[key], 2)
@@ -120,6 +142,33 @@ class ServerProbe:
                 out["ctxUsed"] = int(round(ratio * ctx_max))
         self._metrics[port] = (now, out)
         return out
+
+    def timed_rates(self, port, values: dict[str, float], start: str,
+                    gauges: dict[str, Any]) -> dict[str, float]:
+        """The latest observed token/compute-time rates, retained while idle.
+
+        The first scrape uses the server's accumulated average. Later scrapes
+        use only the new work, which may cover several requests. A process
+        identity change or a counter decrease discards the previous rates.
+        """
+        before = self._timed.get(port)
+        previous, rates = (dict(before[1]), dict(before[2])) if before and before[0] == start else ({}, {})
+        if any(value < previous.get(name, 0) for name, value in values.items()):
+            previous, rates = {}, {}
+        for key, (tokens, seconds) in self.TIMED_COUNTERS.items():
+            if tokens not in values or seconds not in values:
+                rates.pop(key, None)
+                continue
+            count, duration = values[tokens], values[seconds]
+            if tokens in previous and seconds in previous:
+                count -= previous[tokens]
+                duration -= previous[seconds]
+            if duration > 0:
+                rates[key] = round(count / duration, 2)
+            if gauges.get(key, 0) > 0:
+                rates[key] = round(gauges[key], 2)
+        self._timed[port] = (start, dict(values), rates)
+        return rates
 
     def ctx_max(self, port) -> int:
         """n_ctx the llama-server was launched with, from /props. Cached ~30s

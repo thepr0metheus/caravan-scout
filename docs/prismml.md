@@ -40,6 +40,16 @@ A Prism release can lag upstream flags. The scout checks the generated options
 against the selected binary's --help and names unsupported options before
 loading the model. It never silently drops a requested flag.
 
+Token speeds come from `/metrics`. This Prism release resets its throughput
+gauges on every scrape, so they become zero when idle or when another reader
+has consumed the window. Scout 2.23.2 also reads cumulative token counts and
+compute seconds: new work is measured from their deltas, and the last observed
+speed remains visible while idle. The first scrape uses the accumulated average
+since the server started; later samples can cover several requests. This is
+inference speed, with idle time excluded, rather than wall-clock traffic rate.
+An unavailable endpoint does not report a speed. Restarting the scout preserves
+running model processes.
+
 Runtime compatibility does not guarantee that a memory plan fits. Bonsai 27B
 PQ2_0 weights alone occupy about 6.7 GiB; projector, KV cache and work buffers
 add to this. Start with a modest context (e.g. 8192), one slot and appropriate
