@@ -110,6 +110,8 @@ class CellLog:
             return levelled and levels.get(ln) in ("I", "W")
         # High-priority: actionable patterns the UI can classify into friendly messages
         priority = (
+            "invalid ggml type",
+            "unsupported quantization",
             "not within the file bounds",
             "corrupted or incomplete",
             "unexpected end of file",
@@ -541,6 +543,8 @@ class CellProcess:
                 # Died while adopted: no exit code is observable (not our child).
                 err = self._log.crash_reason()
                 self._exit_info = {"exitCode": None, "lastError": err, "crashed": True}
+                if self._cfg.get("runner") == "prism":
+                    self._exit_info["runner"] = "prism"
                 self._adopted_pid = None
                 return {"running": False, **self._exit_info}
             if not self._proc:
@@ -556,6 +560,8 @@ class CellProcess:
                 # the reason from the log so the admin can show it.
                 err = self._last_error or self._log.crash_reason()
                 self._exit_info = {"exitCode": rc, "lastError": err, "crashed": rc != 0}
+                if self._cfg.get("runner") == "prism":
+                    self._exit_info["runner"] = "prism"
                 self._proc = None
                 return {"running": False, **self._exit_info}
             return {

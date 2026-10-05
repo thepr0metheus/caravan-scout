@@ -82,7 +82,8 @@ class Watchdog:
         self._schedule(port, note, now)
         with cell.lock:
             cell.crash = note
-        self.suspect.crashed("\n".join((note["reason"], how, note["tail"])))
+        if st.get("runner") != "prism":
+            self.suspect.crashed("\n".join((note["reason"], how, note["tail"])))
 
     def _schedule(self, port: int, note: dict[str, Any], now: float) -> None:
         recent = [t for t in note.get("restarts", []) if now - t < self.WINDOW_SEC]

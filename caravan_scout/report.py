@@ -58,6 +58,7 @@ class Report:
                 # of them carries is erased by the other every minute.
                 "scoutVersion": APP_VERSION,
                 "llamaBinaryVersion": version,
+                "prismRuntime": self.cells.prism.facts(),
                 "llamaBinaryMtime": self.builds.binary_mtime(),
                 "llamaUpdate": self.builds.status_slim(),
                 # Cells crashing soon after a fresh llama.cpp build (2.6+):
@@ -146,6 +147,7 @@ class Report:
             "llamaSuspect": state["llamaSuspect"],
             "telemetry": state["telemetry"],
             "scoutVersion": state["scoutVersion"],
+            "prismRuntime": state["prismRuntime"],
             "autostart": state["autostart"],
             "agentUrl": f"http://{state['host']['ip']}:{self.config.get('listenPort')}",
             "time": state["time"],

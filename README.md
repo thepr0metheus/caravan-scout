@@ -266,3 +266,5 @@ handed over its fleet token, every endpoint except the scout's page,
 scout, which only its controller can do. A pairing with a new token passes
 only when the same controller accepts that token. Command cells execute
 controller-supplied shell — do not expose the port beyond your LAN.
+
+Bonsai GGUF models use the [PrismML runner](docs/prismml.md).

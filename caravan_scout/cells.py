@@ -14,6 +14,7 @@ from typing import Any, Callable
 
 from caravan_scout.models import ModelFetcher
 from caravan_scout.process import CellProcess, HostProcesses
+from caravan_scout.prism import PrismRuntime
 from caravan_scout.starts import CellStart
 from caravan_scout.watchdog import Watchdog
 
@@ -208,6 +209,7 @@ class Cells:
         self.probe = ServerProbe()
         self.records = CellRecords(state)
         self.processes = HostProcesses()
+        self.prism = PrismRuntime(config)
         # The model files are the cells': downloads report into a cell's
         # startup record, and a purge keeps what a running cell holds.
         self.models = ModelFetcher(config, self.report)
@@ -521,4 +523,3 @@ class Cells:
         live server isn't broken: which files those are is the cells' to say,
         the fetcher only deletes."""
         return self.models.purge(keep=self.held_files())
-

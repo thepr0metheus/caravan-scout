@@ -1794,14 +1794,16 @@ def test_worker_refuses_without_args():
     port = 22104
     s = worker_scout()
     r = worker(s, port, {"MODEL_FILE": MODEL, "PORT": port}, args=None)
-    check(err_is(r.err, 400, "controller sent no args for this llama cell — it is older than this agent "
-                             "(needs lama-caravan v1.3.115+)"),
-          "без аргументов от контроллера — отказ 400, а не командная строка, собранная заново")
+    check(r.err is None and s.cells.startup(port).get("error") ==
+          "controller sent no args for this llama cell — it is older than this agent (needs lama-caravan v1.3.115+)",
+          "без аргументов контроллера — причина отказа доходит до доски")
     check(r.popen.calls == [] and disk_cells(s) == {}, "negative: процесс без аргументов контроллера не запускается")
-    check(s.cells.startup(port).get("phase") == "loading",
-          "as-is: ДЕФЕКТ — отказ вылетает из потока воркера: фаза навсегда «loading», причина до доски не доходит")
-    r = worker(worker_scout(), 22107, {"MODEL_FILE": MODEL, "PORT": 22107}, args=[])
-    check(isinstance(r.err, AppError) and r.popen.calls == [], "boundary: пустой список аргументов — тот же отказ")
+    check(s.cells.startup(port).get("phase") == "error",
+          "отказ не оставляет ячейку навсегда в loading")
+    empty = worker_scout()
+    r = worker(empty, 22107, {"MODEL_FILE": MODEL, "PORT": 22107}, args=[])
+    check(r.err is None and empty.cells.startup(22107).get("phase") == "error" and r.popen.calls == [],
+          "boundary: пустой список аргументов — тот же отказ")
 
     port = 22108
     s = worker_scout()

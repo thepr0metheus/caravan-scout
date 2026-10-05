@@ -210,8 +210,11 @@ class LlamaStart(CellStart):
     """
 
     def run(self) -> dict[str, Any]:
+        runner = str(self.config.get("RUNNER") or "").strip().lower() or "llama-server"
+        if runner not in ("llama-server", "prism"):
+            raise AppError(f"unknown native runner: {runner}", 400)
         bin_path = str(self.cells.config.get("llamaServerBin") or "").strip()
-        if not bin_path:
+        if not bin_path and runner == "llama-server":
             raise AppError("llamaServerBin not configured in config.json — run install.sh first", 400)
 
         # Full admin form config (all llama.cpp flags). Falls back to a minimal
@@ -279,6 +282,7 @@ class LlamaLaunch:
         self.spec = spec
         self.cache_models = cache_models
         self.args = args
+        self.runner = str(config.get("RUNNER") or "").strip().lower() or "llama-server"
 
     @staticmethod
     def resolve_paths(args: list[str], model_abs: str, mmproj_abs: str,
@@ -296,12 +300,23 @@ class LlamaLaunch:
         cache_models, incoming_args = self.cache_models, self.args
         cells, models = self.cells, self.cells.models
         cell = cells.at(port)
+        def runtime_progress(downloaded, total, filename):
+            if cells.holds(port, cell):
+                cells.report(port, phase="downloading", downloadedBytes=downloaded,
+                             totalBytes=total, downloadingFile=filename)
         try:
+            if self.runner == "prism":
+                bin_path = cells.prism.ensure(progress=runtime_progress)
+                self.env = {**self.env, **cells.prism.environment(bin_path)}
+                cells.prism.validate_args(bin_path, incoming_args or [])
+                if not cells.holds(port, cell):
+                    return
             mp, mmproj_abs, spec_abs = models.download_all(
                 self.model, self.mmproj, self.spec, use_cache=cache_models, port=port,
                 hints=self.hints)
         except Exception as exc:
-            cells.report(port, phase="error", error=str(exc))
+            if cells.holds(port, cell):
+                cells.report(port, phase="error", error=str(exc))
             return
 
         def build_args() -> list[str]:
@@ -329,7 +344,11 @@ class LlamaLaunch:
         except ValueError:
             gpu_layers = 999
         ctx_size = int(config.get("CTX_SIZE") or 4096)
-        args = build_args()
+        try:
+            args = build_args()
+        except Exception as exc:
+            cells.report(port, phase="error", error=str(exc))
+            return
         # Per PORT, not one file for the whole host. Every llama cell used to
         # write to llama-server.log and each new start renamed it away, while a
         # running cell's fd followed the old inode — so a crashed cell's card
@@ -345,6 +364,8 @@ class LlamaLaunch:
         cfg = {"modelPath": str(mp), "mmprojPath": mmproj_abs, "specPath": spec_abs,
                "specType": _spec_type_raw, "port": port,
                "gpuLayers": gpu_layers, "ctxSize": ctx_size}
+        if self.runner == "prism":
+            cfg["runner"] = self.runner
         artifacts = CellArtifacts(cells.config)
         cfg["artifact"] = artifacts.write(port, bin_path, args, config, cfg, env=self.env)
         # A Stop that arrived while we were downloading has already dropped the
@@ -398,6 +419,8 @@ class LlamaLaunch:
                 cfg = {"modelPath": str(mp), "mmprojPath": mmproj_abs, "specPath": spec_abs,
                        "specType": _spec_type_raw, "port": port,
                        "gpuLayers": gpu_layers, "ctxSize": ctx_size}
+                if self.runner == "prism":
+                    cfg["runner"] = self.runner
                 cfg["artifact"] = artifacts.write(port, bin_path, args, config, cfg, env=self.env)
                 result = cell.process.start(bin_path, args, cfg, log_path=log_path, extra_env=self.env)
 

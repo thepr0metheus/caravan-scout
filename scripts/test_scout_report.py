@@ -254,7 +254,7 @@ def test_public_state():
     with _stub_probes(fresh):
         check(fresh.report.public().get("heartbeat") == {"state": "pending"},
               "negative: до первого пульса — «pending», а не пусто")
-    check(sorted(state) == sorted(["service", "scoutVersion", "llamaBinaryVersion", "llamaBinaryMtime", "llamaUpdate",
+    check(sorted(state) == sorted(["service", "scoutVersion", "prismRuntime", "llamaBinaryVersion", "llamaBinaryMtime", "llamaUpdate",
                                    "llamaSuspect", "telemetry", "host", "controllerUrl", "gpus", "computeApps",
                                    "engines", "cpu", "platform", "driver", "heartbeat", "llamaNode", "llamaNodes",
                                    "autostart", "time"]),
@@ -286,7 +286,7 @@ def test_heartbeat_payload():
             payload = scout.report.heartbeat()
         except Exception as exc:  # noqa: BLE001 — a crash is a red pin, not a stopped run
             payload = {"__raised__": repr(exc), "agentUrl": None}
-    check(sorted(payload) == sorted(["host", "gpus", "computeApps", "engines", "cpu", "platform", "driver", "llamaNode",
+    check(sorted(payload) == sorted(["prismRuntime", "host", "gpus", "computeApps", "engines", "cpu", "platform", "driver", "llamaNode",
                                      "llamaNodes", "llamaBinaryVersion", "llamaBinaryMtime", "llamaUpdate",
                                      "llamaSuspect", "telemetry", "scoutVersion", "autostart", "agentUrl", "time"]),
           "ровно эти поля — только машина")

@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.23.0 — 2026-10-02
+
+Add an isolated PrismML runtime for Bonsai cells: pinned official archives with SHA-256 verification, on-demand installation, platform/CUDA selection, option validation, progress reporting and restart/adoption through the normal cell lifecycle. Report the runtime separately from stock llama.cpp.
+
 ## 2.22.0 — 2026-09-30
 
 - **The scout describes itself: `GET /openapi.json`.** OpenAPI 3.1, open like
