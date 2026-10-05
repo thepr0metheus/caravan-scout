@@ -1,5 +1,25 @@
 # Changelog
 
+## 2.23.3 — 2026-10-05
+
+- **The snapshots pass on Linux again.** They were green on a Mac and red on
+  every Linux runner, so the GitHub CI failed on each release since 2.19:
+  - A snapshot's scout read the machine's own NVIDIA driver facts: `/boot`,
+    `/proc` and `modinfo` about the next kernel. The harness refused the
+    `modinfo` call, and four files stopped there. A snapshot's machine now has
+    no NVIDIA driver anywhere; the driver's own pins point those paths at their
+    own files, as before.
+  - The quiet-health adoption pin left "whose listener is it" to the host: a Mac
+    answered "cannot tell" and Linux "not ours". It now says "ours", like the
+    other adoption pins.
+  - The engines-loop pin stopped the loop with a `StopIteration` thrown through
+    a generator, which Python 3.9 turns into a `RuntimeError`. It stops on an
+    exception of its own now.
+- Checked in a Linux container (Python 3.12 and 3.14, with a kernel file in
+  `/boot` like a GitHub runner) and on macOS (3.9 and 3.13). Taking any of the
+  three fixes away turns its pins red again.
+- The scout itself is unchanged: only the tests and the version.
+
 ## 2.23.2 — 2026-10-02
 
 Recover PrismML/llama.cpp token speeds from cumulative token and compute-time

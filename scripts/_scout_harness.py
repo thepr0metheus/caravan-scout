@@ -255,3 +255,18 @@ class Served:
 from caravan_scout.process import MemoryScope  # noqa: E402
 
 MemoryScope._usable = False
+
+# The NVIDIA driver facts (2.19) read /boot, /proc and the library folders and
+# ask modinfo about the next kernel — doors to the host that only Linux opens:
+# a Mac leaves at "not Linux", so the snapshots were green there and red on
+# every Linux runner (modinfo refused) from 2.19 on. A snapshot's machine has
+# no NVIDIA driver anywhere; a pin about the driver points these at its own
+# files (test_scout_driver.py patches them and gets these back afterwards).
+from caravan_scout.driver import DriverFacts  # noqa: E402
+
+DriverFacts.BOOT = TMP / "no-boot"
+DriverFacts.PROC_VERSION = TMP / "no-nvidia-version"
+DriverFacts.LIB_DIRS = (TMP / "no-nvidia-lib",)
+DriverFacts.DKMS_KEY = TMP / "no-mok.der"
+DriverFacts.EFI_DIR = TMP / "no-efi"
+DriverFacts.SECURE_BOOT_VAR = TMP / "no-efi" / "SecureBoot"

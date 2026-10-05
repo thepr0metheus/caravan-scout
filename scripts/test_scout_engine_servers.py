@@ -54,6 +54,18 @@ def executable(path):
     return path
 
 
+class LoopStop(BaseException):
+    """Ends the engines' loop from its sleep. A class of its own: the
+    StopIteration this pin used to throw through a generator is a RuntimeError
+    on Python 3.9 (PEP 479), the macOS scout's Python, so the pin was red there.
+    A BaseException, so the loop's `except Exception` could never swallow it
+    and spin forever."""
+
+
+def stop_loop(*_):
+    raise LoopStop()
+
+
 class Cli:
     """LM Studio's command line, stood in for: answers by the command's
     first two words, records every command and how long it may take."""
@@ -577,8 +589,8 @@ def test_boot():
     engines, machine, queued, clock = rig(False, Procs(), state=State(), boot="b1")
     with patched(engines, start_at_boot=lambda: runs.append("boot") or []), patched(engines, refresh=lambda: runs.append("scan")):
         try:
-            engines.run(sleep=lambda s: (_ for _ in ()).throw(StopIteration()) if runs.count("scan") >= 2 else None)
-        except StopIteration:
+            engines.run(sleep=lambda s: stop_loop() if runs.count("scan") >= 2 else None)
+        except LoopStop:
             pass
     same(runs, ["scan", "boot", "scan"], "цикл: подъём при загрузке — один раз, после первого скана (когда известно, что работает)")
 

@@ -1123,7 +1123,10 @@ def test_adopt_quiet_health():
     run = FakeRun({("ps", "-p", "4646"): (0, ""), ("ss", "-ltnpH"): (0, ss_line(port, 6161))})
     web = FakeUrlopen({"http://127.0.0.1:": URLError_("timed out")})
     rig = Rig(run=run, web=web, kill=FakeKill(alive={6161}))
-    with rig:
+    # Whose listener it is, said here like the other adoption pins: left to the
+    # host, a Mac answered "cannot tell" (no ps entry) and Linux "not ours"
+    # (no /proc/6161), and the same pin was green on one and red on the other.
+    with rig, patched(s.cells.processes, owned=lambda pid: True):
         s.cells.adopt_survivors()
         slot = s.cells.by_port.get(port)
         st = slot.process.status() if slot else {}
