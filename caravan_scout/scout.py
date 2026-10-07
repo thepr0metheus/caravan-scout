@@ -11,7 +11,9 @@ from caravan_scout.engine_servers import EngineProcs, EngineServers
 from caravan_scout.engines import ForeignEngines
 from caravan_scout.heartbeat import Heartbeat
 from caravan_scout.identity import HostIdentity
+from caravan_scout.job import BackgroundJob
 from caravan_scout.driver import DriverFacts
+from caravan_scout.driver_packages import DriverPackages
 from caravan_scout.machine import Machine
 from caravan_scout.report import Report
 from caravan_scout.saved_configs import SavedConfigs
@@ -61,6 +63,11 @@ class Scout:
         # What decides whether the NVIDIA card comes back after a reboot
         # (2.19): the controller warns before the reboot, not after it.
         self.driver = DriverFacts(Machine.run_text)
+        # Its packages as apt sees them, and installing one (2.24): the
+        # controller's driver panel asks the machine's scout, never its own
+        # machine — a controller in a container has none.
+        self.driver_packages = DriverPackages(self.driver.secure_boot)
+        self.driver_install = BackgroundJob("driver-install", "a driver install is already running")
         self.report = Report(self.config, self.state, self.machine, self.cells, self.builds, self.autostart,
                              self.suspect, self.telemetry, identity=self.identity, engines=self.engines,
                              driver=self.driver)

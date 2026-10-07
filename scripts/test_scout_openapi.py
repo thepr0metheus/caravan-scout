@@ -53,6 +53,7 @@ BODIES = {
     "/api/llama-node/stop": ["port"],
     "/api/llama-node/update": ["tag", "restoreId"],
     "/api/vllm/update": ["version"],
+    "/api/host/driver/install": ["package"],
     "/api/llama-node/restore": ["id", "restoreId"],
     "/api/llama-node/configs/delete": ["filename"],
     "/api/engines/unload": ["kind", "port", "model"],
@@ -107,7 +108,7 @@ def test_the_document():
     check(doc["components"]["securitySchemes"]["fleetToken"]
           == {"type": "apiKey", "in": "header", "name": "X-Caravan-Token", "description": ApiSpec.SECURITY},
           "вход: токен флота в заголовке X-Caravan-Token, и сказано, когда скаут открыт без него")
-    check(len(ops) == len(api.routes) == 34, f"операций столько же, сколько строк в таблице путей — 34 (got {len(ops)})")
+    check(len(ops) == len(api.routes) == 39, f"операций столько же, сколько строк в таблице путей — 39 (got {len(ops)})")
     check(list(doc["paths"]) == sorted(doc["paths"]), "пути в документе по алфавиту — он не зависит от порядка строк таблицы")
     ids = [op["operationId"] for _m, _p, op in ops]
     check(len(set(ids)) == len(ids) and "getApiLlamaNodeStatus" in ids and "postApiHeartbeat" in ids

@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.24.0 — 2026-10-07
+
+- **The machine's hands for its controller.** A controller in a container cannot
+  reach the machine it runs on, so it asks that machine's scout for what it
+  used to read and do there itself:
+  - `GET /api/host/driver` — the NVIDIA driver packages as apt sees them: the
+    version in the kernel and the installed ones, the candidates, Secure Boot,
+    the signed modules for the running kernel, the OS's own reboot request.
+    The controller's driver panel decides from these.
+  - `POST /api/host/driver/install` and `GET /api/host/driver/install-status` —
+    a driver package installed as a background job. Only `nvidia-driver-<N>`
+    and `-open` names that apt offers; under Secure Boot together with their
+    signed modules, the DKMS build moved out of their way. Needs passwordless
+    sudo for apt-get.
+  - `GET /api/host/processes` — the busiest processes by CPU.
+  - `GET /api/monitor/btop` — a btop frame and top's table for the monitor drawer.
+
 ## 2.23.3 — 2026-10-05
 
 - **The snapshots pass on Linux again.** They were green on a Mac and red on

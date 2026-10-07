@@ -146,6 +146,25 @@ class Api:
                   "Every server cell of this machine with its state", "`{ok, nodes: [...]}`.", tag="cells"),
             Route("GET", "/api/monitor/nvidia-smi", lambda: s.machine.nvidia_smi(),
                   "A raw nvidia-smi snapshot for the controller's monitor drawer", tag="machine"),
+            Route("GET", "/api/monitor/btop", lambda: s.machine.btop_snapshot(),
+                  "A btop frame and top's table, for the controller's monitor drawer",
+                  "(2.24+) `{kind, ok, frame, top, source, time}`: `frame` is what btop drew, terminal escapes and "
+                  "all (the controller renders it); `top` is `top -b`'s table, for when btop could not draw.",
+                  tag="machine"),
+            Route("GET", "/api/host/processes", lambda: s.machine.top_processes(),
+                  "The busiest processes on this machine, by CPU",
+                  "(2.24+) `{ok, processes: [{pid, name, user, cpuPct, memPct, rssMiB}], time}`, seven at most. "
+                  "`processes` is null when ps will not say — not an empty machine.", tag="machine"),
+            Route("GET", "/api/host/driver", lambda: s.driver_packages.facts(),
+                  "The NVIDIA driver packages: running, installed, available, Secure Boot",
+                  "(2.24+) What the controller's driver panel decides from, read when asked: `{ok, running, "
+                  "runningError, installed: [{package, version}], available: [{package, version}], secureBoot, "
+                  "moduleLoaded, signedModules, signedModulesInstalled, rebootPending, rebootPendingPackages, "
+                  "kernel, checkedAt}`. `running` is the version in the kernel (nvidia-smi) and `installed` the "
+                  "packages (dpkg), newest first: right after an install they differ until a reboot, and "
+                  "`runningError` says why there is no running number.", tag="machine"),
+            Route("GET", "/api/host/driver/install-status", lambda: s.driver_install.status(),
+                  "The driver install job: running, result, last 200 lines", "(2.24+)", tag="machine"),
             # What is listening on this box, so the controller's port picker
             # stops offering numbers something else already owns. The
             # controller can only see its OWN host; a client squatter was
@@ -236,6 +255,14 @@ class Api:
                   "port, autostart: [ports]}`; 400 for a bad port or an on without a request.", tag="cells",
                   body=("port", "enabled", "payload")),
             Route("POST", "/api/host/reboot", lambda body: power.issue("reboot"), "Reboot this machine", self.POWER, tag="machine"),
+            Route("POST", "/api/host/driver/install",
+                  lambda body: (s.driver_packages.install(body().get("package"), s.driver_install), 200),
+                  "Install an NVIDIA driver package",
+                  "(2.24+) `{package}` — `nvidia-driver-<N>` or `-open`, and one apt offers: 400 for another "
+                  "shape, 404 for a package apt does not have. Under Secure Boot the install carries the signed "
+                  "modules for the running kernel and removes the DKMS build in their way. `sudo -n apt-get`, so "
+                  "it needs passwordless sudo for it. One background job: 409 while it runs. The controller "
+                  "decides what to install and when.", tag="machine", body=("package",)),
             Route("POST", "/api/host/poweroff", lambda body: power.issue("poweroff"),
                   "Power this machine off — nothing on the board can switch it back on", self.POWER, tag="machine"),
             Route("POST", "/api/llama-node/stop", lambda body: (s.cells.stop(body().get("port")), 200),

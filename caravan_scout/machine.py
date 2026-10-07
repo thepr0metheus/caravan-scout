@@ -291,6 +291,57 @@ class Machine:
             "time": int(time.time()),
         }
 
+    def top_processes(self) -> dict[str, Any]:
+        """The busiest processes by CPU, for the controller's monitor (2.24).
+
+        The controller read its own machine's with ps; a controller in a
+        container sees only its own processes, so it asks the machine's
+        scout. `processes` is None when ps will not say — not "no processes".
+        """
+        rows: list[dict[str, Any]] | None = None
+        for sort in (["--sort=-%cpu"], ["-r"]):       # Linux; macOS ps has no --sort
+            try:
+                res = subprocess.run(["ps", "-eo", "pid,comm,user,%cpu,%mem,rss", *sort],
+                                     text=True, capture_output=True, timeout=3)
+            except Exception:
+                continue
+            if res.returncode == 0:
+                rows = []
+                for line in (res.stdout or "").splitlines()[1:8]:
+                    parts = line.split(None, 5)
+                    try:
+                        rows.append({"pid": int(parts[0]), "name": parts[1], "user": parts[2],
+                                     "cpuPct": float(parts[3]), "memPct": float(parts[4]),
+                                     "rssMiB": round(int(parts[5]) / 1024, 1)})
+                    except (IndexError, ValueError):
+                        continue
+                break
+        return {"ok": rows is not None, "processes": rows, "time": int(time.time())}
+
+    def btop_snapshot(self) -> dict[str, Any]:
+        """One btop frame as the terminal drew it, and top's table beside it (2.24).
+
+        The controller renders the frame (its terminal.py) and falls back to
+        top's table when btop could not draw — no btop, no terminal size. Both
+        are asked here, once: the snapshot is taken on a hover, not a schedule.
+        """
+        draw = "stty cols 120 rows 40; TERM=xterm-256color btop -p 0 -u 1000 --utf-force"
+        frame = top = ""
+        try:
+            res = subprocess.run(["timeout", "-k", "1s", "2s", "script", "-q", "-c", draw, "/dev/null"],
+                                 text=True, capture_output=True, timeout=6)
+            frame = (res.stdout or "") + (res.stderr or "")
+        except Exception:
+            frame = ""
+        try:
+            res = subprocess.run(["bash", "-lc", "COLUMNS=150 top -b -n 1 -w 150 | head -45"],
+                                 text=True, capture_output=True, timeout=5)
+            top = (res.stdout if res.returncode == 0 else (res.stderr or res.stdout)).strip()
+        except Exception:
+            top = ""
+        return {"kind": "btop", "ok": bool(frame or top), "frame": frame, "top": top,
+                "source": self.name(), "time": int(time.time())}
+
     # ── the probes themselves: one question to the OS each ──────────────────
 
     @classmethod
