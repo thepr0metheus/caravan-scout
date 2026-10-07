@@ -76,6 +76,9 @@ class Report:
                 },
                 "controllerUrl": self.config.get("controllerUrl"),
                 "gpus": gpus,
+                # Why nvidia-smi named no card, in its words (2.25): "" when it
+                # named them or is not installed.
+                "gpuError": self.machine.gpu_error(),
                 "computeApps": compute_apps,
                 # Model engines on this machine that are not its cells (2.12):
                 # None before the first scan, [] when none were found.
@@ -131,6 +134,7 @@ class Report:
         return {
             "host": state["host"],
             "gpus": state.get("gpus", []),
+            "gpuError": state.get("gpuError", ""),
             "computeApps": state.get("computeApps", []),
             "engines": state["engines"],
             "cpu": state.get("cpu", {}),

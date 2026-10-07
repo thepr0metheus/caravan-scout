@@ -216,11 +216,12 @@ def test_private_files():
           "boundary: читает только группа (0640) — тоже сужается: секрет не для группы")
 
 @contextlib.contextmanager
-def _stub_probes(scout, gpus=None, nodes=None):
+def _stub_probes(scout, gpus=None, nodes=None, gpu_error=""):
     """The report's inputs, faked: every probe the report makes of the host."""
     with patched(
         scout.machine,
         gpus=lambda: gpus if gpus is not None else [{"index": "0", "name": "RTX"}],
+        gpu_error=lambda: gpu_error,
         compute_apps=lambda: [{"gpuUuid": "u0", "pid": 11, "usedMiB": 900}],
         address=lambda: "10.0.0.5",
         cpu_ram=lambda: {"loadPct": 3.0},
@@ -255,9 +256,9 @@ def test_public_state():
         check(fresh.report.public().get("heartbeat") == {"state": "pending"},
               "negative: до первого пульса — «pending», а не пусто")
     check(sorted(state) == sorted(["service", "scoutVersion", "prismRuntime", "llamaBinaryVersion", "llamaBinaryMtime", "llamaUpdate",
-                                   "llamaSuspect", "telemetry", "host", "controllerUrl", "gpus", "computeApps",
-                                   "engines", "cpu", "platform", "driver", "heartbeat", "llamaNode", "llamaNodes",
-                                   "autostart", "time"]),
+                                   "llamaSuspect", "telemetry", "host", "controllerUrl", "gpus", "gpuError",
+                                   "computeApps", "engines", "cpu", "platform", "driver", "heartbeat", "llamaNode",
+                                   "llamaNodes", "autostart", "time"]),
           "ровно эти поля — только машина: ни агентов, ни найденных VM, ни назначений")
     check(state.get("engines", "absent") is None,
           "negative: движки ещё не искали — None («не смотрели»), а не [] («смотрели, нет») (2.12)")
@@ -286,7 +287,8 @@ def test_heartbeat_payload():
             payload = scout.report.heartbeat()
         except Exception as exc:  # noqa: BLE001 — a crash is a red pin, not a stopped run
             payload = {"__raised__": repr(exc), "agentUrl": None}
-    check(sorted(payload) == sorted(["prismRuntime", "host", "gpus", "computeApps", "engines", "cpu", "platform", "driver", "llamaNode",
+    check(sorted(payload) == sorted(["prismRuntime", "host", "gpus", "gpuError", "computeApps", "engines", "cpu", "platform",
+                                     "driver", "llamaNode",
                                      "llamaNodes", "llamaBinaryVersion", "llamaBinaryMtime", "llamaUpdate",
                                      "llamaSuspect", "telemetry", "scoutVersion", "autostart", "agentUrl", "time"]),
           "ровно эти поля — только машина")
@@ -300,6 +302,13 @@ def test_heartbeat_payload():
           "и «сборка идёт» мигало на доске")
     check(payload.get("scoutVersion") == __version__ and "version" not in payload,
           "скаут называет свою версию одним именем, scoutVersion — тем же, что в /api/state")
+    reason = "Failed to initialize NVML: Driver/library version mismatch"
+    with _stub_probes(scout, gpus=[], gpu_error=reason), \
+            patched(socket, gethostname=lambda: "box-a.lan"), patched(time, time=lambda: 1_700_000_000):
+        both = (scout.report.public().get("gpuError"), scout.report.heartbeat().get("gpuError"))
+    check(both == (reason, reason),
+          f"почему карт нет (2.25) — в обоих отчётах одним именем, словами nvidia-smi (получено {both})")
+    check(payload.get("gpuError") == "", "negative: карты названы — причины нет, пустая строка")
 
 
 def test_heartbeat_once():

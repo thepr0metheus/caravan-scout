@@ -36,6 +36,7 @@ class Machine:
     def __init__(self, config):
         self.config = config
         self._gpus: list[dict[str, Any]] = []
+        self._gpu_error = ""
         self._gpus_at = 0.0
         self._apps: list[dict[str, Any]] = []
         self._apps_at = 0.0
@@ -51,9 +52,17 @@ class Machine:
         now = time.time()
         if self._gpus_at and now - self._gpus_at < self.GPUS_TTL:
             return self._gpus
-        self._gpus = self.gpu_inventory()
+        self._gpus, self._gpu_error = self.gpu_reading()
         self._gpus_at = now
         return self._gpus
+
+    def gpu_error(self) -> str:
+        """Why nvidia-smi named no card at the last look, in its own words —
+        "Driver/library version mismatch" between a driver update and the
+        reboot; "" when it named them, or is not installed here. Read with
+        the inventory and kept as long."""
+        self.gpus()
+        return self._gpu_error
 
     def compute_apps(self) -> list[dict[str, Any]]:
         """Per-process GPU memory (pid -> gpu), refreshed at most every 5 s."""
@@ -346,26 +355,52 @@ class Machine:
 
     @classmethod
     def gpu_inventory(cls) -> list[dict[str, Any]]:
-        """Preferred path: live stats via nvidia-smi. Fallback: lspci detection so a
-        card with a missing driver is still reported (driverStatus=driver_missing)."""
-        gpus = cls.nvidia_gpus()
-        if gpus:
-            return gpus
-        return cls.lspci_gpus()
+        """The cards alone — see gpu_reading."""
+        return cls.gpu_reading()[0]
 
-    @staticmethod
-    def nvidia_gpus() -> list[dict[str, Any]]:
+    @classmethod
+    def gpu_reading(cls) -> tuple[list[dict[str, Any]], str]:
+        """(the cards, why nvidia-smi named none). Preferred path: live stats
+        via nvidia-smi. Fallback: lspci detection so a card with a missing
+        driver is still reported (driverStatus=driver_missing).
+
+        nvidia-smi's complaint is kept beside the fallback: "driver missing" is
+        all lspci can say, while the driver may be installed and waiting for a
+        reboot. The controller read it on its own machine and nowhere else;
+        now every scout says it (2.25).
+        """
+        gpus, error = cls.nvidia_reading()
+        if gpus:
+            return gpus, ""
+        return cls.lspci_gpus(), error
+
+    @classmethod
+    def nvidia_gpus(cls) -> list[dict[str, Any]]:
         """Live NVIDIA GPU stats via nvidia-smi (driver required).
 
-        Field names are a CONTRACT with the controller's own gpu_state(), so one card
-        renderer draws local and client GPUs alike. The board reads exactly these:
+        Field names are a CONTRACT with the controller, whose one card renderer
+        draws every machine's cards — its own machine's too, from this list
+        (controller 1.3.440). The board reads exactly these:
         index, name, memoryUsedMiB, memoryTotalMiB, utilizationGpuPct, temperatureC,
         powerDrawW (see nodeGpuRowHtml in the controller's topology-nodes.js).
         Rename one here and that value silently turns into "?" on the client's card —
-        no error anywhere, which is how this kind of drift survives. The controller
-        reports a superset (clocks, PCIe); the names above are the shared floor.
+        no error anywhere, which is how this kind of drift survives.
 
         Returns [] when nvidia-smi is missing or fails (no driver, macOS/Metal host).
+        """
+        return cls.nvidia_reading()[0]
+
+    @staticmethod
+    def nvidia_reading() -> tuple[list[dict[str, Any]], str]:
+        """(the cards nvidia-smi names, its complaint when it names none).
+
+        The complaint is the first line it wrote, in either stream: NVML's goes
+        to stdout, where the cards would be — and with exit code 0 at times:
+        "Failed to initialize NVML: Driver/library version mismatch" after a
+        driver update, before the reboot. A card line is comma-separated, so
+        with code 0 the first line without a comma is the complaint. No
+        nvidia-smi at all is no complaint — a host without the driver, where
+        lspci decides.
         """
         try:
             result = subprocess.run(
@@ -379,10 +414,17 @@ class Machine:
                 capture_output=True,
                 timeout=5,
             )
-        except Exception:
-            return []
+        except FileNotFoundError:
+            return [], ""
+        except subprocess.TimeoutExpired:
+            # Its own words would spend the 200 characters on the command line.
+            return [], "nvidia-smi did not answer in 5 s"
+        except Exception as exc:  # noqa: BLE001 — a failure to start is an answer too
+            return [], f"nvidia-smi: {exc}"[:200]
         if result.returncode != 0:
-            return []
+            said = next((line.strip() for line in f"{result.stdout or ''}\n{result.stderr or ''}".splitlines()
+                         if line.strip()), "")
+            return [], (said or f"nvidia-smi exited with {result.returncode}")[:200]
         gpus: list[dict[str, Any]] = []
         for line in result.stdout.splitlines():
             parts = [part.strip() for part in line.split(",")]
@@ -401,7 +443,11 @@ class Machine:
                 "powerDrawW": parts[7],
                 "uuid": parts[8] if len(parts) > 8 else "",
             })
-        return gpus
+        if gpus:
+            return gpus, ""
+        said = next((line.strip() for line in f"{result.stdout or ''}\n{result.stderr or ''}".splitlines()
+                     if line.strip() and "," not in line), "")
+        return [], said[:200]
 
     #: What nvidia-smi answers "who is on the card" with, in this order: the
     #: card, the process, its name (2.12) and the memory it holds.

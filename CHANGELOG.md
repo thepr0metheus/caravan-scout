@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.25.0 — 2026-10-07
+
+- **Why there are no cards, in nvidia-smi's words.** When nvidia-smi names no
+  card, the scout lists the cards lspci sees as "driver missing" — all lspci
+  can say, while the driver may be installed and waiting for a reboot
+  ("Driver/library version mismatch"). Both reports now carry `gpuError`:
+  the first line nvidia-smi wrote instead of the cards (at times with exit
+  code 0), "nvidia-smi did not answer in 5 s" for a hung driver, or "" when
+  it named the cards or is not installed. The
+  controller read this on its own machine only; it now takes it from every
+  scout, its own machine's included.
+
 ## 2.24.0 — 2026-10-07
 
 - **The machine's hands for its controller.** A controller in a container cannot

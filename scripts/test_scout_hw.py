@@ -416,6 +416,41 @@ def test_gpu_inventory():
          "negative: Mac без nvidia-smi — пусто, lspci не спрашивается")
 
 
+
+def test_gpu_reading():
+    CHECKS.section("почему nvidia-smi не назвал карт (2.25):")
+    mismatch = "Failed to initialize NVML: Driver/library version mismatch\nNVML library version: 610.57"
+    cases = (
+        ("драйвер работает", (0, SMI_TWO_CARDS), ([CARD_A, CARD_B], "")),
+        ("драйвер сломан", (9, SMI_BROKEN), (LSPCI_CARDS, SMI_BROKEN)),
+        ("драйвер обновлён, машина не перезагружена", (18, mismatch),
+         (LSPCI_CARDS, "Failed to initialize NVML: Driver/library version mismatch")),
+        ("код не 0 и ни слова", (6, ""), (LSPCI_CARDS, "nvidia-smi exited with 6")),
+        ("nvidia-smi нет", FileNotFoundError(2, "No such file or directory"), (LSPCI_CARDS, "")),
+        ("код 0 и пусто", (0, ""), (LSPCI_CARDS, "")),
+        ("код 0, а на месте карт — жалоба NVML", (0, mismatch),
+         (LSPCI_CARDS, "Failed to initialize NVML: Driver/library version mismatch")),
+        ("код 0 и обрывок строки карты", (0, "0, NVIDIA GeForce RTX 3090, 24576\n"), (LSPCI_CARDS, "")),
+    )
+    for name, answer, want in cases:
+        with patched(subprocess, run=KwRun({("nvidia-smi",): answer, ("lspci",): (0, LSPCI)})), \
+                patched(sys, platform="linux"):
+            same(outcome(Machine.gpu_reading), want, f"{name}: карты и причина {want[1]!r}")
+    with patched(subprocess, run=KwRun({("nvidia-smi",): subprocess.TimeoutExpired(GPU_QUERY, 5),
+                                        ("lspci",): (0, LSPCI)})), patched(sys, platform="linux"):
+        got = outcome(Machine.gpu_reading)
+    same(got, (LSPCI_CARDS, "nvidia-smi did not answer in 5 s"),
+         "таймаут — короткая причина: своими словами nvidia-smi потратил бы 200 знаков на командную строку")
+    with patched(subprocess, run=KwRun({("nvidia-smi",): PermissionError(13, "Permission denied"),
+                                        ("lspci",): (0, LSPCI)})), patched(sys, platform="linux"):
+        got = outcome(Machine.gpu_reading)
+    same(got, (LSPCI_CARDS, "nvidia-smi: [Errno 13] Permission denied"), "не запустился — причина со словами ОС")
+    with patched(subprocess, run=KwRun({("nvidia-smi",): (9, "x" * 500), ("lspci",): (0, "")})), \
+            patched(sys, platform="linux"):
+        got = outcome(Machine.gpu_reading)
+    same(got, ([], "x" * 200), "boundary: причина обрезана до 200 знаков; карт нет и в lspci — пусто")
+
+
 # ── Machine: ufw ─────────────────────────────────────────────────────────────
 
 def test_ufw_access():
@@ -579,6 +614,21 @@ def test_gpus_cache():
         again = outcome(scout.machine.gpus)
     same((first, again, len(run.calls)), ([], [], 2),
          "negative: пустой ответ тоже кэшируется — хост без карт не гоняет nvidia-smi и lspci на каждый запрос")
+
+    clock = FakeClock()
+    run = KwRun({("nvidia-smi",): (9, SMI_BROKEN), ("lspci",): (0, LSPCI)})
+    scout = make_scout()
+    with patched(time, time=clock.time), patched(subprocess, run=run), patched(sys, platform="linux"):
+        reason = outcome(scout.machine.gpu_error)
+        clock.now = T0 + 5
+        again = outcome(scout.machine.gpu_error)
+        calls_cached = len(run.calls)
+        run.table[("nvidia-smi",)] = (0, SMI_TWO_CARDS)  # rebooted: the driver answers now
+        clock.now = T0 + 10
+        fresh = outcome(scout.machine.gpu_error)
+    same((reason, again, calls_cached), (SMI_BROKEN, SMI_BROKEN, 2),
+         "причина читается вместе с картами и живёт столько же: nvidia-smi и lspci — по разу")
+    same(fresh, "", "через 10 с драйвер ответил — причины больше нет")
 
 
 def test_compute_apps_cache():
@@ -754,7 +804,7 @@ def test_nvidia_smi():
          "а не displayName (2.10)")
 
 
-TESTS = (test_nvidia_gpus, test_nvidia_apps, test_lspci_fallback, test_gpu_inventory,
+TESTS = (test_nvidia_gpus, test_nvidia_apps, test_lspci_fallback, test_gpu_inventory, test_gpu_reading,
          test_ufw_access, test_cpu_ram, test_run_text,
          test_gpus_cache, test_compute_apps_cache,
          test_firewall_cache, test_listeners, test_nvidia_smi)
