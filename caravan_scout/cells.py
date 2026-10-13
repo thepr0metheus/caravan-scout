@@ -35,12 +35,17 @@ class Cell:
         self.cache_models = False
         # Crashes since it was last started by hand (Watchdog); None = none.
         self.crash: dict[str, Any] | None = None
+        # What its model is called at the machine's entry (2.27, entry.ModelName), from the start
+        # that made it — said from the start's first moment, so a model being loaded is found by its
+        # name as "starting"; "" for a cell no start of this scout made (its record keeps the name).
+        self.name = ""
 
 
 class ServerProbe:
     """What a cell's server says about itself over HTTP, per port: token rates
     and its queue from /metrics (kept ~2 s), the context window a
-    llama-server was launched with from /props (kept ~30 s).
+    llama-server was launched with and how many requests it takes at once
+    from /props (kept ~30 s).
 
     llama-server and vLLM tell the same facts under different names.
     llama.cpp reports rates for the window since the last scrape; newer
@@ -73,7 +78,7 @@ class ServerProbe:
         # None asks time.time at each reading, so a patched clock is seen.
         self.clock = clock
         self._metrics: dict[Any, tuple[float, dict[str, Any]]] = {}
-        self._ctx: dict[Any, tuple[float, int]] = {}
+        self._props: dict[Any, tuple[float, dict[str, Any]]] = {}
         self._counted: dict[Any, tuple[float, dict[str, float]]] = {}
         self._timed: dict[Any, tuple[str, dict[str, float], dict[str, float]]] = {}
 
@@ -170,23 +175,38 @@ class ServerProbe:
         self._timed[port] = (start, dict(values), rates)
         return rates
 
-    def ctx_max(self, port) -> int:
-        """n_ctx the llama-server was launched with, from /props. Cached ~30s
-        PER PORT (same single-slot thrash as Machine.firewall — see its note)."""
+    def props(self, port) -> dict[str, Any]:
+        """What a llama-server says of itself at /props. Cached ~30s PER PORT
+        (same single-slot thrash as Machine.firewall — see its note); {} when
+        the server says nothing — another kind of server, or no answer."""
         now = self.now()
-        hit = self._ctx.get(port)
+        hit = self._props.get(port)
         if hit and now - hit[0] < 30:
             return hit[1]
-        ctx = 0
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{int(port)}/props", timeout=1) as r:
                 props = json.loads(r.read().decode("utf-8", "replace"))
-            gen = props.get("default_generation_settings") or {}
-            ctx = int(gen.get("n_ctx") or props.get("n_ctx") or 0)
         except Exception:
-            ctx = 0
-        self._ctx[port] = (now, ctx)
-        return ctx
+            props = {}
+        props = props if isinstance(props, dict) else {}
+        self._props[port] = (now, props)
+        return props
+
+    def ctx_max(self, port) -> int:
+        """n_ctx the llama-server was launched with, from /props; 0 when it does not say."""
+        props = self.props(port)
+        gen = props.get("default_generation_settings") or {}
+        try:
+            return int(gen.get("n_ctx") or props.get("n_ctx") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def slots_total(self, port) -> int | None:
+        """How many requests the server takes at once — llama-server's `--parallel`,
+        `total_slots` of /props (2.29); None when it does not say: a server of
+        another kind (the caravan's own cells, vLLM), or one that does not answer."""
+        value = self.props(port).get("total_slots")
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
 class CellRecords:
@@ -202,7 +222,7 @@ class CellRecords:
 
     def add(self, port: int, kind: str, pid: int, marker: str,
             cfg: dict, log_path, cache_models: bool,
-            health_path: str = "/health", launch: dict | None = None) -> None:
+            health_path: str = "/health", launch: dict | None = None, name: str = "") -> None:
         with self.state.lock:
             cells = self.state.setdefault("cells", {})
             cells[str(int(port))] = {
@@ -219,6 +239,9 @@ class CellRecords:
                 # How it was launched, so a crash after a scout restart can be
                 # followed by the same launch (Watchdog).
                 **({"launch": dict(launch)} if launch else {}),
+                # What its model is called at the machine's entry (2.27,
+                # entry.ModelName): kept, as a restart no longer has the request.
+                **({"name": str(name)} if name else {}),
             }
             self.state.save()
 
@@ -320,6 +343,9 @@ class Cells:
             p = st.get("port") or port
             metrics = self.probe.metrics(p) if p else {}
             view = {**st, "port": p, "phase": "running", **metrics,
+                    # The processes it started (2.31): the card's memory may be
+                    # a child's — Strata's engine under its server.
+                    "pids": self.processes.descendants(st.get("pid")),
                     "firewall": self.machine.firewall(p) if p else {},
                     # Which of the files it holds changed on disk after it
                     # started (2.11): ⟳ on the card — restart to pick them up.
@@ -512,6 +538,13 @@ class Cells:
                 purge_any = True
             self.drop(p)   # a stopped cell disappears from the fleet view
             self.records.forget(p)
+            # What it made from its model (CARAVAN_CELL_SCRATCH) goes the way
+            # its models go: kept with a cache, removed without one.
+            if not cell.cache_models:
+                try:
+                    self.models.clear_scratch(p)
+                except OSError:
+                    pass
         # Purge once, after the stopped cells are dropped, via the SAFE variant
         # so a model still served by another running cell isn't evicted
         # (stopping whisper must not delete the translator gguf).

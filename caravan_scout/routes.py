@@ -25,13 +25,17 @@ class Route:
     `public`: no fleet token needed, even when the scout holds one. `body`
     names the fields the route's own code reads; `body_more` says it hands the
     body on to code that reads more, so the list is a floor and not the whole.
+    `entry`: a path of the machine's entry by OpenAI's API (2.27, entry.py) —
+    open like the cells it reaches, answered by ScoutHandler before the tables.
+    `params` says what each `{name}` of a path template is.
     """
 
-    PAGE, PUBLIC, GET, QUERY, POST, OWN = "page", "public", "get", "query", "post", "own"
+    PAGE, PUBLIC, GET, QUERY, POST, OWN, ENTRY = "page", "public", "get", "query", "post", "own", "entry"
 
     def __init__(self, method: str, path: str, handler: Callable[..., Any] | None, summary: str,
                  description: str = "", *, tag: str, public: bool = False, page: bool = False,
-                 query: tuple[str, ...] = (), body: tuple[str, ...] = (), body_more: bool = False) -> None:
+                 query: tuple[str, ...] = (), body: tuple[str, ...] = (), body_more: bool = False,
+                 entry: bool = False, params: dict[str, str] | None = None) -> None:
         self.method = method
         self.path = path
         self.handler = handler
@@ -43,12 +47,16 @@ class Route:
         self.query = query
         self.body = body
         self.body_more = body_more
+        self.entry = entry
+        self.params = dict(params or {})
 
     @property
     def kind(self) -> str:
         """Which table of the handler the row belongs in."""
         if self.page:
             return self.PAGE
+        if self.entry:
+            return self.ENTRY
         if self.method == "POST":
             return self.POST if self.handler is not None else self.OWN
         if self.query:
@@ -57,8 +65,8 @@ class Route:
 
     @property
     def needs_no_token(self) -> bool:
-        """Whether anyone may ask: the page, and the paths marked `public`."""
-        return self.page or self.public
+        """Whether anyone may ask: the page, the paths marked `public` and the machine's entry."""
+        return self.page or self.public or self.entry
 
     @property
     def reads_a_body(self) -> bool:

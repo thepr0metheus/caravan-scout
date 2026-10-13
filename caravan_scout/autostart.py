@@ -51,6 +51,25 @@ class Autostart:
     def ports(self) -> list[int]:
         return sorted(int(key) for key in self._entries() if str(key).isdigit())
 
+    def requests(self) -> dict[str, Any]:
+        """The kept start requests by port, as a controller keeps a cell (2.26): its settings
+        (`config`, whole — an empty value is a flag taken off), the model it names (`modelPath`) and
+        whether its models stay cached (`cacheModels`).
+
+        The scout drops a stopped cell from its report, and a controller shows a stopped cell only from
+        a record of its own. A controller that did not start the cell — one moved to another machine
+        (2026-10-12: every cell of a machine went off its board as it was stopped) — had none, so the
+        cell was gone with its switch. From these it keeps a record of each it lacks. An entry without
+        settings is no request, and is left out."""
+        out: dict[str, Any] = {}
+        for key, entry in self._entries().items():
+            payload = entry.get("payload") if isinstance(entry, dict) else None
+            if not str(key).isdigit() or not isinstance(payload, dict) or not isinstance(payload.get("config"), dict):
+                continue
+            out[str(int(key))] = {"config": dict(payload["config"]), "modelPath": str(payload.get("modelPath") or ""),
+                                  "cacheModels": bool(payload.get("cacheModels"))}
+        return out
+
     def set(self, port: Any, enabled: Any, payload: Any = None) -> dict[str, Any]:
         """Turn a cell's autostart on (with the request that starts it) or off."""
         port = self.port(port)

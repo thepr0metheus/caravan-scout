@@ -11,6 +11,7 @@ from urllib.parse import parse_qs
 
 from caravan_scout import __version__ as APP_VERSION
 from caravan_scout.api_spec import ApiSpec
+from caravan_scout.entry import EntryBody
 from caravan_scout.errors import AppError
 from caravan_scout.routes import Route
 from caravan_scout.webui import PairingPage
@@ -122,6 +123,33 @@ class Api:
                   "Written from the table the scout answers by, so it cannot drift from what the scout does; the "
                   "endpoint tables of docs/http-api.md are written from the same table. `info.version` is the "
                   "version /api/health names.", tag="meta", public=True),
+            # The machine's entry by OpenAI's API (2.27, entry.py): its models by name, open like the cells
+            # it reaches; ScoutHandler answers these paths before the token gate and the tables.
+            Route("GET", "/v1/models", None, "This machine's models, by OpenAI's API",
+                  "`{object: \"list\", data: [{id, object: \"model\", created, owned_by, caravan: {state, slots, busy, "
+                  "copies: [{port, state, slots, busy}]}}]}`: every cell the scout runs, starts or keeps a start request for, by its model's "
+                  "name — the name its operator gave (`MODEL_NAME`), else the cell's `ALIAS`, else one made of its "
+                  "model — two cells of one model are its copies. `state`: running, starting, failed, stopped; a "
+                  "model's is the best of its copies'. `slots`, `busy` — how many requests a running copy takes at once "
+                  "(/props `total_slots`) and works on now (/metrics); a model's are its running copies' sums, 0 when none "
+                  "runs, null when one does not say (2.29+). `created` — when its first copy started, 0 for none; "
+                  "`owned_by` — this machine's host id. What a model does (`architecture`) is not said: that is the "
+                  "controller's vocabulary.", tag="entry", entry=True),
+            Route("GET", "/v1/models/{model}", None, "One model of this machine, by OpenAI's API",
+                  "The model as the list has it; 404 `model_not_found` in OpenAI's error shape for a name no cell has.",
+                  tag="entry", entry=True, params={"model": "The model's name as the list has it, URL-encoded."}),
+            Route("POST", "/v1/{path}", None, "A request by OpenAI's API, handed to a running copy of its model",
+                  "`model` of a JSON body, or the form field `model` of a multipart one (a recording), names the "
+                  "model; the request goes to its running copy with the fewest requests in work — as it came, but "
+                  "for one hop's headers, the client's `Authorization`, and `model` in the cell's own words when "
+                  "its server answers to other names (vLLM refuses a name it does not serve) — and the answer comes "
+                  "back as it came, a stream as a stream. The body is read whole first, by its length or its "
+                  "chunks. Refusals in OpenAI's shape: no `model`, or a body that cannot be read — 400; no such "
+                  "model — 404 `model_not_found`; none of its copies running — 503 `model_not_running`; the cell "
+                  "not answering — 502 `cell_unreachable`; a body over 256 MiB — 413.",
+                  tag="entry", entry=True, body=("model",), body_more=True,
+                  params={"path": "The rest of the path under /v1, slashes and all: chat/completions, embeddings, "
+                                  "audio/transcriptions… — the cell gets it as it came."}),
             Route("GET", "/api/state", lambda: s.report.public(),
                   "The machine as a whole: hardware, cells, engines, llama.cpp build, driver",
                   "The machine: host identity/IP, GPUs, CPU/RAM, compute apps (`[{gpuUuid, pid, name, usedMiB}]` — "
@@ -137,7 +165,10 @@ class Api:
                   "restart would pick them up (a folder by its newest file), 2.11+; a cell that crashed since it "
                   "was last started by hand carries `crash: {count, at, reason, tail?, gaveUp?}`, 2.5+; `tail` — "
                   "the last 8 lines of the crashed run's log, keys scrubbed, 2.6+), `autostart` — the ports that "
-                  "start with the machine, stopped ones too (2.4+), `driver` — the NVIDIA driver as the next boot "
+                  "start with the machine, stopped ones too (2.4+), `autostartRequests` — the start request kept for "
+                  "each of them by port, `{config, modelPath, cacheModels}`, so a controller that did not start a "
+                  "cell keeps a record of it (2.26+), `entryModels` — the machine's models as `GET /v1/models` lists "
+                  "them, null when not known (2.28+), `driver` — the NVIDIA driver as the next boot "
                   "will meet it (2.19+, below), and `llamaSuspect` — `{suspect: false}` or the incident of cells "
                   "crashing after a fresh llama.cpp build: `crashes15m`, `builtAt`, `currentCommit`, `firstSeenAt`, "
                   "`lastSeenAt`, `restoreCandidate` (the archived build to offer, or null) (2.6+). The heartbeat "
@@ -231,8 +262,10 @@ class Api:
                   "a version hint: this scout never assembles its own. `inPlace` (optional, 2.3+) maps each model "
                   "path the cell is sent to where the controller reads that file — `{path, size}` for a file, "
                   "`{path, dir: true}` for a folder, `library` when it is a library's: a file this machine has at "
-                  "that path with that size is read there (no copy, never deleted); a library's file or a folder it "
-                  "lacks is refused (409) naming what is missing, since a download cannot bring it. `vram` "
+                  "that path with that size is read there (no copy, never deleted); a library's file it lacks is "
+                  "refused (409) naming what is missing, since a download cannot bring it; a folder it lacks is "
+                  "fetched file by file through the controller's `GET /api/models/folder` and "
+                  "`GET /api/models/download` (2.30+, before that refused). `vram` "
                   "(optional, 2.7+) — `{device, reserveMiB, who, why, lower}`, what the cell reserves on a card the "
                   "moment it starts (the controller's rule: vLLM takes utilization × the card): a command cell "
                   "whose card has less free right now is refused before it runs, naming the running cells that "
@@ -242,9 +275,17 @@ class Api:
                   "kept for a restart after a crash. A name that is not a shell variable name, or a value that is "
                   "not a string, is refused (400) before anything starts. Since 2.20 a command cell takes `env` "
                   "too (it was dropped), and `env` may not name `CARAVAN_SCOUT_CELL` (400): the scout sets that "
-                  "marker itself, last. Async: returns `{status: \"starting\", phase: \"resolving\"}` immediately; "
+                  "marker itself, last. `modelFiles` (optional, 2.31+) — the model paths a command cell reads, as "
+                  "the controller's runner names them; without it, the config's `MODEL_FILE` alone. The first "
+                  "part of a split GGUF (`…-00001-of-00002.gguf`) brings its other parts, in the cache beside it "
+                  "or found beside it where it is read in place (409 when one is missing there). A command cell "
+                  "gets `CARAVAN_CELL_SCRATCH`, a folder for what it makes from its model: kept with its models, "
+                  "emptied at its start and removed at its stop when they are not kept (`cacheModels`, which a "
+                  "command cell obeys since 2.31). Async, a command cell's start too since 2.31 (it ran on the request, "
+                  "download included): returns `{status: \"starting\", phase: \"resolving\"}` immediately; "
                   "progress is visible in `/api/llama-node/status` and the fast heartbeats.", tag="cells",
-                  body=("port", "args", "cellKind", "shellLine", "healthPath", "cacheModels", "inPlace", "vram", "env"),
+                  body=("port", "args", "cellKind", "shellLine", "healthPath", "cacheModels", "inPlace", "vram", "env",
+                        "modelFiles"),
                   body_more=True),
             Route("POST", "/api/llama-node/autostart", self._autostart,
                   "Set whether a cell starts with the machine",
@@ -268,8 +309,10 @@ class Api:
             Route("POST", "/api/llama-node/stop", lambda body: (s.cells.stop(body().get("port")), 200),
                   "Stop one cell by its port, or every cell",
                   "`{port}`, or no port for ALL cells. Drops the cell from the fleet view and the registry; purges "
-                  "cached models unless the cell had `cacheModels` (safe purge — never evicts a model a sibling cell "
-                  "still serves). A port still held by a process the scout lost track of is reclaimed only when it "
+                  "cached models — files and, since 2.31, model folders — unless the cell had `cacheModels` (safe "
+                  "purge — never evicts a model a sibling cell still serves, nor a download still under way); a "
+                  "command cell's own `cacheModels` counts since 2.31 (it kept its models always), and its scratch "
+                  "folder goes with its models. A port still held by a process the scout lost track of is reclaimed only when it "
                   "is recognisably ours (its marker or the llama-server binary); an unrecognised holder is named "
                   "and left alone.", tag="cells", body=("port",)),
             Route("POST", "/api/llama-node/update", lambda body: (s.builds.start_update(body()), 200),
@@ -412,9 +455,40 @@ class ScoutHandler(BaseHTTPRequestHandler):
     def refuse(self) -> None:
         self.send_json({"error": "fleet token required (X-Caravan-Token)"}, 401)
 
+    def entry_request(self, entry) -> None:
+        """A request to the machine's entry: its body read whole — by its length or its chunks, never
+        past ENTRY_BODY_MAX (entry.EntryBody) — and handed on (entry.MachineEntry.forward). A client
+        gone mid-answer ends it."""
+        try:
+            body = EntryBody(self.ENTRY_BODY_MAX).read(self.headers, self.rfile)
+        except EntryBody.TooLong:
+            # The rest of the body is not read: the connection goes with the answer.
+            self.close_connection = True
+            self.send_json(entry.refusal(f"The request body is over {self.ENTRY_BODY_MAX} bytes",
+                                         "invalid_request_error", None, None), 413)
+            return
+        except EntryBody.Malformed as exc:
+            self.close_connection = True
+            self.send_json(entry.refusal(f"The request body cannot be read: {exc}", "invalid_request_error",
+                                         None, None), 400)
+            return
+        try:
+            entry.forward(self, "POST", self.path, body)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+
+    #: The most a request to the machine's entry may carry: a recording of two hours as 16 kHz WAV
+    #: (115 MB an hour) — the scout holds it in memory while it goes on.
+    ENTRY_BODY_MAX = 256 << 20
+
     def do_GET(self) -> None:
         api = self.api
         try:
+            # The machine's entry by OpenAI's API (2.27): open like the cells it reaches.
+            if self.path.startswith("/v1/"):
+                payload, status = api.scout.entry.get(self.path)
+                self.send_json(payload, status)
+                return
             if self.path in api.pages:
                 self.send_page(api.pages[self.path]())
                 return
@@ -441,6 +515,9 @@ class ScoutHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         api = self.api
         try:
+            if self.path.startswith("/v1/"):
+                self.entry_request(api.scout.entry)
+                return
             if self.path == "/api/controller-url":
                 # The pairing form may carry the token in the body, so the
                 # body is read before the gate on this one path — and a token

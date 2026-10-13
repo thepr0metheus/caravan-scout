@@ -53,7 +53,7 @@ os.environ["HOME"] = str(HOME)
 
 import caravan_scout.builds as builds  # noqa: E402
 from caravan_scout.cell_assets import CellAssets  # noqa: E402
-from caravan_scout.starts import CellArtifacts, LlamaLaunch  # noqa: E402
+from caravan_scout.starts import CellArtifacts, CommandLaunch, LlamaLaunch  # noqa: E402
 from caravan_scout.errors import AppError  # noqa: E402
 from caravan_scout.paths import SERVER_CELLS_DIR  # noqa: E402
 from caravan_scout.process import HostProcesses  # noqa: E402
@@ -366,7 +366,7 @@ def worker_scout(**config):
 
 
 def worker(s, port, config, model=MODEL, mmproj="", spec="", cache=False, args=...,
-           popen=None, web=None, kill=None, bin_path=None, make_cache_dir=True, hints=None, env=None):
+           popen=None, web=None, kill=None, bin_path=None, make_cache_dir=True, hints=None, env=None, name=""):
     """Run the llama startup worker synchronously under a Rig. The cache dir
     is made first unless asked not to: the worker opens its per-port log there."""
     if args is ...:
@@ -377,7 +377,7 @@ def worker(s, port, config, model=MODEL, mmproj="", spec="", cache=False, args=.
     with rig:
         rig.res, rig.err = attempt(lambda: LlamaLaunch(
             s.cells, port, str(bin_path or LLAMA_BIN), config, model, mmproj, spec, cache, args,
-            hints=hints, env=env).run())
+            hints=hints, env=env, name=name).run())
     return rig
 
 
@@ -394,8 +394,11 @@ def start_llama(payload, config=None, prep=None, kill=None, run=None):
 
 
 def start_command(payload, config=None, prep=None, popen=None, web=None, kill=None,
-                  home=None, make_cache_dir=True):
-    """A command cell through Cells.start under a Rig."""
+                  home=None, make_cache_dir=True, hold=False):
+    """A command cell through Cells.start under a Rig: `res` is the answer to
+    the request; then — unless `hold` — its background launch runs in the
+    same Rig, and `launched` is what that launch answered (the process
+    start's answer, or why there was none)."""
     s = make_scout(config or {})
     if make_cache_dir:
         s.models.cache_dir().mkdir(parents=True, exist_ok=True)
@@ -403,10 +406,24 @@ def start_command(payload, config=None, prep=None, popen=None, web=None, kill=No
         prep(s)
     rig = Rig(popen=popen or FakePopen({"pid": 7070}), run=FakeRun({UFW_ALLOW: (0, "")}),
               web=web, kill=kill)
+    rig.launched = rig.launch_err = None
     with env(HOME=str(home or HOME)), rig:
         rig.res, rig.err = attempt(lambda: s.cells.start(payload))
+        held = [t for t in rig.threads.made if isinstance(getattr(t.target, "__self__", None), CommandLaunch)]
+        if held and not hold:
+            held[0].ran = True
+            rig.launched, rig.launch_err = attempt(held[0].target)
     rig.s = s
     return rig
+
+
+def starting(port):
+    """What a start answers at once since 2.31, a command cell's too."""
+    return {"ok": True, "status": "starting", "phase": "resolving", "port": port}
+
+
+def scratch_of(s, port):
+    return str(s.models.cache_dir() / ".cells" / str(port))
 
 
 # ── slots (agent.py) ──────────────────────────────────────────────────────
@@ -531,12 +548,13 @@ def test_node_public_views():
     s.cells.report(22021, phase="error", error="old failure")
     web = FakeUrlopen({"/metrics": lambda url: FakeResponse(METRICS), "/props": lambda url: FakeResponse(PROPS)})
     run = FakeRun({("sudo", "-n", "ufw", "status"): (0, "Status: inactive\n")})
-    with Rig(web=web, run=run, kill=FakeKill(alive={5353})):
+    with patched(HostProcesses, PROC=TMP / "proc-empty"), Rig(web=web, run=run, kill=FakeKill(alive={5353})):
         view = s.cells.view(sl)
     check(view == {"running": True, "pid": 5353, "adopted": True, "startedAt": NOW - 500, "uptimeSec": 500,
                    "modelPath": "/m/model-q4.gguf", "port": 22021, "phase": "running",
                    "promptTps": 123.46, "genTps": 45.68, "requestsProcessing": 2, "ctxMax": 8192,
-                   "ctxUsed": 2048, "firewall": {"state": "open", "allowedFrom": []}, "launchDiskNewer": []},
+                   "ctxUsed": 2048, "pids": [], "firewall": {"state": "open", "allowedFrom": []},
+                   "launchDiskNewer": []},
           "живой процесс: фаза running, метрики, окно контекста, файрвол и файлы, изменившиеся после старта "
           "(2.11; файла модели здесь нет — пусто), влиты в вид")
     check("cmd" not in view, "negative: командная строка процесса (cmd) в вид не попадает")
@@ -1070,6 +1088,34 @@ def test_adopt_by_port_stranger():
           "журнал называет порт и чужой pid")
 
 
+def test_descendants():
+    proc = TMP / "proc-tree"
+
+    def kids(pid, tid, children):
+        f = proc / str(pid) / "task" / str(tid) / "children"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(" ".join(str(c) for c in children) + (" " if children else ""), encoding="utf-8")
+    kids(4000, 4000, [4001])            # the server and its engine
+    kids(4000, 4002, [4003])            # a thread of the server started a helper
+    kids(4001, 4001, [4004, 4005])      # the engine's own children
+    kids(4004, 4004, [])
+    kids(5000, 5000, [5001])            # another cell's tree
+    (proc / "6000" / "task" / "6000").mkdir(parents=True, exist_ok=True)   # no children file (old kernel)
+    with patched(HostProcesses, PROC=proc):
+        got = HostProcesses.descendants(4000)
+        none = [HostProcesses.descendants(p) for p in (6000, 7000, 1, "x", None)]
+        limited = None
+        with patched(HostProcesses, TREE_LIMIT=2):
+            limited = HostProcesses.descendants(4000)
+    check(got == [4001, 4003, 4004, 4005],
+          "дети процесса ячейки и их дети — из /proc/<pid>/task/<tid>/children, всех потоков: движок Strata "
+          "под её сервером виден (2.31), его видеопамять — память ячейки")
+    check(5001 not in got, "negative: дерево другой ячейки не попадает")
+    check(none == [[], [], [], [], []],
+          "negative: нет файла children, нет процесса, pid 1, не число — пустой список, а не ошибка")
+    check(limited == [4001, 4003], "boundary: дерево обрезано по TREE_LIMIT — убежавший fork не обходится целиком")
+
+
 def test_owned():
     proc = TMP / "proc-owned"
     for pid, env in ((5151, b"PATH=/bin\0CARAVAN_SCOUT_CELL=22062\0HOME=/h\0"),
@@ -1343,6 +1389,13 @@ def test_llama_start_accepted():
           "на доске сразу фаза resolving с моделью и временем старта")
     check(r.s.cells.by_port[port].cache_models is True if port in r.s.cells.by_port else False,
           "флаг кэша моделей из запроса записан в слот")
+    check(port in r.s.cells.by_port and r.s.cells.by_port[port].name == "model-q4" and t is not None
+          and t.target.__self__.name == "model-q4",
+          "имя модели для входа машины (2.27) дано ячейке сразу, до загрузки — модель находится по имени как "
+          "«starting»; и передано запуску, чтобы запись его сохранила")
+    r = start_llama({**payload, "config": {**payload["config"], "ALIAS": "gemma-4-12b", "MODEL_NAME": "gemma"}})
+    check(r.s.cells.by_port[port].name == "gemma" if port in r.s.cells.by_port else False,
+          "имя оператора (MODEL_NAME) — первое: раньше алиаса и имени файла")
 
     r = start_llama({"modelPath": MODEL, "port": 22082, "gpuLayers": 20, "ctxSize": 8192})
     t = r.threads.made[0] if r.threads.made else None
@@ -1456,7 +1509,8 @@ def test_command_cell_start():
     r = start_command({"cellKind": "command", "command": cmd, "shellLine": shell, "cacheModels": False,
                        "healthPath": "/v1/health", "config": {"PORT": port}})
     log = r.s.models.cache_dir() / f"command-cell.{port}.log"
-    check(r.res == {"ok": True, "pid": 7070, "port": port}, "командная ячейка стартует и отвечает pid и портом")
+    check(r.res == starting(port) and r.launched == {"ok": True, "pid": 7070, "port": port},
+          "командная ячейка отвечает сразу «starting» (2.31), а pid и порт — её фоновый запуск")
     spawn = r.popen.calls[0] if r.popen.calls else {}
     check(spawn.get("argv") == ["bash", "-lc", shell], "запускается ровно строка контроллера через bash -lc")
     env = spawn.get("env") or {}
@@ -1466,15 +1520,26 @@ def test_command_cell_start():
     check(disk_cells(r.s).get(str(port)) == {
         "port": port, "kind": "command", "pid": 7070, "marker": f"bash run_whisper.sh {port} --lang en",
         "cfg": {"modelPath": "", "port": port, "cellKind": "command", "command": "bash ~/run_whisper.sh $PORT --lang en"},
-        "log": str(log), "cacheModels": True, "healthPath": "/v1/health", "startedAt": NOW,
-        "launch": {"argv": ["bash", "-lc", shell], "extraEnv": {}, "log": str(log)}},
-        "ячейка в реестре: маркер с раскрытым $PORT и без ~/, cfg с командой без exec, healthPath от контроллера")
+        "log": str(log), "cacheModels": False, "healthPath": "/v1/health", "startedAt": NOW,
+        "launch": {"argv": ["bash", "-lc", shell], "extraEnv": {"CARAVAN_CELL_SCRATCH": scratch_of(r.s, port)},
+                   "log": str(log)}, "name": f"cell-{port}"},
+        "ячейка в реестре: маркер с раскрытым $PORT и без ~/, cfg с командой без exec, healthPath от контроллера; "
+        "имя модели для входа машины (2.27) — у ячейки без имени, алиаса и модели — cell-<порт>; "
+        "в окружении запуска — её рабочая папка CARAVAN_CELL_SCRATCH (2.31)")
     check(r.s.cells.startup(port) == {"phase": "running", "modelPath": "bash ~/run_whisper.sh $PORT --lang en",
                                            "downloadedBytes": 0, "totalBytes": 0, "error": "", "startedAt": NOW},
           "фаза running; в modelPath записи старта — сама команда")
-    check(port in r.s.cells.by_port and r.s.cells.by_port[port].cache_models is True,
-          "кэш моделей командной ячейки включён принудительно, хотя запрос просил false: её файлы не качаются заново")
-    check(r.threads.made == [], "командная ячейка стартует в потоке запроса — фонового воркера нет")
+    check(port in r.s.cells.by_port and r.s.cells.by_port[port].cache_models is False,
+          "defect-history: кэш командной ячейки — как просил контроллер (false): до 2.31 он включался "
+          "принудительно, и её модель оставалась на машине после остановки")
+    check(len(r.threads.made) == 1 and r.threads.made[0].started
+          and isinstance(getattr(r.threads.made[0].target, "__self__", None), CommandLaunch),
+          "defect-history: командная ячейка стартует в фоне, как llama: до 2.31 запрос ждал и загрузку модели, "
+          "а контроллер ждёт ответа 10 с")
+    r = start_command({"cellKind": "command", "command": cmd, "shellLine": shell, "cacheModels": True,
+                       "config": {"PORT": port}})
+    check(r.s.cells.by_port[port].cache_models is True and disk_cells(r.s).get(str(port), {}).get("cacheModels") is True,
+          "negative: контроллер просит кэш — ячейка его держит, и запись тоже")
     check(r.run.calls == [["sudo", "-n", "ufw", "allow", str(port)]], "порт открыт в ufw")
 
     r = start_command({"cellKind": "command", "shellLine": "exec python3 srv.py",
@@ -1507,8 +1572,8 @@ def test_command_cell_refusals():
                              "(needs lama-caravan v1.3.115+)"),
           "без shellLine — отказ 400, а не строка, собранная заново из command")
     check(r.popen.calls == [] and disk_cells(r.s) == {}, "negative: без shellLine ничего не запущено и не записано")
-    check(r.run.calls == [["sudo", "-n", "ufw", "allow", str(port)]],
-          "as-is: ДЕФЕКТ — порт открыт в ufw ещё до отказа: файрвол открыт для ячейки, которая не стартовала")
+    check(r.run.calls == [],
+          "defect-history: без shellLine отказ ДО ufw — до 2.31 порт открывался для ячейки, которая не стартовала")
     r = start_command({"cellKind": "command", "command": "   ", "shellLine": "exec true", "config": {"PORT": 22221}})
     check(err_is(r.err, 400, "command is required for a command cell") and r.run.calls == [],
           "пустая команда — отказ 400, ufw не тронут")
@@ -1529,7 +1594,8 @@ def test_command_cell_refusals():
     port = 22223
     r = start_command({"cellKind": "command", "command": "python3 srv.py", "shellLine": "exec python3 srv.py",
                        "config": {"PORT": port}}, popen=FakePopen(OSError("exec failed")))
-    check(r.res == {"ok": False, "error": "exec failed"}, "процесс не запустился — ответ с причиной")
+    check(r.res == starting(port) and r.launched == {"ok": False, "error": "exec failed"},
+          "процесс не запустился — запуск отвечает причиной (запрос уже ответил «starting»)")
     st = r.s.cells.startup(port)
     check((st.get("phase"), st.get("error")) == ("error", "exec failed") and disk_cells(r.s) == {},
           "negative: не стартовавшая ячейка — фаза error, в реестр не пишется")
@@ -1539,7 +1605,7 @@ def test_command_cell_refusals():
                        "config": {"PORT": port}}, make_cache_dir=False)
     log = r.s.models.cache_dir() / f"command-cell.{port}.log"
     spawn = r.popen.calls[0] if r.popen.calls else {}
-    check(r.res == {"ok": True, "pid": 7070, "port": port} and log.is_file()
+    check(r.launched == {"ok": True, "pid": 7070, "port": port} and log.is_file()
           and getattr(spawn.get("stdout"), "name", None) == str(log),
           "defect-history: на хосте без папки моделей командная ячейка не стартовала — лог открывался в "
           "несуществующей папке, а папку создавала только загрузка модели; теперь папку создаёт сам лог")
@@ -1548,8 +1614,9 @@ def test_command_cell_refusals():
     occupied.write_text("not a folder", encoding="utf-8")
     r = start_command({"cellKind": "command", "command": "python3 srv.py", "shellLine": "exec python3 srv.py",
                        "config": {"PORT": port}}, config={"modelsBasePath": str(occupied)}, make_cache_dir=False)
-    check(r.res == {"ok": False, "error": f"[Errno 17] File exists: '{occupied}'"} and r.popen.calls == [],
-          "negative: папку не создать (на её месте файл) — отказ с причиной, процесс не запущен")
+    check(r.launched == {"ok": False, "error": f"[Errno 20] Not a directory: '{occupied / '.cells' / str(port)}'"}
+          and r.popen.calls == [] and r.s.cells.startup(port).get("phase") == "error",
+          "negative: папку не создать (на её месте файл) — отказ с причиной, процесс не запущен, фаза error")
 
 
 def test_command_cell_model():
@@ -1562,11 +1629,16 @@ def test_command_cell_model():
         f.write_bytes(b"GGUF cached asr")
     port = 22230
     r = start_command({"cellKind": "command", "command": command, "shellLine": "exec python3 -m asr_server",
-                       "config": {"PORT": port, "MODEL_FILE": asr}}, prep=cached, web=FakeUrlopen())
+                       "cacheModels": True, "config": {"PORT": port, "MODEL_FILE": asr}}, prep=cached, web=FakeUrlopen())
     mp = str(r.s.models.cache_dir() / asr)
     check(disk_cells(r.s).get(str(port), {}).get("cfg", {}).get("modelPath") == mp,
           "MODEL_FILE найден в кэше — его путь в cfg: по нему чистка кэша не тронет файл работающей ячейки")
-    check(r.web.calls == [], "negative: закэшированная модель не перекачивается")
+    check(r.web.calls == [], "negative: с кэшем закэшированная модель не перекачивается")
+    r = start_command({"cellKind": "command", "command": command, "shellLine": "exec python3 -m asr_server",
+                       "config": {"PORT": port, "MODEL_FILE": asr}}, config={"controllerUrl": CONTROLLER},
+                      prep=cached, web=models_served({asr: b"GGUF asr-q8"}))
+    check(len(r.web.calls) == 1 and (r.s.models.cache_dir() / asr).read_bytes() == b"GGUF asr-q8",
+          "без кэша файл, оставшийся в кэше, скачан заново — модель всегда с контроллера (владелец, 2026-10-13)")
 
     port = 22231
     web = models_served({asr: b"GGUF asr-q8"})
@@ -1576,19 +1648,121 @@ def test_command_cell_model():
     check(f.exists() and f.read_bytes() == b"GGUF asr-q8"
           and disk_cells(r.s).get(str(port), {}).get("cfg", {}).get("modelPath") == str(f),
           "модели нет — скачана с контроллера до старта, путь в cfg")
-    check(r.threads.made == [] and (r.res or {}).get("ok") is True,
-          "as-is: ДЕФЕКТ — загрузка идёт в потоке запроса: ответ контроллеру ждёт весь файл "
-          "(llama-путь ради этого ушёл в фон)")
+    check(len(r.threads.made) == 1 and r.res == starting(port),
+          "defect-history: загрузка идёт в фоне — ответ контроллеру не ждёт файл (до 2.31 ждал весь)")
 
     port = 22232
     r = start_command({"cellKind": "command", "command": command, "shellLine": "exec python3 -m asr_server",
                        "config": {"PORT": port, "MODEL_FILE": asr}})
     why = f"model not found locally and controllerUrl not set: {asr}"
-    check(r.res == {"ok": False, "error": f"model not available: {why}"},
+    check(r.launched == {"ok": False, "error": f"model not available: {why}"},
           "модель недоступна — отказ с причиной, а не ячейка, тихо упавшая в своём логе")
     st = r.s.cells.startup(port)
     check((st.get("phase"), st.get("error")) == ("error", why), "фаза error с той же причиной")
     check(r.popen.calls == [] and disk_cells(r.s) == {}, "negative: без модели не запущено и не записано")
+
+
+def test_command_cell_model_files():
+    first, second = "models/org/big-00001-of-00002.gguf", "models/org/big-00002-of-00002.gguf"
+    draft = "models/org/mtp-q2.gguf"
+    bodies = {first: b"GGUF one", second: b"GGUF two", draft: b"GGUF mtp", MODEL: b"GGUF other"}
+    port = 22270
+    r = start_command({"cellKind": "command", "command": "bash ~/run_strata.sh $PORT", "shellLine": "exec true",
+                       "modelFiles": [first, draft], "config": {"PORT": port, "MODEL_FILE": MODEL}},
+                      config={"controllerUrl": CONTROLLER}, web=models_served(bodies))
+    cache = r.s.models.cache_dir()
+    asked = [urllib.parse.unquote(c["url"].split("path=", 1)[1]) for c in r.web.calls
+             if "/api/models/download" in c["url"]]
+    check(asked == [first, second, draft],
+          "modelFiles контроллера (1.3.512) — качаются все названные файлы и части разбитого: первая, вторая, "
+          "черновой слой; MODEL_FILE не качается, раз контроллер назвал файлы сам")
+    cfg = disk_cells(r.s).get(str(port), {}).get("cfg", {})
+    check(cfg.get("modelPath") == str(cache / first) and cfg.get("files") == [str(cache / draft)],
+          "в записи ячейки — первый файл и остальные (files): по ним чистка не тронет работающую ячейку")
+    held = r.s.cells.held_files()
+    check(sorted(held) == sorted([str(cache / first), str(cache / second), str(cache / draft)]),
+          "работающая ячейка держит все свои файлы, вторую часть тоже — чистка соседа её не удалит")
+
+    r = start_command({"cellKind": "command", "command": "bash ~/run_whisper.sh $PORT", "shellLine": "exec true",
+                       "modelFiles": [], "config": {"PORT": port + 1, "MODEL_FILE": MODEL}},
+                      config={"controllerUrl": CONTROLLER}, web=models_served(bodies))
+    check([c for c in r.web.calls if "/api/models/download" in c["url"]] == [] and (r.launched or {}).get("ok") is True,
+          "negative: контроллер сказал «файлов нет» — забытый в конфиге MODEL_FILE не качается")
+    r = start_command({"cellKind": "command", "command": "bash ~/run_whisper.sh $PORT", "shellLine": "exec true",
+                       "modelFiles": "x.gguf", "config": {"PORT": port + 2}})
+    check(err_is(r.err, 400, "modelFiles must be a list of model paths") and r.run.calls == [] and r.threads.made == [],
+          "negative: modelFiles не список — отказ 400 до ufw и до запуска")
+
+
+def test_command_cell_scratch_and_stop():
+    port = 22271
+    asr = "models/org/asr-q8.gguf"
+
+    def leftover(s):
+        junk = s.models.scratch(port) / "old-pack.bin"
+        junk.parent.mkdir(parents=True, exist_ok=True)
+        junk.write_bytes(b"old")
+        other = s.models.scratch(port + 1) / "keep.bin"
+        other.parent.mkdir(parents=True, exist_ok=True)
+        other.write_bytes(b"other")
+    r = start_command({"cellKind": "command", "command": "bash ~/run_x.sh $PORT", "shellLine": "exec true",
+                       "modelFiles": [asr], "config": {"PORT": port}}, config={"controllerUrl": CONTROLLER},
+                      prep=leftover, web=models_served({asr: b"GGUF asr"}))
+    scratch = r.s.models.scratch(port)
+    penv = (r.popen.calls[0].get("env") or {}) if r.popen.calls else {}
+    check(penv.get("CARAVAN_CELL_SCRATCH") == str(scratch) and scratch.is_dir() and list(scratch.iterdir()) == [],
+          "ячейка получает рабочую папку в окружении (CARAVAN_CELL_SCRATCH); на старте папка пуста — "
+          "оставшееся от прошлого запуска убрано")
+    with Rig():
+        res, _ = attempt(lambda: r.s.cells.stop(port))
+    check((res or {}).get("ok") is True and not scratch.exists(), "остановка убирает рабочую папку ячейки")
+    check(not (r.s.models.cache_dir() / asr).exists(),
+          "defect-history: без кэша остановка удаляет скачанную модель командной ячейки — до 2.31 она "
+          "оставалась на машине навсегда")
+    check((r.s.models.scratch(port + 1) / "keep.bin").exists(), "negative: рабочая папка другой ячейки цела")
+
+    r = start_command({"cellKind": "command", "command": "bash ~/run_x.sh $PORT", "shellLine": "exec true",
+                       "modelFiles": [asr], "cacheModels": True, "config": {"PORT": port}},
+                      config={"controllerUrl": CONTROLLER}, prep=leftover, web=models_served({asr: b"GGUF asr"}))
+    kept = r.s.models.scratch(port) / "old-pack.bin"
+    check(kept.exists(), "с кэшем рабочая папка на старте не очищается: сделанное прошлым запуском той же модели "
+                         "берётся снова, а не пишется на диск заново (владелец бережёт диски, 2026-10-13)")
+    with Rig():
+        attempt(lambda: r.s.cells.stop(port))
+    check((r.s.models.cache_dir() / asr).exists() and kept.exists(),
+          "negative: с кэшем остановка оставляет и модель, и рабочую папку — она живёт вместе с моделью")
+
+
+def test_command_cell_stopped_mid_download():
+    port = 22272
+    asr = "models/org/asr-q8.gguf"
+    r = start_command({"cellKind": "command", "command": "bash ~/run_x.sh $PORT", "shellLine": "exec true",
+                       "modelFiles": [asr], "config": {"PORT": port}}, config={"controllerUrl": CONTROLLER},
+                      web=models_served({asr: b"GGUF asr"}), hold=True)
+    check(r.res == starting(port) and r.popen.calls == [], "загрузка ещё не шла — процесса нет, ответ «starting»")
+    launch = r.threads.made[0].target.__self__ if r.threads.made else None
+    r.s.cells.drop(port)
+    with Rig(web=models_served({asr: b"GGUF asr"})) as rig:
+        got, _ = attempt(launch.run)
+    check(got == {"ok": False, "error": "the cell was stopped during its start"} and rig.popen.calls == []
+          and rig.web.calls == [] and str(port) not in disk_cells(r.s),
+          "стоп пришёл до начала запуска — ни загрузки, ни процесса, ни записи в реестре")
+
+    r = start_command({"cellKind": "command", "command": "bash ~/run_x.sh $PORT", "shellLine": "exec true",
+                       "modelFiles": [asr], "config": {"PORT": port}}, config={"controllerUrl": CONTROLLER},
+                      web=models_served({asr: b"GGUF asr"}), hold=True)
+    launch = r.threads.made[0].target.__self__ if r.threads.made else None
+    with Rig(web=models_served({asr: b"GGUF asr"}, on_request=lambda raw: r.s.cells.drop(port))) as rig:
+        got, _ = attempt(launch.run)
+    check(got == {"ok": False, "error": "the cell was stopped during its start"} and rig.popen.calls == []
+          and str(port) not in disk_cells(r.s),
+          "стоп пришёл во время загрузки — процесс не запускается и в реестр не пишется: иначе он жил бы "
+          "сиротой, которого доска считает остановленным")
+    r = start_command({"cellKind": "command", "command": "bash ~/run_x.sh $PORT", "shellLine": "exec true",
+                       "modelFiles": [asr], "config": {"PORT": port}}, config={"controllerUrl": CONTROLLER},
+                      web=models_served({asr: b"GGUF asr"}))
+    check((r.launched or {}).get("ok") is True and str(port) in disk_cells(r.s),
+          "negative: без стопа тот же запуск доходит до процесса и записи")
 
 
 def test_command_cell_markers():
@@ -1634,7 +1808,7 @@ def test_command_cell_syncs_assets_first():
     with patched(CellAssets, sync=broken_sync):
         r = start_command({"cellKind": "command", "command": "bash $HOME/run_whisper.sh $PORT",
                            "shellLine": "exec true", "config": {"PORT": port}})
-    check((r.res or {}).get("ok") is True and f"[llama-node] cell-assets :{port} skipped (boom)" in r.journal,
+    check((r.launched or {}).get("ok") is True and f"[llama-node] cell-assets :{port} skipped (boom)" in r.journal,
           "negative: сбой синхронизации не роняет старт — ячейка идёт на локальных копиях, причина в журнале")
 
 
@@ -1679,7 +1853,8 @@ def test_worker_success():
                                            "launch": {"argv": [str(LLAMA_BIN), "--model", mp, "--port", str(port)],
                                                       "extraEnv": {}, "log": log}},
           "успешный старт в реестре: маркер — путь бинаря, cfg с артефактом, лог порта; и как запущен (argv, "
-          "окружение сверх обычного, лог) — чтобы после падения повторить тот же запуск и после рестарта скаута")
+          "окружение сверх обычного, лог) — чтобы после падения повторить тот же запуск и после рестарта скаута; "
+          "negative: имени модели нет — запуску его не дали (имя даёт старт, LlamaStart)")
     size = len(BODIES[MODEL])
     check(s.cells.startup(port) == {"phase": "running", "error": "", "downloadedBytes": size, "totalBytes": size,
                                          "downloadingFile": "model-q4.gguf"},
@@ -1694,6 +1869,10 @@ def test_worker_success():
     check([c["url"] for c in r.web.calls] == [f"{CONTROLLER}/api/models/download?path=models/org/model-q4.gguf"],
           "модель скачана с контроллера один раз")
     check(r.web.calls and r.web.calls[0]["timeout"] == 3600, "загрузка модели с таймаутом 3600 с")
+    named = worker_scout()
+    worker(named, port + 1, {"MODEL_FILE": MODEL, "PORT": port + 1}, name="gemma")
+    check(disk_cells(named).get(str(port + 1), {}).get("name") == "gemma",
+          "имя, данное запуску, — в записи ячейки: после рестарта скаута модель зовётся так же")
 
 
 def test_worker_engine_env():
@@ -2078,10 +2257,11 @@ def test_cell_env_both_kinds():
     r = start_command({"cellKind": "command", "command": "python3 srv.py", "shellLine": shell,
                        "env": {"CUDA_VISIBLE_DEVICES": ""}, "config": {"PORT": cport}})
     got = (r.popen.calls[0] if r.popen.calls else {}).get("env") or {}
-    check(r.res == {"ok": True, "pid": 7070, "port": cport} and got.get("CUDA_VISIBLE_DEVICES") == ""
+    check(r.launched == {"ok": True, "pid": 7070, "port": cport} and got.get("CUDA_VISIBLE_DEVICES") == ""
           and got.get("CARAVAN_SCOUT_CELL") == str(cport),
           "командная ячейка берёт env из запроса (2.20; раньше он молча выбрасывался), метка скаута при ней")
-    check(disk_cells(r.s).get(str(cport), {}).get("launch", {}).get("extraEnv") == {"CUDA_VISIBLE_DEVICES": ""},
+    check(disk_cells(r.s).get(str(cport), {}).get("launch", {}).get("extraEnv")
+          == {"CUDA_VISIBLE_DEVICES": "", "CARAVAN_CELL_SCRATCH": scratch_of(r.s, cport)},
           "env в записи запуска — перезапуск после аварии стартует так же")
     r = start_command({"cellKind": "command", "command": "python3 srv.py", "shellLine": shell,
                        "env": {"CARAVAN_SCOUT_CELL": "x"}, "config": {"PORT": cport}})
@@ -2105,13 +2285,14 @@ TESTS = [
     test_update_status_views, test_update_start_commands, test_update_job_run, test_update_conflict,
     test_builds_list, test_cell_artifacts, test_cell_artifacts_env, test_registry, test_marker_matches, test_pid_cmdline,
     test_port_listener_pid, test_port_health_ok,
-    test_adopt_by_marker, test_adopt_by_port, test_adopt_by_port_stranger, test_owned,
+    test_adopt_by_marker, test_adopt_by_port, test_adopt_by_port_stranger, test_owned, test_descendants,
     test_adopt_nothing_listening, test_adopt_quiet_health,
     test_adopt_bad_records, test_reap_strays,
     test_node_configs, test_delete_node_config,
     test_llama_start_refusals, test_llama_start_accepted, test_llama_start_port_order, test_llama_start_misc,
     test_llama_start_then_worker, test_llama_engine_env,
     test_command_cell_start, test_command_exec_stripping, test_command_cell_refusals, test_command_cell_model,
+    test_command_cell_model_files, test_command_cell_scratch_and_stop, test_command_cell_stopped_mid_download,
     test_command_cell_markers, test_command_cell_syncs_assets_first,
     test_resolve_arg_paths,
     test_worker_success, test_worker_engine_env, test_worker_download_error, test_worker_log_dir_missing, test_worker_refuses_without_args,

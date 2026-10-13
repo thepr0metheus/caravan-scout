@@ -167,6 +167,28 @@ def test_both_reports_say_it():
     check(public.get("autostart") == [22001, 22024] and beat.get("autostart") == [22001, 22024],
           "/api/state и пульс — одно поле под одним именем, остановленные ячейки тоже: иначе опрос и пульс "
           "стирали бы его друг у друга, а ↟ на остановленной ячейке не узнать")
+    kept = {"22001": {"config": {"PORT": 22001}, "modelPath": "models/org/model-q4.gguf", "cacheModels": False},
+            "22024": {"config": {"PORT": 22024, "RUNNER": "whisper"}, "modelPath": "", "cacheModels": False}}
+    check(public.get("autostartRequests") == kept and beat.get("autostartRequests") == kept,
+          "оба отчёта несут и сохранённый запрос старта каждой такой ячейки — настройки, модель, кэш (2.26): контроллер, "
+          "который её не запускал, заводит по нему запись, и остановленная ячейка не пропадает с его доски")
+
+
+def test_kept_requests():
+    CHECKS.section("сохранённые запросы старта — как их отдаёт отчёт (2.26):")
+    s = make_scout()
+    s.autostart.set(22024, True, {**WHISPER, "config": {**WHISPER["config"], "EXTRA_ARGS": ""}, "cacheModels": True})
+    s.state["autostart"]["junk"] = {"payload": {"config": {"PORT": 1}}}
+    s.state["autostart"]["22030"] = {"payload": {"port": 22030}}
+    s.state["autostart"]["22031"] = "not an entry"
+    got = s.autostart.requests()
+    check(got == {"22024": {"config": {"PORT": 22024, "RUNNER": "whisper", "EXTRA_ARGS": ""}, "modelPath": "", "cacheModels": True}},
+          f"запрос — настройки целиком, пустое значение тоже (снятый флаг), модель и кэш; negative: порт не числом, запрос без "
+          f"настроек и запись не словарём не отдаются (got {got})")
+    got["22024"]["config"]["PORT"] = 1
+    check(s.state["autostart"]["22024"]["payload"]["config"]["PORT"] == 22024,
+          "negative: отданное — копия: правка ответа не трогает хранимое")
+    check(make_scout().autostart.requests() == {}, "negative: без автозапуска — пусто, а не отказ")
 
 
 def test_the_launcher_runs_it():
@@ -180,7 +202,7 @@ def test_the_launcher_runs_it():
 
 
 for fn in (test_the_launcher_runs_it, test_turning_it_on_and_off, test_refresh_on_start, test_what_a_boot_starts, test_routes, test_boot_id,
-           test_both_reports_say_it):
+           test_both_reports_say_it, test_kept_requests):
     fn()
 
 sys.exit(CHECKS.finish())

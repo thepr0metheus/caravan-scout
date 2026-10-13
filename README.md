@@ -94,7 +94,9 @@ command builder. The scout:
   the controller (models are downloaded from the controller and cached);
 - runs generic **command cells** (e.g. a whisper server) the same way — the controller
   supplies both the start line and the cell server files themselves;
-- updates or rolls back llama.cpp on this host when the controller asks.
+- updates or rolls back llama.cpp on this host when the controller asks;
+- answers OpenAI's API for the models of its machine at `:8092/v1` (2.27): a
+  client names a model, the scout hands the request to a running cell of it.
 
 ```text
 Machine A (any GPU or no GPU)          Machine B (controller)
@@ -194,7 +196,7 @@ python3 -m caravan_scout.app --config config.json --state state.json
 | Port | Service |
 |---|---|
 | `7990` | LAMA CARAVAN admin (controller) |
-| `8092` | this scout |
+| `8092` | this scout, and the machine's entry by OpenAI's API (`/v1`) |
 | `22001–22999` | the cells on this machine — ports the controller picks from its cell range |
 
 ## Config reference
@@ -231,7 +233,8 @@ llama-node/configs · llama-node/list-cache · llama-node/update-status ·
 llama-node/builds`; POST `controller-url · unpair · heartbeat · llama-node/start ·
 llama-node/stop · llama-node/update · llama-node/restore ·
 llama-node/purge-cache · llama-node/configs/delete · host/reboot ·
-host/poweroff`.
+host/poweroff`. The machine's entry by OpenAI's API: GET `v1/models ·
+v1/models/{model}`; POST `v1/*` by the model it names.
 
 ## Services
 

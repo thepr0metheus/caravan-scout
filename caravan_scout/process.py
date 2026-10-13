@@ -14,6 +14,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from caravan_scout.models import SplitGguf
+
 
 class CellLog:
     """The log a cell's process writes.
@@ -492,11 +494,15 @@ class CellProcess:
 
     def held_files(self) -> list[str]:
         """The model files this process holds while it runs — what a cache
-        purge must leave alone. A process that does not run holds none."""
+        purge must leave alone: the launch files, the rest a command cell was
+        sent (`files`), and every part of a split GGUF among them (SplitGguf:
+        the engine opens them by name). A process that does not run holds none."""
         if not self.status().get("running"):
             return []
         cfg = self._cfg
-        return [cfg[k] for k, _role in self.LAUNCH_FILES if cfg.get(k)]
+        named = [cfg[k] for k, _role in self.LAUNCH_FILES if cfg.get(k)]
+        named += [str(f) for f in cfg.get("files") or [] if f]
+        return [part for path in named for part in SplitGguf(path).parts()]
 
     def changed_since(self, started_at: int) -> list[str]:
         """The roles of the launch files that changed on disk after the process
@@ -624,6 +630,47 @@ class HostProcesses:
         if out.returncode != 0 or not out.stdout.strip():
             return None
         return f" {cls.CELL_ENV}=" in out.stdout
+
+    #: How many processes a cell's tree may name: a server with its engine and
+    #: helpers has a handful, and a runaway fork is not walked.
+    TREE_LIMIT = 64
+
+    @classmethod
+    def descendants(cls, pid: Any) -> list[int]:
+        """The processes `pid` started, and theirs, read from
+        /proc/<pid>/task/<tid>/children; [] where /proc does not say (macOS,
+        a kernel without the file, a process gone).
+
+        A cell's server can hand the card to a child: Strata's server.py runs
+        its engine as one. The card's memory was the child's, so the board
+        found none for the cell and called it a CPU cell, with 31 GB of VRAM
+        in use (2026-10-13). The controller binds the card to these too
+        (lama-caravan reads them as the cell's `pids`)."""
+        try:
+            root = int(pid)
+        except (TypeError, ValueError):
+            return []
+        if root <= 1:
+            return []
+        found: list[int] = []
+        todo = [root]
+        while todo and len(found) < cls.TREE_LIMIT:
+            parent = todo.pop(0)
+            tasks = cls.PROC / str(parent) / "task"
+            try:
+                files = sorted(tasks.glob("*/children"))
+            except OSError:
+                continue
+            for children in files:
+                try:
+                    kids = [int(x) for x in children.read_text().split()]
+                except (OSError, ValueError):
+                    continue
+                for kid in kids:
+                    if kid != root and kid not in found and len(found) < cls.TREE_LIMIT:
+                        found.append(kid)
+                        todo.append(kid)
+        return found
 
     @staticmethod
     def marker_matches(marker: str, cmdline: str) -> bool:

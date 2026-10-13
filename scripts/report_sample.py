@@ -32,7 +32,7 @@ from _scout_harness import TMP, make_scout, patched  # noqa: E402
 
 import caravan_scout.report as report_module  # noqa: E402
 from caravan_scout.engines import LmStudio, Ollama  # noqa: E402
-from caravan_scout.process import CellProcess  # noqa: E402
+from caravan_scout.process import CellProcess, HostProcesses  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -171,8 +171,10 @@ class ReportSample:
                 patched(scout.driver, facts=lambda: json.loads(json.dumps(self.DRIVER))), \
                 patched(scout.cells.probe, metrics=lambda port: dict(self.VLLM_METRICS if port == 22012
                                                                       else self.METRICS if port == 22001
-                                                                      else {})), \
+                                                                      else {}),
+                        props=lambda port: {"total_slots": 4} if port == 22001 else {}), \
                 patched(CellProcess, pid_alive=staticmethod(lambda pid: pid in (4242, 4343, 4444))), \
+                patched(HostProcesses, PROC=self.process_tree()), \
                 patched(socket, gethostname=lambda: "box-a.lan"), patched(time, time=lambda: float(self.NOW)), \
                 patched(sys, platform="linux"), patched(report_module, APP_VERSION=self.VERSION), \
                 patched(scout.engines, ask=lambda port, host="127.0.0.1":
@@ -192,6 +194,16 @@ class ReportSample:
                 queued.pop()()
                 scout.engines.act("unload", "ollama", 11434, "qwen3:8b")
             return {"heartbeat": scout.report.heartbeat(), "state": scout.report.public()}
+
+    def process_tree(self) -> Path:
+        """/proc as the sample shows it, the same on every machine: the vLLM
+        cell's server (4343) runs its engine as a child (4345) — the cell's
+        `pids` (2.31); the others start none."""
+        root = TMP / "sample-proc"
+        children = root / "4343" / "task" / "4343" / "children"
+        children.parent.mkdir(parents=True, exist_ok=True)
+        children.write_text("4345 ", encoding="utf-8")
+        return root
 
     def text(self) -> str:
         return json.dumps(self.build(), ensure_ascii=False, indent=2, sort_keys=True) + "\n"

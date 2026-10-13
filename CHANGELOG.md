@@ -1,5 +1,124 @@
 # Changelog
 
+## 2.31.0 — 2026-10-13
+
+- **A command cell keeps its models as the controller asks.** The scout
+  forced `cacheModels` on for every command cell — "nothing it runs is
+  downloadable" stopped being true with the transcribe runner. Now it does what
+  the controller asks, as a llama cell does: kept, a model is written to the
+  disk once; not kept, every start downloads it and every stop deletes it — a
+  scout starts an engine only from its own disk, so "no cache" writes the
+  whole model again at every start (the owner keeps them for the disks' sake,
+  2026-10-13). Without a cache the stop's purge takes model folders too (2.30
+  fetched them and never let them go), and what is being downloaded right now
+  is never purged: a stop on one port deleted the `.tmp` a start on another
+  was still filling.
+- **A command cell starts in the background.** Its start ran on the request,
+  download included, while the controller waits 10 s for the answer — a model
+  of any size answered "timed out" while the scout went on downloading it. It
+  answers `starting` at once now, as a llama cell does, and reports its phases;
+  a stop before or during the download cancels the start (no process, no
+  record). The firewall opens only after the request is accepted.
+- **The files a cell reads, and all their parts.** The controller names the
+  files a command cell reads (`modelFiles`, lama-caravan 1.3.512): Strata reads
+  its weights and its draft layer. The first part of a split GGUF brings the
+  others — the scout fetched only the first, and the engine stopped at the
+  second: Strata's model is 68 GB in two parts. A running cell holds every
+  part, so a neighbour's purge leaves them alone.
+- **A scratch folder per cell.** `CARAVAN_CELL_SCRATCH` names a folder under
+  the cache for what a cell makes from its model (Strata builds its pack
+  there). It lives as the cell's models live: kept with them, so a start of the
+  same model uses what the last one made instead of writing 2.3 GB again;
+  emptied at the start and removed at the stop when they are not kept.
+- **A cell's child processes (`pids`).** A running cell's view names the
+  processes its server started, and theirs (`/proc/<pid>/task/*/children`).
+  Strata's server runs its engine as a child, and the card's 31 GB were the
+  child's: the board found no memory for the cell and called it a CPU cell.
+  The controller binds the card by these too (lama-caravan 1.3.512).
+
+## 2.30.0 — 2026-10-12
+
+- **A folder model comes through the controller.** A checkpoint, a whisper
+  cache, seamless, a robot policy: a folder model this machine lacked was
+  refused ("a folder cannot be downloaded"), so it ran only where the folder
+  already sat. Now the scout asks the controller for the folder's listing
+  (`GET /api/models/folder`, lama-caravan 1.3.509), takes each file the way it
+  takes a model file and makes the folder's links again (a Hugging Face cache:
+  snapshots/ → blobs/). The scout reads the caravan's models only through the
+  controller — the owner, 2026-10-12: no machine with a scout gets rights to
+  the share they live on. The files gather in `<folder>.part`, the folder takes
+  its name when all are in, `.caravan-folder.json` last; a fetch cut short
+  resumes, and a folder the scout did not download is never replaced. A path or
+  a link in the listing that leaves the folder is refused.
+
+## 2.29.0 — 2026-10-12
+
+- **A model's places.** Each model of the machine's entry says how many
+  requests its running copies take at once (`slots` — llama-server's
+  `total_slots` of /props) and how many they work on now (`busy` — /metrics,
+  the count a copy is picked by), each copy its own and the model their sum:
+  0 when none runs, `null` when one of them does not say (the caravan's own
+  cells, vLLM). The controller queues a model's requests by them, as it queues
+  a cell's by its /slots, so a busy model gives way to a pool's next row
+  (step 2 of the owner's plan). The places are asked only of running copies;
+  /props is read once for the window and the places (kept 30 s).
+
+## 2.28.0 — 2026-10-12
+
+- **The machine's models in both reports.** The heartbeat and `/api/state`
+  carry `entryModels`: the machine's models exactly as `GET /v1/models` lists
+  them — the name, the state, the copies. A controller names a model of this
+  machine by the name the entry's clients use (step 2 of the owner's plan:
+  the machine as a provider, a pool's row "machine + model"). `null` when the
+  scout does not know them.
+
+## 2.27.0 — 2026-10-12
+
+- **The machine's entry by OpenAI's API.** The models of this machine at one
+  address: `GET /v1/models` lists every cell the scout runs, starts or keeps
+  a start request for, by its model's name, and a POST under `/v1` that names
+  a model in `model` goes to a running cell of it — the answer relayed as it
+  comes, a stream as a stream. Step 1 of the owner's plan (2026-10-12): a
+  model is called by its name, not by its port.
+  - The name: `MODEL_NAME` (the operator's), else `ALIAS`, else one made of
+    its model, else `cell-<port>`. A start gives it at once — a model being
+    loaded is found as `starting` — and the cell's record keeps it.
+  - Two cells of one model are its copies: a request goes to the one with
+    the fewest requests in work, equal ones in turn.
+  - `model` reaches the cell in its own words when its server answers to
+    other names: the scout asks a running cell's `/v1/models` once per start
+    (vLLM refuses a name it does not serve).
+  - Refusals in OpenAI's shape: 400 no `model` (or a body that cannot be
+    read), 404 `model_not_found`, 503 `model_not_running`, 502
+    `cell_unreachable`, 413 over 256 MiB. A body sent in chunks is read too.
+  - Open like the cells; a cell's own port answers as before and stays the
+    spare way in. The client's `Authorization` does not reach a cell.
+
+## 2.26.0 — 2026-10-12
+
+- **A stopped cell stays on the board of a controller that did not start it.**
+  The scout drops a stopped cell from its report, and a controller shows a
+  stopped cell only from a record of its own. A controller moved to another
+  machine had no record of the cells the old one started, so on 2026-10-12
+  every cell of a machine went off the board as it was stopped — with its
+  switch, and with the kanban's cable to it. Both reports now carry
+  `autostartRequests`: the start request kept for each autostart cell, by
+  port — `{config, modelPath, cacheModels}`, the settings whole (an empty
+  value is a flag taken off). The controller keeps a record of each cell it
+  lacks from it (lama-caravan 1.3.504).
+
+## 2.25.1 — 2026-10-10
+
+- **The card through kernel updates under Secure Boot.** A guard for the
+  machine, outside the scout: `scripts/install-nvidia-kernel-guard.sh` (as
+  root). After the automatic updates every installed kernel gets the
+  Canonical-signed modules of the machine's NVIDIA driver series, and GRUB
+  boots the newest kernel that has them — a kernel installed without them is
+  not booted. Apt gets `--force-confdef --force-confold`, so
+  unattended-upgrade finishes a driver series move instead of skipping it on
+  a false conffile prompt: on 2026-10-09 it skipped 610 -> 615 and installed
+  the kernel anyway, and the next boot had no card. See docs/operations.md.
+
 ## 2.25.0 — 2026-10-07
 
 - **Why there are no cards, in nvidia-smi's words.** When nvidia-smi names no

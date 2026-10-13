@@ -258,8 +258,10 @@ def test_public_state():
     check(sorted(state) == sorted(["service", "scoutVersion", "prismRuntime", "llamaBinaryVersion", "llamaBinaryMtime", "llamaUpdate",
                                    "llamaSuspect", "telemetry", "host", "controllerUrl", "gpus", "gpuError",
                                    "computeApps", "engines", "cpu", "platform", "driver", "heartbeat", "llamaNode",
-                                   "llamaNodes", "autostart", "time"]),
+                                   "llamaNodes", "autostart", "autostartRequests", "entryModels", "time"]),
           "ровно эти поля — только машина: ни агентов, ни найденных VM, ни назначений")
+    check(state.get("entryModels") == [] and state["entryModels"] == scout.entry.listing()["data"],
+          "модели машины (2.28) — ровно список входа GET /v1/models; ячеек нет — пустой список")
     check(state.get("engines", "absent") is None,
           "negative: движки ещё не искали — None («не смотрели»), а не [] («смотрели, нет») (2.12)")
     check(state["host"] == {"id": "box-a", "name": "Box A", "hostname": "box-a.lan", "ip": "10.0.0.5"},
@@ -290,7 +292,8 @@ def test_heartbeat_payload():
     check(sorted(payload) == sorted(["prismRuntime", "host", "gpus", "gpuError", "computeApps", "engines", "cpu", "platform",
                                      "driver", "llamaNode",
                                      "llamaNodes", "llamaBinaryVersion", "llamaBinaryMtime", "llamaUpdate",
-                                     "llamaSuspect", "telemetry", "scoutVersion", "autostart", "agentUrl", "time"]),
+                                     "llamaSuspect", "telemetry", "scoutVersion", "autostart", "autostartRequests", "entryModels",
+                                     "agentUrl", "time"]),
           "ровно эти поля — только машина")
     check(payload["agentUrl"] == "http://10.0.0.5:18099", "адрес скаута — его IP и порт, на котором он слушает")
     check(payload.get("driver") == {"secureBoot": True, "kernelRunning": "7.0.0-31-generic"},
@@ -309,6 +312,30 @@ def test_heartbeat_payload():
     check(both == (reason, reason),
           f"почему карт нет (2.25) — в обоих отчётах одним именем, словами nvidia-smi (получено {both})")
     check(payload.get("gpuError") == "", "negative: карты названы — причины нет, пустая строка")
+
+
+def test_entry_models():
+    CHECKS.section("модели машины в отчётах (2.28):")
+    scout = make_scout()
+    cell = scout.cells.at(22001)
+    cell.name = "gemma"
+    with patched(cell.process, status=lambda: {"running": True}), \
+            patched(scout.cells.probe, metrics=lambda port: {"requestsProcessing": 0}, slots_total=lambda port: 2):
+        scout.state.setdefault("cells", {})["22001"] = {"port": 22001, "name": "gemma", "startedAt": 1000}
+        scout.autostart.set(22003, True, {"modelPath": "", "config": {"PORT": 22003, "ALIAS": "gigaam"}})
+        with _stub_probes(scout), patched(time, time=lambda: 1_700_000_000):
+            state, beat = scout.report.public(), scout.report.heartbeat()
+        listed = scout.entry.listing()["data"]
+    check([(m["id"], m["caravan"]["state"], m["caravan"]["slots"]) for m in state["entryModels"]]
+          == [("gemma", "running", 2), ("gigaam", "stopped", 0)]
+          and state["entryModels"] == listed and beat["entryModels"] == listed,
+          "обе формы отчёта несут список входа целиком: имя, состояние, копии — работающие и сохранённые для автозапуска; "
+          "контроллер зовёт модель машины тем же именем, что клиент входа")
+    bare = make_scout()
+    bare.report.entry_models = None
+    with _stub_probes(bare):
+        check(bare.report.public().get("entryModels", "absent") is None,
+              "negative: отчёт без списка входа говорит None («не знаю»), а не [] («моделей нет»)")
 
 
 def test_heartbeat_once():
@@ -585,7 +612,7 @@ def test_report_sample():
 
 
 for fn in (test_config, test_state, test_private_files, test_token, test_pairing, test_public_state, test_heartbeat_payload,
-           test_heartbeat_once, test_heartbeat_pace, test_unpair, test_local_ip, test_binary_version,
+           test_entry_models, test_heartbeat_once, test_heartbeat_pace, test_unpair, test_local_ip, test_binary_version,
            test_live_numbers, test_live_numbers_vllm, test_report_sample):
     fn()
 

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from caravan_scout.cell_assets import CellAssets
+from caravan_scout.entry import ModelName
 from caravan_scout.errors import AppError
 from caravan_scout.paths import (LLAMA_PATH_PLACEHOLDER_MMPROJ, LLAMA_PATH_PLACEHOLDER_MODEL,
                                  LLAMA_PATH_PLACEHOLDER_SPEC, SERVER_CELLS_DIR)
@@ -95,6 +96,10 @@ class CellStart:
 
     #: What a shell accepts as a variable name.
     ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+    #: The folder a command cell may fill with what it makes from its model
+    #: (ModelFetcher.scratch) — kept with the cell's models, emptied at its
+    #: start and removed at its stop when they are not kept.
+    SCRATCH_ENV = "CARAVAN_CELL_SCRATCH"
 
     def process_env(self) -> dict[str, str]:
         """The environment the cell starts with over this scout's own (`env`,
@@ -239,6 +244,7 @@ class LlamaStart(CellStart):
         if refusal:
             return refusal
         cell = self.cells.at(port)
+        cell.name = ModelName.of(config, model_path_raw, port)
 
         mmproj_raw = str(config.get("MMPROJ_FILE") or "").strip()
         spec_raw = str(config.get("SPEC_DRAFT_MODEL_FILE") or "").strip()
@@ -256,7 +262,7 @@ class LlamaStart(CellStart):
         self.open_firewall(port)
         launch = LlamaLaunch(self.cells, port, bin_path, config, model_path_raw,
                              mmproj_raw, spec_raw, cache_models, incoming_args,
-                             hints=self.hints(), env=env)
+                             hints=self.hints(), env=env, name=cell.name)
         threading.Thread(target=launch.run, daemon=True).start()
         return {"ok": True, "status": "starting", "phase": "resolving", "port": port}
 
@@ -270,9 +276,10 @@ class LlamaLaunch:
     def __init__(self, cells, port: int, bin_path: str, config: dict[str, Any],
                  model: str, mmproj: str = "", spec: str = "",
                  cache_models: bool = False, args: list[str] | None = None,
-                 hints: dict[str, Any] | None = None, env: dict[str, str] | None = None):
+                 hints: dict[str, Any] | None = None, env: dict[str, str] | None = None, name: str = ""):
         self.hints = dict(hints or {})   # where the controller reads each file
         self.env = dict(env or {})       # what the engine starts with (CellStart.process_env)
+        self.name = name                 # its model's name at the machine's entry (Cell.name), kept in its record
         self.cells = cells
         self.port = port
         self.bin_path = bin_path
@@ -437,7 +444,7 @@ class LlamaLaunch:
         if result.get("ok"):
             cells.report(port, phase="running", error="")
             cells.records.add(port, "llama", result.get("pid") or 0, bin_path,
-                              cfg, log_path, cache_models, launch=cell.process.launch_spec())
+                              cfg, log_path, cache_models, launch=cell.process.launch_spec(), name=self.name)
             # Manual snapshots only — no auto-save of launch params on start.
             # Caching on ⇒ keep only the active model (don't accumulate on disk).
             # Caching off ⇒ files get purged on stop anyway, no cleanup needed here.
@@ -453,13 +460,18 @@ class LlamaLaunch:
 
 
 class CommandStart(CellStart):
-    """A generic command cell (CELL_KIND="command"), started on the request.
+    """A generic command cell (CELL_KIND="command"): checked on the request,
+    launched in the background (CommandLaunch), as a llama cell is.
 
     Runs an arbitrary managed process (e.g. whisper-server) in the same
-    single-process cell as a llama node — no llama-server binary, and a model
-    only when the command names one. SECURITY: this executes a
+    single-process cell as a llama node — no llama-server binary, and the
+    model files the controller names. SECURITY: this executes a
     controller-supplied shell command on this host; only the trusted-LAN
     admin can reach this endpoint.
+
+    Until 2.31 all of it ran on the request, the download too: the
+    controller waits 10 s for the answer, so a model of any size answered
+    "timed out" while the scout went on downloading it.
     """
 
     def run(self) -> dict[str, Any]:
@@ -468,82 +480,169 @@ class CommandStart(CellStart):
                          str(payload.get("command") or config.get("COMMAND") or "").strip()).strip()
         if not command:
             raise AppError("command is required for a command cell", 400)
+        # The controller sends the whole start line — shell flags, exports,
+        # workdir, exec. This scout used to rebuild it from `command` plus the
+        # config, mirroring the controller's script renderer, and the mirror had
+        # already lost `set -euo pipefail`: one config, two behaviours depending
+        # on which host ran the cell. Refusing beats guessing — and refusing
+        # before the firewall opens: until 2.31 the port was opened for a cell
+        # that was then refused.
+        shell_line = str(payload.get("shellLine") or "").strip()
+        if not shell_line:
+            raise AppError(
+                "controller sent no shellLine for this command cell — it is older "
+                "than this agent (needs lama-caravan v1.3.115+)", 400)
+        files = self.model_files()
         env = self.process_env()
         port = self.port()
         refusal = self.busy(port) or self.short_of_vram(port)
         if refusal:
             return refusal
         cell = cells.at(port)
-
+        cell.name = ModelName.of(config, str(payload.get("modelPath") or ""), port)
+        # Its files stay or go as the controller asks, as a llama cell's do.
+        # Until 2.31 a command cell kept them always, whatever was asked —
+        # "nothing it runs is downloadable" stopped being true with the
+        # transcribe runner. Kept, a model is written to the disk once; not
+        # kept, every start writes it again (the owner keeps them, 2026-10-13).
+        cell.cache_models = bool(payload.get("cacheModels", cells.config.get("cacheModels", False)))
+        cells.report(port, phase="resolving", modelPath=files[0] if files else command[:80],
+                     downloadedBytes=0, totalBytes=0, error="", startedAt=int(time.time()))
         # Open the port in ufw so the admin/clients can reach the cell.
         self.open_firewall(port)
+        launch = CommandLaunch(cells, port, cell, command, shell_line, files, cell.cache_models,
+                               hints=self.hints(), env=env, name=cell.name,
+                               health_path=str(payload.get("healthPath") or "/health"))
+        threading.Thread(target=launch.run, daemon=True).start()
+        return {"ok": True, "status": "starting", "phase": "resolving", "port": port}
 
-        # The controller sends the whole start line — shell flags, exports,
-        # workdir, exec. This scout used to rebuild it from `command` plus the
-        # config, mirroring the controller's script renderer, and the mirror had
-        # already lost `set -euo pipefail`: one config, two behaviours depending
-        # on which host ran the cell. Refusing beats guessing.
-        shell_line = str(payload.get("shellLine") or "").strip()
-        if not shell_line:
-            raise AppError(
-                "controller sent no shellLine for this command cell — it is older "
-                "than this agent (needs lama-caravan v1.3.115+)", 400)
-        log_path = cells.models.cache_dir() / f"command-cell.{int(port)}.log"
-        # A command cell used to mean "no model, ever". The transcribe runner
-        # broke that: its model is a GGUF PATH like a llama cell's, and the
-        # command the controller sends names it under the models dir. So a
-        # download CAN be needed here — and without one the failure was quiet:
-        # the cell came up healthy on its port and only said "model file not
-        # found" inside its own log.
-        #
-        # modelPath is filled in for a second reason. The safe purge keeps the
-        # files of RUNNING cells by reading exactly this key; left empty, a
-        # cache purge deletes the weights out from under a running recognizer
-        # — the kind of bug that surfaces weeks later.
-        model_raw = str(config.get("MODEL_FILE") or "").strip()
-        model_abs = ""
-        if model_raw:
-            cells.report(port, phase="resolving", modelPath=model_raw,
-                         downloadedBytes=0, totalBytes=0, error="",
-                         startedAt=int(time.time()))
-            try:
-                model_abs = str(cells.models.ensure(model_raw, report=True,
-                                                    use_cache=True, port=port,
-                                                    hint=self.hints().get(model_raw)))
-            except Exception as exc:  # noqa: BLE001
+    def model_files(self) -> list[str]:
+        """The model files the command reads, as the controller names them:
+        `modelFiles` (lama-caravan 1.3.512 — the runner says which of its
+        fields are files: Strata reads its weights and its draft layer). An
+        older controller sends none, and MODEL_FILE is then the one file — the
+        only field a command runner had."""
+        sent = self.payload.get("modelFiles")
+        if sent is None:
+            one = str(self.config.get("MODEL_FILE") or "").strip()
+            return [one] if one else []
+        if not isinstance(sent, list) or not all(isinstance(f, str) and f.strip() for f in sent):
+            raise AppError("modelFiles must be a list of model paths", 400)
+        return [f.strip() for f in sent]
+
+
+class CommandLaunch:
+    """The slow half of a command cell's start, off the request thread: the
+    model files, the launcher's files from the controller, the cell's scratch
+    folder, the process and its record — or nothing, when the cell was
+    stopped meanwhile. run() answers what the process start answered, for
+    whoever runs it in the foreground (a test); the controller reads the
+    phases."""
+
+    #: What run() answers when the cell was stopped before its process ran.
+    CANCELLED = {"ok": False, "error": "the cell was stopped during its start"}
+
+    def __init__(self, cells, port: int, cell, command: str, shell_line: str, files: list[str],
+                 cache_models: bool, hints: dict[str, Any] | None = None,
+                 env: dict[str, str] | None = None, name: str = "", health_path: str = "/health"):
+        self.cells = cells
+        self.port = port
+        # The cell the request made: a stop drops it, so a later lookup on the
+        # port no longer returns it — the cancel token (Cells.holds). Taken
+        # here, not when the thread runs: a stop in between would otherwise
+        # be met by a fresh cell and missed.
+        self.cell = cell
+        self.command = command
+        self.shell_line = shell_line
+        self.files = list(files)
+        self.cache_models = cache_models
+        self.hints = dict(hints or {})
+        self.env = dict(env or {})
+        self.name = name
+        self.health_path = health_path
+
+    def fetch(self) -> list[str]:
+        """Each model file where this machine reads it — in place, in the
+        cache, or downloaded now. A command cell used to mean "no model,
+        ever"; the transcribe runner broke that, and without the download the
+        failure was quiet: the cell came up on its port and said "model file
+        not found" only in its own log."""
+        count = len(self.files)
+        return [str(self.cells.models.ensure(
+                    raw, report=True, report_label=f"{Path(raw).name} ({i + 1}/{count})" if count > 1 else "",
+                    use_cache=self.cache_models, port=self.port, hint=self.hints.get(raw)))
+                for i, raw in enumerate(self.files)]
+
+    def run(self) -> dict[str, Any]:
+        cells, port, cell = self.cells, self.port, self.cell
+        if not cells.holds(port, cell):
+            print(f"[llama-node] :{port} start cancelled — the cell was stopped before it began")
+            return dict(self.CANCELLED)
+        try:
+            held = self.fetch()
+        except Exception as exc:  # noqa: BLE001
+            if cells.holds(port, cell):
                 cells.report(port, phase="error", error=str(exc))
-                return {"ok": False, "error": f"model not available: {exc}"}
-        cfg = {"modelPath": model_abs, "port": port, "cellKind": "command", "command": command}
-        # Whatever else a command cell runs is not downloadable, so its cache is
-        # never purged on stop.
-        cell.cache_models = True
-        cells.report(port, phase="loading", modelPath=command[:80],
-                     downloadedBytes=0, totalBytes=0, error="",
-                     startedAt=int(time.time()))
+            return {"ok": False, "error": f"model not available: {exc}"}
+        if not cells.holds(port, cell):
+            print(f"[llama-node] :{port} start cancelled — the cell was stopped mid-download")
+            return dict(self.CANCELLED)
+        # modelPath is filled in for a second reason: the safe purge keeps the
+        # files of RUNNING cells by reading it (and `files`, the rest of them);
+        # left empty, a purge deletes the weights out from under a running
+        # cell — the kind of bug that surfaces weeks later.
+        model_raw = self.files[0] if self.files else ""
+        model_abs = held[0] if held else ""
+        cfg: dict[str, Any] = {"modelPath": model_abs, "port": port, "cellKind": "command",
+                               "command": self.command}
+        if len(held) > 1:
+            cfg["files"] = held[1:]
+        cells.report(port, phase="loading", modelPath=self.command[:80],
+                     downloadedBytes=0, totalBytes=0, error="", startedAt=int(time.time()))
+        log_path = cells.models.cache_dir() / f"command-cell.{int(port)}.log"
         # The controller owns the cell servers; pick up its current copy before
         # running the launcher this command names. Never fatal — see CellAssets.
         try:
             synced = CellAssets(
                 str(cells.config.get("controllerUrl") or ""),
                 cells.config.headers(),
-                log=lambda m: print(f"[llama-node] {m}")).sync(command)
+                log=lambda m: print(f"[llama-node] {m}")).sync(self.command)
             if synced:
                 print(f"[llama-node] cell-assets :{port} — " +
                       ", ".join(f"{k}={v}" for k, v in synced.items()))
         except Exception as exc:  # noqa: BLE001
             print(f"[llama-node] cell-assets :{port} skipped ({exc})")
-        result = cell.process.start_command(shell_line, cfg, log_path=log_path,
-                                            extra_env={**env, **self.models_root(model_raw, model_abs)})
+        # What the cell makes from its model (Strata builds its pack and its
+        # draft layer there). It lives as the cell's models do: kept with them,
+        # so a start of the same model uses what the last one made instead of
+        # writing it again; emptied at the start when they are not kept.
+        try:
+            if not self.cache_models:
+                cells.models.clear_scratch(port)
+            scratch = cells.models.scratch(port)
+            scratch.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            cells.report(port, phase="error", error=str(exc))
+            return {"ok": False, "error": str(exc)}
+        env = {**self.env, **CellStart.models_root(model_raw, model_abs), CellStart.SCRATCH_ENV: str(scratch)}
+        result = cell.process.start_command(self.shell_line, cfg, log_path=log_path, extra_env=env)
+        if result.get("ok") and not cells.holds(port, cell):
+            print(f"[llama-node] :{port} stopped during startup — terminating the fresh process")
+            try:
+                cell.process.stop()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[llama-node] :{port} cleanup stop failed: {exc}")
+            return dict(self.CANCELLED)
         cells.report(port, phase="running" if result.get("ok") else "error",
                      error="" if result.get("ok") else (result.get("error") or "start failed"))
         if result.get("ok"):
             # Marker for re-adoption: the exec'd command line with $PORT expanded
             # (the shell resolves it before exec, so ps shows the resolved form).
-            marker = command.replace("$PORT", str(port)).replace("~/", "")[:120]
+            marker = self.command.replace("$PORT", str(port)).replace("~/", "")[:120]
             cells.records.add(port, "command", result.get("pid") or 0, marker,
-                              cfg, log_path, cell.cache_models,
-                              health_path=str(payload.get("healthPath") or "/health"),
-                              launch=cell.process.launch_spec())
+                              cfg, log_path, self.cache_models,
+                              health_path=self.health_path,
+                              launch=cell.process.launch_spec(), name=self.name)
         return result
 
 

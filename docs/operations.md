@@ -53,7 +53,9 @@ systemctl --user restart caravan-scout.service   # or launchctl kickstart
 ```
 
 A restart does **not** stop the host's cells: the fresh scout re-adopts every
-cell in its registry (see below). What it does terminate at start is a
+cell in its registry (see below). It does cut the requests going through the
+machine's entry (`:8092/v1`, 2.27) — a cell's own port is the way that a
+restart does not touch. What it does terminate at start is a
 llama-server that a scout started and that is in no record — an orphan
 holding a GPU and a port (`Cells.reap_strays`). Every cell the scout starts
 carries `CARAVAN_SCOUT_CELL=<port>` in its environment; a process without it
@@ -81,6 +83,40 @@ and `state.json` (the cells' start requests and launches). Before 2.20 the
 machine's umask made them 0664; since 2.20.1 the scout narrows them to 0600
 when it starts (config.json is otherwise written only when the scout is
 paired).
+
+## The NVIDIA card through kernel updates (Secure Boot)
+
+Under Secure Boot the card's kernel module loads only when it is signed by a
+key the firmware trusts — Canonical's, shipped per kernel as
+`linux-modules-nvidia-<series>[-open]-<kernel>`. A DKMS build is signed by the
+machine's own key, never enrolled, and the kernel refuses it. The automatic
+updates have installed a kernel without those modules three times, and the
+next boot came up without the card: a driver update that dropped its signed
+companion, a modules package whose driver was in a pocket the updates were not
+allowed, and — 2026-10-09 — a move of the driver from series 610 to 615 by
+renamed packages: unattended-upgrade read the conffile the new
+`nvidia-kernel-common` takes over from the old one as a prompt and skipped the
+series, but not the kernel it installed in the same run.
+
+`scripts/install-nvidia-kernel-guard.sh` (as root) puts a guard in the way:
+
+- `Dpkg::Options --force-confdef --force-confold` for apt
+  (`/etc/apt/apt.conf.d/53unattended-upgrades-dpkg-options`), so
+  unattended-upgrade does not skip a package for a conffile prompt —
+  `dpkg_conffile_prompt()` in `/usr/bin/unattended-upgrade` — and finishes a
+  driver series move by itself;
+- `nvidia-kernel-guard modules` after the automatic updates (an
+  `ExecStartPost` of `apt-daily-upgrade.service`): every installed kernel gets
+  the signed modules of the machine's driver series when apt offers them;
+- `nvidia-kernel-guard boot` after every dpkg run (an APT `DPkg::Post-Invoke`
+  hook): GRUB (`GRUB_DEFAULT=saved`) boots the newest kernel that has the
+  module of that series — when the newest has none, the newest older one that
+  has. A module of another series counts as none: under the new series'
+  libraries it is a "Driver/library version mismatch".
+
+`nvidia-kernel-guard status` (as root, it reads grub.cfg) says what the two
+would do. `--uninstall` takes it all away and puts `/etc/default/grub` back.
+Its messages are in the journal: `journalctl -t nvidia-kernel-guard`.
 
 ## Known quirks
 
@@ -120,9 +156,20 @@ paired).
 - **`sudo -n ufw allow <port>`** on cell start is best-effort: without
   passwordless sudo the port silently stays closed to the LAN.
 - **`cacheModels=false` (default)**: models re-download on every start and are
-  purged on stop; with caching on they stay. `cleanOldModels=true` (off by
-  default) removes the other cached models after a start, keeping what the
-  running cells hold.
+  purged on stop — files and model folders, a command cell's too (2.31; it kept
+  them always); with caching on they stay, and a model is written to the disk
+  once. An engine starts only from a file on this machine's disk, so without a
+  cache every start writes the whole model again. A download under way is
+  never purged. `cleanOldModels=true` (off by default) removes the other cached
+  models after a start, keeping what the running cells hold.
+- **A command cell starts in the background (2.31)** and answers `starting` at
+  once, as a llama cell does: its files arrive while the board shows the
+  `downloading` phase. A stop before or during the download cancels the start.
+  It reads the files the controller names (`modelFiles`); the first part of a
+  split GGUF brings the other parts, and a running cell holds all of them.
+  `CARAVAN_CELL_SCRATCH` names its scratch folder (`<cache>/.cells/<port>`):
+  kept with the cell's models; emptied at the start and removed at the stop
+  when they are not kept.
 - **A crashed cell comes back (2.5+).** A cell that dies without being
   stopped — a non-zero exit, or gone while adopted — is launched again the same
   way 10 s later (the launch its record keeps, also after a scout restart), at
@@ -185,16 +232,27 @@ paired).
   so a scout restart or update in the same boot starts nothing, as systemd's
   `enable` does. A machine that will not say which boot it is (no
   `/proc/sys/kernel/random/boot_id`, no `sysctl kern.boottime`) gets no
-  autostart, and the log says so.
+  autostart, and the log says so. Both reports carry the kept requests
+  (`autostartRequests`, 2.26): a controller that did not start a cell — one
+  moved to another machine — keeps a record of it from them, and the cell
+  stays on its board when it stops.
 - **Models are read in place when this machine has them.** The controller
   says where it reads each model file (`inPlace` in the start request). The
   scout on the controller's own machine, or one that mounts a library at the
   same path, reads the file there — the same size, or it is another file —
   instead of copying it into its cache; a look at a path that does not answer
-  in 3 s (a dead NFS mount) counts as absent. A library's file or a folder
-  model (seamless) that this machine lacks is refused with what to do. A
-  command cell gets `LLAMA_MODELS_DIR` pointing where its model really is — in
-  place or in the cache; a value set in the cell's config wins.
+  in 3 s (a dead NFS mount) counts as absent. A library's file that this
+  machine lacks is refused with what to do. A command cell gets
+  `LLAMA_MODELS_DIR` pointing where its model really is — in place or in the
+  cache; a value set in the cell's config wins.
+- **A folder model comes through the controller too (2.30).** A checkpoint, a
+  whisper cache, seamless: the scout asks the controller for the folder's
+  listing (`GET /api/models/folder`) and takes each file the way it takes a
+  model file, then makes the folder's links again. The files gather in
+  `<folder>.part`; the folder takes its name when all of them are in, with
+  `.caravan-folder.json` written last. A fetch cut short is resumed: a file
+  already of its size is kept. A folder the scout did not download is never
+  replaced. No machine with a scout needs rights to the share the models live on.
 - **The scout deletes only what it downloaded.** Each download is written down
   in `.caravan-downloads.json` in the cache; the purge, the old-model cleanup
   and the corrupt-model retry delete only those files. A cache dir set to a

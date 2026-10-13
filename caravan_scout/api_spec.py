@@ -23,7 +23,7 @@ class ApiSpec:
     OPENAPI = "3.1.0"
     NOT_DESCRIBED = "Not described yet."
     TOKEN_HEADER = "X-Caravan-Token"
-    JSON, HTML = "application/json", "text/html"
+    JSON, HTML, FORM, STREAM = "application/json", "text/html", "multipart/form-data", "text/event-stream"
     SCHEME = "fleetToken"
     ABOUT = ("The API of caravan-scout, the sidecar of a machine in a LAMA CARAVAN fleet: the controller drives "
              "the machine's cells, engines and llama.cpp build through it. Written from the table the scout "
@@ -31,7 +31,17 @@ class ApiSpec:
              "of answers are not described yet.")
     SECURITY = ("The fleet token the controller hands a scout when the operator adds it on the board "
                 "(`controllerToken` in config.json), sent as X-Caravan-Token. A scout that holds none is open, as a "
-                "trusted LAN is; the page, /api/pairing, /api/health and this document are open either way.")
+                "trusted LAN is; the page, /api/pairing, /api/health, this document and the machine's entry (/v1) "
+                "are open either way.")
+    #: A refusal of the machine's entry: OpenAI's own shape, which its clients read.
+    OPENAI_ERROR = {"type": "object", "required": ["error"],
+                    "properties": {"error": {"type": "object", "required": ["message", "type"],
+                                             "properties": {"message": {"type": "string"}, "type": {"type": "string"},
+                                                            "param": {"type": ["string", "null"]},
+                                                            "code": {"type": ["string", "null"]}}}},
+                    "description": "A refusal of the machine's entry, in OpenAI's shape: 400 no `model` or a body "
+                                   "that cannot be read, 404 `model_not_found`, 413, 502 `cell_unreachable`, 503 "
+                                   "`model_not_running`."}
 
     def __init__(self, routes: list[Route], version: str) -> None:
         self.routes = routes
@@ -59,7 +69,8 @@ class ApiSpec:
                 "schemas": {"Error": {"type": "object", "required": ["error"],
                                       "properties": {"error": {"type": "string"}},
                                       "description": "A refusal or a failure: the status is the scout's own "
-                                                     "(400 a bad request, 404, 409…), or 500 for what it did not expect."}},
+                                                     "(400 a bad request, 404, 409…), or 500 for what it did not expect."},
+                            "OpenAIError": self.OPENAI_ERROR},
             },
         }
 
@@ -68,9 +79,12 @@ class ApiSpec:
         if route.description:
             op["description"] = route.description
         op["security"] = [] if route.needs_no_token else [{self.SCHEME: []}]
-        if route.query:
-            op["parameters"] = [{"name": name, "in": "query", "required": False,
-                                 "schema": {"description": self.NOT_DESCRIBED}} for name in route.query]
+        params = [{"name": name, "in": "path", "required": True, "schema": {"type": "string"}, "description": said}
+                  for name, said in route.params.items()]
+        params += [{"name": name, "in": "query", "required": False,
+                    "schema": {"description": self.NOT_DESCRIBED}} for name in route.query]
+        if params:
+            op["parameters"] = params
         if route.method == "POST" and route.kind == Route.OWN:
             # Answered by the handler itself: it reads the body ahead of the token
             # gate, and the fleet token may ride in the body instead of the header.
@@ -79,6 +93,9 @@ class ApiSpec:
             schema: dict[str, Any] = {"type": "object",
                                       "properties": {name: {"description": self.NOT_DESCRIBED} for name in route.body}}
             content: dict[str, Any] = {self.JSON: {"schema": schema}}
+            if route.entry:
+                # A recording comes as a form, its `model` a field of it, as OpenAI's API takes it.
+                content[self.FORM] = {"schema": schema}
             op["requestBody"] = {"required": False, "content": content}
             if route.body_more:
                 op["x-caravan-fields-complete"] = False
@@ -86,6 +103,8 @@ class ApiSpec:
         return op
 
     def responses(self, route: Route) -> dict[str, Any]:
+        if route.entry:
+            return self.entry_responses(route)
         if route.page:
             ok: dict[str, Any] = {"description": "The page.", "content": {self.HTML: {"schema": {"type": "string"}}}}
         else:
@@ -100,6 +119,20 @@ class ApiSpec:
                           "content": {self.JSON: {"schema": {"$ref": "#/components/schemas/Error"}}}}
         out["default"] = failure
         return out
+
+    def entry_responses(self, route: Route) -> dict[str, Any]:
+        """The machine's entry answers as OpenAI's API does: its list or model, a cell's answer as the
+        cell gave it (a stream as `text/event-stream`), refusals in OpenAI's error shape — never a 401."""
+        refusal = {"description": "A refusal in OpenAI's shape: `{error: {message, type, param, code}}`.",
+                   "content": {self.JSON: {"schema": {"$ref": "#/components/schemas/OpenAIError"}}}}
+        if route.method == "GET":
+            ok = {"description": "The answer, in OpenAI's shape. " + self.NOT_DESCRIBED,
+                  "content": {self.JSON: {"schema": {"description": self.NOT_DESCRIBED}}}}
+        else:
+            ok = {"description": "The cell's answer, as the cell gave it: JSON, or a stream of server-sent events.",
+                  "content": {self.JSON: {"schema": {"description": "The cell's own."}},
+                              self.STREAM: {"schema": {"type": "string"}}}}
+        return {"200": ok, "default": refusal}
 
     @staticmethod
     def operation_id(route: Route) -> str:
@@ -118,7 +151,8 @@ class ApiReference:
     """
 
     ACCESS = {Route.PAGE: "open", Route.PUBLIC: "open", Route.GET: "fleet token", Route.QUERY: "fleet token",
-              Route.POST: "fleet token", Route.OWN: "fleet token, in the header or the body"}
+              Route.POST: "fleet token", Route.OWN: "fleet token, in the header or the body",
+              Route.ENTRY: "open — the machine's entry by OpenAI's API"}
     START, END = "<!-- api-reference:{name}:start -->", "<!-- api-reference:{name}:end -->"
     HEAD = "| Path | Access | Purpose |\n|---|---|---|\n"
 

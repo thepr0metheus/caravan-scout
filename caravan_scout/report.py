@@ -24,8 +24,10 @@ class Report:
     """
 
     def __init__(self, config, state, machine, cells, builds, autostart, suspect, telemetry, identity=None,
-                 engines=None, driver=None):
+                 engines=None, driver=None, entry_models=None):
         self.config = config
+        # The machine's models as its entry lists them (2.28, entry.MachineModels).
+        self.entry_models = entry_models
         # The NVIDIA driver as the next boot will meet it (2.19).
         self.driver = driver
         # Ollama, LM Studio on this machine (2.12): their last scan.
@@ -50,6 +52,8 @@ class Report:
         driver = self.driver.facts() if self.driver else None
         # Before the state's lock: the verdict takes it itself.
         suspect = self.suspect.verdict(version)
+        # Before the lock too, like the machine's probes: the list asks each cell's process.
+        models = self.entry_models.listing() if self.entry_models else None
         with self.state.lock:
             return {
                 "service": "caravan-scout",
@@ -94,6 +98,13 @@ class Report:
                 # The ports that start with the machine — stopped ones too:
                 # the board shows ↟ on a parked cell as well.
                 "autostart": self.autostart.ports(),
+                # The start request kept for each of them (2.26): a controller
+                # that did not start a cell keeps its record from it, so the
+                # cell stays on its board when it stops.
+                "autostartRequests": self.autostart.requests(),
+                # The machine's models as GET /v1/models lists them (2.28): a controller
+                # names a model of this machine by its name, as a client of the entry does.
+                "entryModels": models,
                 "time": int(time.time()),
             }
 
@@ -153,6 +164,8 @@ class Report:
             "scoutVersion": state["scoutVersion"],
             "prismRuntime": state["prismRuntime"],
             "autostart": state["autostart"],
+            "autostartRequests": state["autostartRequests"],
+            "entryModels": state["entryModels"],
             "agentUrl": f"http://{state['host']['ip']}:{self.config.get('listenPort')}",
             "time": state["time"],
         }

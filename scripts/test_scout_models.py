@@ -561,6 +561,108 @@ def test_purge_models_safely():
     check(res == {"removed": 5, "freedBytes": 29}, "negative: работающих ячеек нет — удаляется всё")
 
 
+def test_split_gguf_parts():
+    from caravan_scout.models import SplitGguf
+    check(SplitGguf("org/big-00001-of-00003.gguf").parts()
+          == ["org/big-00001-of-00003.gguf", "org/big-00002-of-00003.gguf", "org/big-00003-of-00003.gguf"],
+          "первая часть из трёх — все три части по имени, первая первой")
+    check(SplitGguf("/c/org/big-00002-of-00003.gguf").parts() == ["/c/org/big-00002-of-00003.gguf"],
+          "negative: вторая часть, названная сама, — только она")
+    check(SplitGguf("org/model-q4.gguf").parts() == ["org/model-q4.gguf"], "negative: целый файл — только он")
+    check(SplitGguf("m-00001-of-00001.gguf").parts() == ["m-00001-of-00001.gguf"],
+          "boundary: «часть 1 из 1» — один файл")
+    check(SplitGguf("org/notes-00001-of-00002.txt").parts() == ["org/notes-00001-of-00002.txt"],
+          "negative: не GGUF — не части")
+    check(SplitGguf("org/M-00001-OF-00002.GGUF").parts() == ["org/M-00001-OF-00002.GGUF", "org/M-00002-OF-00002.GGUF"],
+          "написание имени сохранено целиком: первая часть — тот самый путь")
+
+
+SPLIT_1, SPLIT_2 = "models/org/big-00001-of-00002.gguf", "models/org/big-00002-of-00002.gguf"
+SPLIT = {SPLIT_1: b"GGUF part one", SPLIT_2: b"GGUF part two"}
+
+
+def test_ensure_split_parts():
+    def asked(rig):
+        return [urllib.parse.unquote(c["url"].split("path=", 1)[1]) for c in rig.web.calls]
+
+    s = make_scout({"controllerUrl": CONTROLLER})
+    with Rig(web=models_served(SPLIT)) as rig:
+        got, err = attempt(lambda: s.models.ensure(SPLIT_1, report=True, port=22310))
+    cache = s.models.cache_dir()
+    second = cache / SPLIT_2
+    check(err is None and got == cache / SPLIT_1 and second.is_file() and second.read_bytes() == b"GGUF part two",
+          "defect-history: первая часть разбитого GGUF приносит вторую — обе в кэше рядом; до 2.31 качалась "
+          "только названная первая, и движок останавливался на второй")
+    check(asked(rig) == [SPLIT_1, SPLIT_2], "части качаются по порядку: первая, потом вторая")
+    check(sorted(written_down(s)) == sorted([SPLIT_1, SPLIT_2]), "обе записаны как скачанные — чистка уберёт обе")
+    check(s.cells.startup(22310).get("downloadingFile") == "big-00002-of-00002.gguf (2/2)",
+          "прогресс второй части подписан номером «(2/2)»")
+
+    s = make_scout({"controllerUrl": CONTROLLER})
+    with Rig(web=models_served(SPLIT)) as rig:
+        got, err = attempt(lambda: s.models.ensure(SPLIT_2, report=False))
+    check(err is None and asked(rig) == [SPLIT_2], "negative: названа вторая часть — качается только она")
+
+    lib = TMP / "lib-split"
+    lay(lib, {"org/big-00001-of-00002.gguf": SPLIT[SPLIT_1], "org/big-00002-of-00002.gguf": SPLIT[SPLIT_2]})
+    first = lib / "org" / "big-00001-of-00002.gguf"
+    hint = {"path": str(first), "size": len(SPLIT[SPLIT_1])}
+    s = make_scout({"controllerUrl": CONTROLLER})
+    with Rig(web=models_served(SPLIT)) as rig:
+        got, err = attempt(lambda: s.models.ensure(SPLIT_1, report=False, hint=hint))
+    check(err is None and got == first and rig.web.calls == [],
+          "первая часть на месте, вторая рядом — обе читаются на месте, ничего не скачано")
+    (lib / "org" / "big-00002-of-00002.gguf").unlink()
+    s = make_scout({"controllerUrl": CONTROLLER})
+    with Rig(web=models_served(SPLIT)) as rig:
+        got, err = attempt(lambda: s.models.ensure(SPLIT_1, report=False, hint=hint))
+    check(err_is(err, 409, f"big-00001-of-00002.gguf is read at {lib / 'org'}, but its part "
+                           "big-00002-of-00002.gguf is not there") and rig.web.calls == [],
+          "negative: первая на месте, второй рядом нет — отказ 409 с именем части; скачанная в кэш, "
+          "она лежала бы там, где движок её не ищет")
+
+
+def test_purge_folders_and_flight():
+    def fresh():
+        s = make_scout()
+        cache = s.models.cache_dir()
+        lay(cache, {"seam/FP32/weights.bin": 6, "seam/FP32/.caravan-folder.json": 2, "whisper/x/blob": 3,
+                    MODEL: 10, "models/org/live.tmp": 4, "models/org/keep-inside/a.gguf": 5})
+        fetched(s, "seam/FP32", "whisper/x", MODEL, "models/org/live.tmp")
+        return s, cache
+
+    s, cache = fresh()
+    s.models._flying(cache / "models/org/live.tmp", True)
+    with Rig() as rig:
+        res, _ = attempt(lambda: s.models.purge(keep=[cache / "whisper/x"]))
+    check(res == {"removed": 2, "freedBytes": 18},
+          "очистка считает и папки: папка-модель (8 байт) и файл (10) — 2 удалено, 18 байт")
+    check(not (cache / "seam").exists(),
+          "defect-history: папка-модель, которую никто не держит, удалена (2.31) — с 2.30 она качалась на "
+          "каждую машину и не уходила никогда; опустевшая родительская папка убрана")
+    check((cache / "whisper/x/blob").exists(), "negative: папка, которую держит работающая ячейка, цела")
+    check((cache / "models/org/live.tmp").exists() and "models/org/live.tmp" in written_down(s),
+          "negative: файл, который качается сейчас, не удалён — остановка одной ячейки срывала загрузку другой")
+    check((cache / "models/org/keep-inside/a.gguf").exists(), "negative: файл, которого скаут не скачивал, цел")
+    s.models._flying(cache / "models/org/live.tmp", False)
+    with Rig():
+        res, _ = attempt(lambda: s.models.purge(keep=[cache / "whisper/x"]))
+    check(res == {"removed": 1, "freedBytes": 4} and not (cache / "models/org/live.tmp").exists(),
+          "загрузка кончилась (или сорвалась) — её .tmp уходит со следующей очисткой")
+
+    s, cache = fresh()
+    with Rig():
+        res, _ = attempt(lambda: s.models.purge(keep=[cache / "whisper/x/blob"]))
+    check((cache / "whisper/x/blob").exists() and not (cache / "seam").exists(),
+          "negative: папка, внутри которой лежит удерживаемый файл, цела")
+
+    s, cache = fresh()
+    with Rig():
+        attempt(lambda: s.models.cleanup_old([cache / MODEL]))
+    check((cache / "seam/FP32/weights.bin").exists() and (cache / "whisper/x/blob").exists(),
+          "negative: уборка старых моделей после старта (cleanOldModels) папки не трогает — только .gguf")
+
+
 def test_in_place():
     lib = TMP / "lib-in-place"
     lay(lib, {"org/model-q4.gguf": BODIES[MODEL], "seam/FP32/weights.bin": 3})
@@ -617,10 +719,11 @@ def test_in_place():
     folder = lib / "seam" / "gone"
     with Rig(web=models_served()) as rig:
         _, err = attempt(lambda: s.models.ensure("seam/gone", report=False, hint={"path": str(folder), "dir": True}))
-    check(err_is(err, 409, f"the model is a folder ({folder}) and this machine does not have it there — a folder "
-                           f"cannot be downloaded; put it there, or mount the library that holds it")
-          and rig.web.calls == [],
-          "модели-папки здесь нет — отказ 409: папку не скачать")
+    check(isinstance(err, AppError) and err.status == 502
+          and str(err).startswith("the controller does not list the model folder seam/gone")
+          and [c["url"] for c in rig.web.calls] == [f"{CONTROLLER}/api/models/folder?path=seam/gone"],
+          "defect-history: модели-папки здесь нет — раньше отказ 409 «папку не скачать»; теперь скаут просит у "
+          "контроллера её список (test_folder_download)")
 
     s = make_scout({"controllerUrl": CONTROLLER})
     release = threading.Event()
@@ -642,6 +745,119 @@ def test_in_place():
     check(err is None and got == (str(model), str(s.models.cache_dir() / MMPROJ), "")
           and [urllib.parse.unquote(c["url"].split("path=", 1)[1]) for c in rig.web.calls] == [MMPROJ],
           "подсказка по каждому файлу: модель читается на месте, mmproj без подсказки качается")
+
+
+FOLDER = "seam/facebook/FP32"
+FOLDER_FILES = {"config.json": b'{"a": 1}', "model-00001.safetensors": b"WEIGHTS-1",
+                "sub/conf.yaml": b"k: v\n", "blobs/abc": b"BLOB"}
+FOLDER_LISTING = {"path": FOLDER, "size": sum(len(b) for b in FOLDER_FILES.values()),
+                  "files": [{"path": k, "size": len(v)} for k, v in FOLDER_FILES.items()],
+                  "links": [{"path": "snap/h1/model.bin", "target": "../../blobs/abc"},
+                            {"path": "snap/h2", "target": "h1"}]}
+
+
+def peek(fn):
+    """What fn() answers, or None when the file or link it reads is not there: a pin that
+    reads a missing file fails as itself, not as the whole test."""
+    try:
+        return fn()
+    except (OSError, ValueError):
+        return None
+
+
+def folder_served(listing=None, files=None, on_file=None):
+    """The controller of a folder model: its listing, then each file."""
+    listing = FOLDER_LISTING if listing is None else listing
+    files = FOLDER_FILES if files is None else files
+
+    def file_answer(url):
+        raw = urllib.parse.unquote(url.split("path=", 1)[1])
+        name = raw[len(FOLDER) + 1:]
+        if on_file:
+            on_file(name)
+        body = files[name]
+        return FakeResponse(body, headers={"Content-Length": str(len(body))})
+
+    def listing_answer(_url):
+        return FakeResponse(json.dumps(listing).encode())
+    return FakeUrlopen({"/api/models/folder?path=": listing_answer, "/api/models/download?path=": file_answer})
+
+
+def test_folder_download():
+    hint = {"path": "/data/models/" + FOLDER, "dir": True}     # the controller's own path: not on this machine
+    s = make_scout({"controllerUrl": CONTROLLER, "controllerToken": "tok"})
+    local = s.models.cache_dir() / FOLDER
+    with Rig(web=folder_served()) as rig:
+        got, err = attempt(lambda: s.models.ensure(FOLDER, report=False, use_cache=True, hint=hint))
+    urls = [c["url"] for c in rig.web.calls]
+    check(err is None and got == local, f"модель-папка собрана в кэше скаута: {err}")
+    check(urls[0] == f"{CONTROLLER}/api/models/folder?path=seam/facebook/FP32"
+          and urls[1:] == [f"{CONTROLLER}/api/models/download?path=" + urllib.parse.quote(f"{FOLDER}/{k}")
+                           for k in FOLDER_FILES],
+          "сначала список у контроллера, потом каждый файл той же загрузкой, что и файл модели")
+    check(all(c["headers"].get("X-caravan-token") == "tok" for c in rig.web.calls),
+          "каждый запрос несёт токен флота: адреса контроллера машинные")
+    check(all(peek(lambda k=k: (local / k).read_bytes()) == v for k, v in FOLDER_FILES.items()),
+          "файлы на своих местах, подпапки сохранены, байты те же")
+    check(peek(lambda: os.readlink(local / "snap/h1/model.bin")) == "../../blobs/abc"
+          and peek(lambda: (local / "snap/h1/model.bin").read_bytes()) == b"BLOB"
+          and peek(lambda: os.readlink(local / "snap/h2")) == "h1",
+          "ссылки внутри папки сделаны заново той же целью (кэш Hugging Face: snapshots → blobs)")
+    check(peek(lambda: json.loads((local / s.models.FOLDER_MARK).read_text())) == FOLDER_LISTING,
+          "последним лёг знак полной папки — список контроллера")
+    check(not local.with_name("FP32.part").exists() and written_down(s) == [FOLDER],
+          "часть переименована в папку; записана как закачка скаута одна папка, не каждый файл")
+
+    with Rig(web=folder_served()) as rig:
+        got, err = attempt(lambda: s.models.ensure(FOLDER, report=False, use_cache=True, hint=hint))
+    check(err is None and got == local and rig.web.calls == [],
+          "второй старт с кэшем — полная папка берётся как есть, без запросов")
+
+    # A fetch cut short: two files arrived, the third broke. The next start keeps them.
+    s = make_scout({"controllerUrl": CONTROLLER})
+    part = s.models.cache_dir() / "seam/facebook/FP32.part"
+    lay(part, {"config.json": FOLDER_FILES["config.json"], "model-00001.safetensors": b"WEIGHTS"})
+    asked = []
+    with Rig(web=folder_served(on_file=asked.append)) as rig:
+        got, err = attempt(lambda: s.models.ensure(FOLDER, report=False, use_cache=True, hint=hint))
+    check(err is None and asked == ["model-00001.safetensors", "sub/conf.yaml", "blobs/abc"],
+          f"обрыв: файл своего размера оставлен, недокачанный и остальные скачаны: {asked}")
+    check(peek(lambda: (s.models.cache_dir() / FOLDER / "model-00001.safetensors").read_bytes()) == b"WEIGHTS-1",
+          "недокачанный файл заменён полным")
+
+    s = make_scout({"controllerUrl": CONTROLLER})
+    lay(s.models.cache_dir(), {FOLDER + "/config.json": b"by hand"})
+    with Rig(web=folder_served()):
+        _, err = attempt(lambda: s.models.ensure(FOLDER, report=False, use_cache=True, hint=hint))
+    check(err_is(err, 409, f"{s.models.cache_dir() / FOLDER} is there and was not downloaded by this scout: not replaced")
+          and peek(lambda: (s.models.cache_dir() / FOLDER / "config.json").read_bytes()) == b"by hand",
+          "negative: чужая папка на том же месте не заменяется — 409, её файл цел")
+
+    for listing, what in ((dict(FOLDER_LISTING, files=[{"path": "../../evil", "size": 1}]), "путь из папки наружу"),
+                          (dict(FOLDER_LISTING, files=[{"path": "/etc/evil", "size": 1}]), "абсолютный путь"),
+                          (dict(FOLDER_LISTING, links=[{"path": "x", "target": "../../../evil"}]), "ссылка наружу"),
+                          (dict(FOLDER_LISTING, links=[{"path": "x", "target": "/etc/passwd"}]), "абсолютная ссылка")):
+        s = make_scout({"controllerUrl": CONTROLLER})
+        with Rig(web=folder_served(listing=listing, files={**FOLDER_FILES, "../../evil": b"E", "/etc/evil": b"E"})):
+            _, err = attempt(lambda: s.models.ensure(FOLDER, report=False, use_cache=True, hint=hint))
+        check(isinstance(err, AppError) and err.status == 502 and not (s.models.cache_dir() / FOLDER).exists()
+              and not (s.models.cache_dir() / "evil").exists() and not (s.models.cache_dir().parent / "evil").exists(),
+              f"negative: {what} в списке контроллера — отказ 502, ничего не записано вне папки и папка не названа")
+
+    s = make_scout({"controllerUrl": CONTROLLER})
+    with Rig(web=FakeUrlopen({"/api/models/folder?path=": FakeResponse(b"[1, 2]")})):
+        _, err = attempt(lambda: s.models.ensure(FOLDER, report=False, hint=hint))
+    check(err_is(err, 502, f"the controller's listing of {FOLDER} is not a folder listing"),
+          "negative: ответ не список папки — отказ 502, а не догадка")
+    s = make_scout({"controllerUrl": CONTROLLER})
+    with Rig(web=folder_served()) as rig:
+        _, err = attempt(lambda: s.models.ensure(FOLDER, report=False, hint=dict(hint, library="NAS")))
+    check(isinstance(err, AppError) and err.status == 409 and "in the library NAS" in str(err) and rig.web.calls == [],
+          "negative: папка в библиотеке, которой здесь нет, — прежний отказ 409, без запросов")
+    s = make_scout({})
+    _, err = attempt(lambda: s.models.ensure(FOLDER, report=False, hint=hint))
+    check(err_is(err, 404, f"model not found locally and controllerUrl not set: {FOLDER}"),
+          "negative: без адреса контроллера — 404 с путём папки")
 
 
 def test_list_cached_models():
@@ -909,7 +1125,9 @@ def test_sync_malformed_manifest():
 TESTS = [
     test_model_cache_dir, test_is_corruption_error, test_ensure_model_local, test_ensure_model_download,
     test_ensure_model_progress_throttle, test_ensure_model_truncation, test_ensure_model_retries,
-    test_cleanup_old_models, test_purge_model_cache, test_purge_models_safely, test_in_place, test_list_cached_models,
+    test_cleanup_old_models, test_purge_model_cache, test_purge_models_safely, test_split_gguf_parts,
+    test_ensure_split_parts, test_purge_folders_and_flight, test_in_place, test_folder_download,
+    test_list_cached_models,
     test_download_all_model_files,
     test_launcher_and_runner, test_sync_nothing_to_do, test_sync_runner_resolution, test_sync_files,
     test_sync_requests, test_sync_malformed_manifest,
