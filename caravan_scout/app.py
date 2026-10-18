@@ -24,11 +24,14 @@ def main(argv: list[str] | None = None) -> int:
 
     agent = Scout(Path(args.config).expanduser(), Path(args.state).expanduser())
     agent.cells.adopt_survivors()
-    # The cells that start with the machine; off the main thread, so a slow
-    # start does not keep the port closed.
-    threading.Thread(target=agent.autostart.start_all, daemon=True).start()
+    # The cells that start with the machine, then the cache trimmed to its
+    # setting; off the main thread, so a slow start does not keep the port closed.
+    threading.Thread(target=agent.start_cells, daemon=True).start()
     # A crashed cell comes back, as systemd brings the controller's (Watchdog).
     threading.Thread(target=agent.watchdog.run, daemon=True).start()
+    # A cell it started and lost track of — the scout was killed while it loaded —
+    # is held again, so the board can stop it (Reconcile).
+    threading.Thread(target=agent.reconcile.run, daemon=True).start()
     # The machine second by second while a board watches it (Telemetry).
     threading.Thread(target=agent.telemetry.run, daemon=True).start()
     # The engines next to the cells (ForeignEngines), rescanned on their own.

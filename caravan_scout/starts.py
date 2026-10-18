@@ -14,6 +14,7 @@ from typing import Any
 from caravan_scout.cell_assets import CellAssets
 from caravan_scout.entry import ModelName
 from caravan_scout.errors import AppError
+from caravan_scout.ledger import MemoryLedger
 from caravan_scout.paths import (LLAMA_PATH_PLACEHOLDER_MMPROJ, LLAMA_PATH_PLACEHOLDER_MODEL,
                                  LLAMA_PATH_PLACEHOLDER_SPEC, SERVER_CELLS_DIR)
 from caravan_scout.process import HostProcesses
@@ -158,6 +159,23 @@ class CellStart:
         phase = self.cells.startup(port).get("phase")
         if phase in ("resolving", "downloading", "loading"):
             return {"ok": False, "error": f"startup already in progress on port {port} ({phase})", "phase": phase}
+        # A cell this scout started and lost track of still runs there — a
+        # start that was loading when the scout was killed (2026-10-14). A
+        # second copy beside it loads its model again and fights it for the
+        # port and the card: it is held again instead, and the board shows it.
+        lost = self.cells.survivor(port)
+        if lost:
+            self.cells.adopt_found(port, lost)
+            return {"ok": False, "adopted": True, "pid": lost,
+                    "error": f"a server is already running on port {port} (pid {lost}, started by this scout "
+                             f"and lost track of) — it is held again; stop it from the board to start another"}
+        # A process no scout started holds the port: the cell would load its
+        # model, and only then fail to bind it.
+        holder = self.cells.processes.listener(port)
+        if holder:
+            return {"ok": False, "listenerPid": holder,
+                    "error": f"port {port} is held by pid {holder} ({self.cells.processes.cmdline(holder)[:80]}), "
+                             f"which no scout started — stop it first, or pick another port"}
         return None
 
     def short_of_vram(self, port: int) -> dict[str, Any] | None:
@@ -171,7 +189,12 @@ class CellStart:
         read now — also when the start comes from autostart at boot, where
         two cells may want one card. Refused rather than started: otherwise
         the cell dies in a crash loop a minute later. Best effort, like the
-        controller's own check: no nvidia-smi, no such card — no refusal."""
+        controller's own check: no nvidia-smi, no such card — no refusal.
+
+        The words name the way out for THIS card (2.33): a card too small
+        for the reserve is said to be (stopping cells will not help), the
+        holders named are the ones on that card, with what each holds, and
+        another card with the room is named when there is one."""
         want = self.payload.get("vram")
         if not isinstance(want, dict):
             return None
@@ -186,13 +209,73 @@ class CellStart:
             return None
         if reserve <= 0 or free >= reserve:
             return None
-        holders = sorted(f":{p}" for p, cell in self.cells.all()
-                         if p != port and cell.process.status().get("running"))
         lower = str(want.get("lower") or "what it reserves")
-        hint = f" — stop {', '.join(holders)} or lower {lower}" if holders else f" — lower {lower}"
         who, why = str(want.get("who") or "the cell"), str(want.get("why") or "")
-        return {"ok": False, "error": f"{who} wants {reserve / 1024:.1f} GiB reserved{f' ({why})' if why else ''} "
-                                      f"but only {free / 1024:.1f} GiB VRAM is free on GPU {device}{hint}"}
+        wants = f"{who} wants {reserve / 1024:.1f} GiB reserved{f' ({why})' if why else ''}"
+        try:
+            total = float(card.get("memoryTotalMiB"))
+        except (TypeError, ValueError):
+            total = 0.0
+        room = self.room_elsewhere(reserve)
+        elsewhere = f", or pick GPU {room[0]} ({room[1] / 1024:.1f} GiB free)" if room else ""
+        if total and reserve > total:
+            # Stopping cells cannot make the card bigger: the only ways out are another card or a smaller reserve.
+            return {"ok": False, "error": f"{wants} but GPU {device} has only {total / 1024:.1f} GiB in all — "
+                                          f"lower {lower}{elsewhere}"}
+        holders = ", ".join(f"{name} ({mib / 1024:.1f} GiB)" for name, mib in self.holders_of(port, card))
+        hint = f" — stop {holders} or lower {lower}" if holders else f" — lower {lower}"
+        return {"ok": False, "error": f"{wants} but only {free / 1024:.1f} GiB VRAM is free on GPU {device}{hint}{elsewhere}"}
+
+    #: A holder is named in a refusal from this much memory on: less is a driver's or a display's context, not
+    #: something to stop to make room.
+    NAMED_MIB = 256
+
+    def holders_of(self, port: int, card: dict[str, Any]) -> list[tuple[str, float]]:
+        """Who holds memory on `card` right now, [(name, MiB)], the biggest first: ":22003" for a cell of this scout
+        (what its own process and the processes it started hold there: a server may hand the card to a child, Strata's
+        engine), the executable's name for anything else. Only what is on THIS card: the refusal used to name every
+        running cell of the machine, the ones on the other card too, and a machine with two cards sent the operator to
+        stop cells that held nothing there (2026-10-17). [] when nvidia-smi does not say who holds what."""
+        uuid = str(card.get("uuid") or "")
+        apps = [a for a in self.cells.machine.compute_apps() if uuid and a.get("gpuUuid") == uuid]
+        owners: dict[int, str] = {}
+        for p, cell in self.cells.all():
+            status = cell.process.status()
+            if not status.get("running"):
+                continue
+            for pid in [status.get("pid"), *self.cells.processes.descendants(status.get("pid"))]:
+                if isinstance(pid, int):
+                    owners[pid] = f":{p}"
+        held: dict[str, float] = {}
+        for app in apps:
+            pid = app.get("pid")
+            if owners.get(pid) == f":{port}":
+                continue                       # the cell being started: it is not what is in its way
+            name = owners.get(pid) or str(app.get("name") or f"pid {pid}")
+            held[name] = held.get(name, 0.0) + float(app.get("usedMiB") or 0)
+        return sorted(((name, mib) for name, mib in held.items() if mib >= self.NAMED_MIB), key=lambda x: (-x[1], x[0]))
+
+    def room_elsewhere(self, reserve: float) -> tuple[str, float] | None:
+        """Another card of this machine with the room the start wants free: (index, free MiB), the one with the most
+        room; None when there is none or nvidia-smi names no other card. (The card the start is for has less free than
+        it wants, or nobody asks: it is never its own answer.)"""
+        best = None
+        for g in self.cells.machine.nvidia_gpus():
+            try:
+                free = float(g.get("memoryFreeMiB"))
+            except (TypeError, ValueError):
+                continue
+            if free >= reserve and (best is None or free > best[1]):
+                best = (str(g.get("index")), free)
+        return best
+
+    def short_of_ram(self, port: int) -> dict[str, Any] | None:
+        """The refusal when the machine's memory cannot hold what the cell
+        keeps resident; None when it can, or when the start promises nothing
+        (MemoryLedger). Strata keeps its 37 GB in RAM: the card's check never
+        saw that, and a second start beside the first loaded it twice."""
+        want = self.payload.get("ram")
+        return MemoryLedger(self.cells).short(port, want) if isinstance(want, dict) else None
 
     @staticmethod
     def open_firewall(port: int) -> None:
@@ -248,6 +331,9 @@ class LlamaStart(CellStart):
 
         mmproj_raw = str(config.get("MMPROJ_FILE") or "").strip()
         spec_raw = str(config.get("SPEC_DRAFT_MODEL_FILE") or "").strip()
+        # The cache is told what this start asks of it before the first byte is copied: a trim that another start's end triggers
+        # must find these files wanted, whole or half copied.
+        self.cells.keeper.begin(port, [model_path_raw, mmproj_raw, spec_raw])
         cache_models = bool(payload.get("cacheModels", self.cells.config.get("cacheModels", False)))
         cell.cache_models = cache_models
 
@@ -446,15 +532,13 @@ class LlamaLaunch:
             cells.records.add(port, "llama", result.get("pid") or 0, bin_path,
                               cfg, log_path, cache_models, launch=cell.process.launch_spec(), name=self.name)
             # Manual snapshots only — no auto-save of launch params on start.
-            # Caching on ⇒ keep only the active model (don't accumulate on disk).
-            # Caching off ⇒ files get purged on stop anyway, no cleanup needed here.
-            if cache_models and self.cells.config.get("cleanOldModels"):
+            # Caching on ⇒ the cache keeps the last models the operator set (1 to 5), this one among them, and deletes the older
+            # ones (CacheKeeper); what the neighbours run stays whatever its age. Caching off ⇒ files get purged on stop anyway.
+            if cache_models:
                 try:
-                    # What the neighbours run stays too: the cleanup used to keep
-                    # only this cell's files and took a running cell's model.
-                    models.cleanup_old([str(mp), mmproj_abs, spec_abs, *cells.held_files()])
-                except Exception:
-                    pass
+                    cells.keeper.commit(port)
+                except Exception as exc:  # noqa: BLE001 — a trim that fails is not a start that failed
+                    print(f"[llama-node] :{port} cache trim failed: {exc}")
         else:
             cells.report(port, phase="error", error=result.get("error") or "start failed")
 
@@ -495,10 +579,11 @@ class CommandStart(CellStart):
         files = self.model_files()
         env = self.process_env()
         port = self.port()
-        refusal = self.busy(port) or self.short_of_vram(port)
+        refusal = self.busy(port) or self.short_of_vram(port) or self.short_of_ram(port)
         if refusal:
             return refusal
         cell = cells.at(port)
+        cell.ram_mib = self.ram_mib()
         cell.name = ModelName.of(config, str(payload.get("modelPath") or ""), port)
         # Its files stay or go as the controller asks, as a llama cell's do.
         # Until 2.31 a command cell kept them always, whatever was asked —
@@ -506,15 +591,26 @@ class CommandStart(CellStart):
         # transcribe runner. Kept, a model is written to the disk once; not
         # kept, every start writes it again (the owner keeps them, 2026-10-13).
         cell.cache_models = bool(payload.get("cacheModels", cells.config.get("cacheModels", False)))
+        # What this start asks of the cache, told before the first byte is copied (see LlamaStart.run).
+        cells.keeper.begin(port, files)
         cells.report(port, phase="resolving", modelPath=files[0] if files else command[:80],
                      downloadedBytes=0, totalBytes=0, error="", startedAt=int(time.time()))
         # Open the port in ufw so the admin/clients can reach the cell.
         self.open_firewall(port)
         launch = CommandLaunch(cells, port, cell, command, shell_line, files, cell.cache_models,
                                hints=self.hints(), env=env, name=cell.name,
-                               health_path=str(payload.get("healthPath") or "/health"))
+                               health_path=str(payload.get("healthPath") or "/health"),
+                               ram_mib=cell.ram_mib)
         threading.Thread(target=launch.run, daemon=True).start()
         return {"ok": True, "status": "starting", "phase": "resolving", "port": port}
+
+    def ram_mib(self) -> int:
+        """The memory this start promises to keep resident, as it said it (`ram`): 0 for none."""
+        want = self.payload.get("ram")
+        try:
+            return max(0, int(float(want.get("reserveMiB") or 0))) if isinstance(want, dict) else 0
+        except (TypeError, ValueError):
+            return 0
 
     def model_files(self) -> list[str]:
         """The model files the command reads, as the controller names them:
@@ -544,7 +640,8 @@ class CommandLaunch:
 
     def __init__(self, cells, port: int, cell, command: str, shell_line: str, files: list[str],
                  cache_models: bool, hints: dict[str, Any] | None = None,
-                 env: dict[str, str] | None = None, name: str = "", health_path: str = "/health"):
+                 env: dict[str, str] | None = None, name: str = "", health_path: str = "/health",
+                 ram_mib: float = 0):
         self.cells = cells
         self.port = port
         # The cell the request made: a stop drops it, so a later lookup on the
@@ -560,6 +657,7 @@ class CommandLaunch:
         self.env = dict(env or {})
         self.name = name
         self.health_path = health_path
+        self.ram_mib = ram_mib
 
     def fetch(self) -> list[str]:
         """Each model file where this machine reads it — in place, in the
@@ -642,7 +740,12 @@ class CommandLaunch:
             cells.records.add(port, "command", result.get("pid") or 0, marker,
                               cfg, log_path, self.cache_models,
                               health_path=self.health_path,
-                              launch=cell.process.launch_spec(), name=self.name)
+                              launch=cell.process.launch_spec(), name=self.name, ram_mib=self.ram_mib)
+            if self.cache_models:
+                try:
+                    cells.keeper.commit(port)
+                except Exception as exc:  # noqa: BLE001 — a trim that fails is not a start that failed
+                    print(f"[llama-node] :{port} cache trim failed: {exc}")
         return result
 
 

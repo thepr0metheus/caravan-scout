@@ -1,5 +1,214 @@
 # Changelog
 
+## 2.35.1 — 2026-10-18
+
+- **A Strata cell says its token speed, its queue and its context use.** The owner, 2026-10-18, after talking to a local model through a
+  chat page: "some characteristics I do not see — tokens per second are zero". The model ran in a Strata cell, and the machine's
+  card said "prompt 0 / gen 0 t/s". The scout read a cell's `/metrics` as Prometheus text. Strata answers Prometheus text, in vLLM's
+  metric names and its own (`strata:`), only to a reader that asks for it (`Accept: text/plain`); asked without, it answers the JSON of its
+  Monitor tab, in which the reader found no sample: the cell said no speed (`promptTps`, `genTps`), no queue (`requestsProcessing`,
+  `requestsWaiting`), no context use (`ctxUsed`).
+  (1) The scout asks for `text/plain`, as Prometheus does. llama.cpp and vLLM answer the same either way.
+  (2) A scrape with a `strata:` sample is a Strata scrape. Its speeds are the running request's own while it reads or generates
+  (`strata:live_prefill_tok_s_mean`, `strata:live_tok_s`), and while it idles the last measured ones: tokens over compute seconds of the
+  work done since the last scrape (`timed_rates`, the same rule as llama.cpp's), the accumulated average at the first scrape. The prompt
+  tokens its cache already held (`vllm:prefix_cache_hits_total`) are not counted as read ones: of 86650 prompt tokens 38423 were held, so
+  48227 were read in 18.053 s, 2671 per second, not 4800. A sample the server does not say makes no rate, and a counter that went down
+  (a restarted cell) drops the old ones. The growth of vLLM's counters between two scrapes — zero between two requests and a spike at
+  the one that finished — is not how a Strata cell is read; a vLLM server (no `strata:` sample) is read as before.
+  (3) `requestsProcessing`, `requestsWaiting` come from vLLM's names, and `ctxUsed` from `vllm:kv_cache_usage_perc`, which Strata gives as the
+  running request's share of its context (the context window is `/props`'s `n_ctx`; a vLLM server has no `/props`, so its pool usage
+  is never taken for a context share).
+  (4) A test that could not fail. `test_scout_metrics.py` ended with `CHECKS.finish()` as a statement: the verdict `finish()` returns was
+  thrown away, so the script printed its FAIL lines and exited 0, and the CI went on green. It had done so since 2.23.2; a run of
+  mutants of this release found it — fourteen of seventeen alive, each with the test showing FAIL and the exit code 0. It ends with
+  `sys.exit(CHECKS.finish())` now, and `scripts/check_test_verdicts.py` (a CI step of its own, which tries itself on the broken ending first)
+  names every test script that ends the old way.
+  Checked: `test_scout_metrics.py` (27 checks, 12 new: the cell is asked with `Accept: text/plain`, the first scrape's averages with the cached prompt
+  tokens left out, a request at work, the new work only, held while idle, the queue, a restart, a cache that holds more than was asked, no
+  seconds, the JSON of the Monitor tab, vLLM unchanged); `test_scout_cells.py`, `test_scout_report.py` (their stand-ins take a request as well as an address); `check_test_verdicts.py` (it names the one broken ending before the fix and passes
+  30 scripts after); the whole suite on 3.12 and 3.9; 16 mutants in tree copies, all caught (the first run left 14 alive: see (4)). Not checked: on the
+  real machine until it is deployed (the server's text was read there by hand: its names are the ones the test uses).
+
+## 2.35.0 — 2026-10-18
+
+- **A running cell says how much memory it holds in RAM: `ramBytes` on every cell of `llamaNodes` and `llamaNode`.** The owner,
+  2026-10-18, looking at the thin rows of a machine's cells, where only the video memory a cell holds was written: "for each model show
+  two badges, how much it holds in RAM and how much on the GPU, even if one of them is not occupied". The video memory has been
+  the controller's to work out, from the compute apps by pid. The RAM had no source at all: the cell's report said nothing of it.
+  Now `CellRegistry.views()` takes one table of the machine's processes (`Machine.processes()`, the `ps -A` an engine's `ramBytes`
+  already comes from), and a running cell's `ramBytes` is the RSS of its process and of everything it started, in bytes, read by
+  parent pid (`HostProcesses.resident`), so it works on macOS too, where `/proc` does not. One `ps` serves every cell, and none
+  is asked when no cell runs. It is `null`, not `0`, when ps did not answer or the table does not hold the cell's process: "not
+  told" is not "nothing", and the card draws it as a dash. A cell that is not running has no `ramBytes`.
+  RSS counts the memory-mapped model files a process has touched: the weights of a CPU cell are in it, and a file that two
+  cells map is in both. It is what `top` shows as RES, not the cell's own cost. The controller's row says so in the badge's tip.
+  Checked: `test_scout_cells.py` (402 checks, 12 new: the sum over a process tree, another cell's tree left out, the cut at
+  `TREE_LIMIT`, a table with a cycle, rows with no RSS, no table / empty / unknown pid / not a number, the view of a running cell
+  with the number and without it, a lone call taking its own table, one `ps` for all cells and none when nothing runs), `report_sample.py` (the sample shows both
+  `ramBytes: 2147483648` and `null`), `check_oop.py`, the rest of the suite on 3.12 and 3.9; 12 mutants in tree copies, all caught.
+  Not checked: on a real machine (2.35.0 is not deployed); on macOS, where only the parent-pid walk can work.
+
+## 2.34.1 — 2026-10-18
+
+- **A cell killed from outside says so, and a cell that never gets ready is not restarted for ever.** A Strata cell on the owner's
+  machine (Swift IQ3_S, 2026-10-18) was killed four times by `systemd-oomd` — its memory scope was full and the pressure stood
+  above 50 % — and restarted each time: the cause is told in the controller's 1.3.574. Two things of the scout's made it worse:
+  (1) The card said `still starting (461 s) - please wait ...`. A process that is killed by SIGKILL cannot say why: its log's last
+  line is merely the last thing it said, and here that was the launcher's "still alive" line. The crash note's reason now begins
+  with the signal and what it usually is (`died of SIGKILL (killed from outside — on a machine short of memory that is
+  systemd-oomd or the kernel's OOM killer)`), the log's last words after it when there are any; a SIGABRT or a SIGSEGV, which a
+  process raises itself and explains on its way out, and every exit code keep the log's line. And a line `[strata] still starting
+  (N s) …` is no longer read as a cause (`CellLog.PROGRESS_NOISE`).
+  (2) The watchdog gives up after 3 restarts in 10 minutes. A start that dies after 4 to 8 minutes never fills that window, so the
+  loop never ended — until the owner pressed Stop. Now the starts that died before their port ever listened are counted on their
+  own (the watchdog notes it each tick, `Cell.listened`): after 3 restarts that did not take, the next death is the last, whatever
+  the clock says, and the card says `never ready in 4 starts — not restarting it: …`. A run that did listen resets the count; a
+  machine that will not say what listens (`listening_ports()` is None) leaves the rule off.
+  Checked: `test_scout_watchdog.py` (50 checks: a SIGKILL with a log line, with none, with 400 characters of one; SIGABRT/SIGSEGV,
+  an exit code and an unknown code unchanged; four unready runs of five minutes give up with the right words; a ready run resets the
+  count; no listening data — no give-up; the window rule and its words unchanged), `test_scout_node.py` (181: a log of progress
+  lines names no cause, a real cause before them stays, another `[strata]` line and a "still starting" without seconds are read as
+  before); 21 mutants in tree copies, all caught.
+  Not checked: on the machine that had the loop (the controller's 1.3.574 makes the start refuse in the first place).
+
+## 2.34.0 — 2026-10-18
+
+- **The model cache keeps the last N models that ran, with all their files, and deletes the rest by itself.** The owner, 2026-10-18,
+  when the disk of a machine was 94 % full of model copies and a start died with `No space left on device`: "keep in the cache only
+  the last models, from 1 to 5, 1 by default, with all their files; show the setting somewhere noticeable; everything older is
+  deleted automatically". Until now a model stayed in the cache until someone asked for a purge: every cell that ran was copied
+  from the library to the disk once, and none of the copies ever left (`cleanOldModels`, the one knob, was off and never used by
+  the board).
+  The scout now records each start (`modelUse` in `state.json`: the files the start names — the model, its projector, its
+  draft layer —, the port, the time) before the files are copied, and marks it once its server runs. After a start that
+  reached a running process, when the setting is changed, and once at the boot after the cells that start with the machine
+  have asked for their files, the cache is trimmed (`CacheKeeper.trim`): what stays is the files of the `keep` models that ran
+  most recently (all parts of a split GGUF, the projector, the draft layer, a model's folder), of every cell that is starting
+  or running whatever its age, and of every running process; the rest of what this scout downloaded goes. The setting
+  (`cacheKeep`, 1 to 5, 1 until set) lives in `state.json` — `config.json` stays the file the operator wrote.
+  Two things are never done by guess: nothing is deleted while the scout knows no model that ran (the answer says
+  `waiting: true`, as the first start after the update begins the log: "unknown" is not "nothing"), and a file this scout did not
+  download — copied in by hand, left from before the ledger — is never deleted by itself: it is counted and shown
+  (`modelCache.foreign`: files, bytes, the folders they lie in) and deleted only when the operator asks with the size he was
+  shown (`POST /api/llama-node/cache/delete-foreign {expectBytes}`; 409 and nothing deleted when it changed since, 400 without).
+  A model that was started and died while loading is not "the last model": its copy goes with the next trim, and a retry
+  copies it again.
+  New: `GET /api/llama-node/cache` (the setting, what the scout holds, what it did not download, the disk), `POST
+  /api/llama-node/cache/keep {keep}` (sets and trims at once), `POST /api/llama-node/cache/delete-foreign`, and `modelCache` in
+  both reports (`/api/state` and the heartbeat), so the board shows the figures without asking. Retired: `cleanOldModels` and
+  `ModelFetcher.cleanup_old` (a `config.json` that still carries the flag is read and ignored).
+  Checked: `test_scout_cache_keeper.py` (89 checks: the setting and what it refuses, the log of starts, the trim in every case — waiting,
+  keep 1/2/5, split parts, a folder model, a running process's file, a starting cell, a download in flight, a failed start —, the foreign files and
+  their deletion by figure, the figures and their reuse, the routes and their closing under a fleet token), `test_scout_cells.py` (the
+  worker's trim rewritten for the keeper; llama and command starts are recorded and committed, only with caching on), `test_scout_report.py`
+  (the field and its figures), `test_scout_autostart.py` (the trim comes after the cells), `test_scout_openapi.py` (45 operations),
+  `docs/report-sample.json` regenerated, 36 mutants in tree copies, all caught.
+  Not checked: on a real machine with real models (the first start after the update only begins the log; nothing is deleted before a
+  model has run); the board's control for the setting (controller 1.3.576).
+
+## 2.33.2 — 2026-10-17
+
+- **A library's footer is not the reason a cell crashed, and a wrapper that says "see root cause above" is not either.**
+  pydantic ends every validation error with a pointer to its docs, `For further information visit https://errors.pydantic.dev/…`,
+  and that line's `error` (it is in the address) took the place of the cause the line above it states. Two vLLM cells died
+  on the owner's board with the card saying `crashed 4 times in 10 minutes — not restarting it: For further information
+  visit https://errors.pydantic.dev/2.13/v/value_error` (2026-10-17): the real causes were `Please pass the argument
+  trust_remote_code=True to allow custom code to be run` and `Unrecognized model in … Should have a model_type key in its
+  config.json`, one line higher. The footer is now left out of the reading, as the debugger's lines are (2.33.1), with or
+  without the `(APIServer pid=…)` prefix and any indent; a different `For further information …` line of a program, or the
+  address alone, stays what it was. A log of nothing but the footer names no reason.
+  A third vLLM cell ended with `RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}`
+  — and the cause stood a screen higher (`torch._inductor.exc.InductorError: AssertionError: auto_functionalized was not
+  removed`). A log without levels (a Python process: vLLM, whisper, a command cell) is now read by its last EXCEPTION line
+  (`…Error: …`, `…Exception: …`, with or without the process prefix and a dotted name) — except a line that says where
+  the cause stands: a wrapper that says it is above (`see root cause above`, so the line before it is the cause) and a
+  pydantic header that says it is below (`1 validation error for ModelConfig`, so the lines under it are read). A log with
+  levels (llama.cpp) is read as before.
+  Checked: `test_scout_node.py` (177 checks: the cause one line above the footer, the line that says what to do, the footer
+  alone, a footer with indent and no prefix, a different phrase and the bare address; the engine-core wrapper, a chain of
+  exceptions, `Exception` without `Error`, a wrapper with nothing above it, a levelled log with a stray exception line —
+  negatives), 17 mutants, all caught.
+
+## 2.33.1 — 2026-10-17
+
+- **The reason a cell crashed is the cause, not the debugger's last line.** llama.cpp's crash handler runs gdb, and gdb writes
+  into the log after the server's own message: frames (`#3  0x… in ggml_abort () from …`), a warning about a source file
+  it cannot find (`warning: 360	../csu/libc-start.c: No such file or directory.`), the detach lines. The scout took the
+  reason from the log by patterns, and `no such file` is a priority pattern (a missing model is the most actionable
+  reason there is): so a cell that died with `CUDA error: no kernel image is available for execution on the device`
+  showed on the board `crashed 4 times in 10 minutes — not restarting it: warning: 360 ../csu/libc-start.c: No such file
+  or directory` (2026-10-17), and a frame's `abort` would have won the same way. The debugger's lines are now left out
+  of the reading (a frame by its shape, gdb's `warning: <line number>` about a source, `[Inferior … detached]`,
+  `[New LWP …]`, `[Thread debugging …]`), and `no kernel image` is a priority pattern of its own: the engine has no
+  code for the card it runs on, and the fix — a build for that card — is the only thing the message says. A real
+  `No such file or directory` from the program's own line stays the reason, and a log of nothing but the debugger's
+  lines names no reason (it used to name the last line, whatever it was).
+  **Checked:** `scripts/test_scout_node.py` (164 checks: the real log of the crash — the CUDA error, the frames, the libc
+  warning, the detach line — names the CUDA error; an indented frame is noise too; a program's own `No such file` and
+  `warning: … failed` stay reasons; a log of only noise names none; `no kernel image` wins over a later generic error).
+  Mutants: 9 (each part of the noise pattern, the window, the fallback, the new priority pattern), all caught.
+  **Not checked:** on the live machine: 2.33.1 is not deployed yet.
+
+## 2.33.0 — 2026-10-17
+
+- **The refusal of a start the card cannot hold names what holds THAT card, and says when the card is too small.** The
+  controller sends a start's VRAM reserve with the card it is for (`vram`), and the scout refuses a start that finds less
+  free there. The words named every running cell of the machine as the ones to stop. On a machine with an RTX 3090 and an
+  RTX 5090 (2026-10-17) a 31 GB server pinned to the 24 GB card was told to stop cells that held nothing on it, and nothing
+  said that stopping them would not help: the card was smaller than the reserve. Now the refusal reads who holds memory on
+  the card from `nvidia-smi` (the processes with their memory) and names, biggest first, the cells with a process on it —
+  also through a child, as Strata's engine is a child of its server — and any other process by its executable
+  (`stop :22024 (21.5 GiB), :22010 (5.9 GiB) or lower GPU_MEMORY_UTILIZATION`, `stop ollama (6.2 GiB) …`). A holder under
+  256 MiB (a driver's or a display's context) is not named, the cell being started is not named, a cell of the other
+  card never is. A reserve bigger than the card's whole memory gets another sentence — `GPU 0 has only 24.0 GiB in all —
+  lower GPU_MEMORY_UTILIZATION` — because stopping cells cannot make the card bigger. Either way the words name another card
+  with the room when there is one, the one with the most: `or pick GPU 1 (29.3 GiB free)`. `nvidia-smi` that does not say
+  who holds what names nobody, where it used to name every cell.
+  **Checked:** `scripts/test_scout_vram.py` (names only that card's holders with their memory, through a child process,
+  by executable for a process that is no cell, nothing under 256 MiB, not the cell being started, not the cell of the other
+  card; a card too small, with and without another card to pick, the most roomy of three, the reserve equal to the
+  whole card is not "too small", one card, the second card as the one asked for, no apps data names nobody).
+  Mutants: 26 (who is named, through a child, summed, the biggest first, a stopped cell, the cell being started, the 256 MiB line, a card too small and its edge, another card with the room and its edge, the words), all caught.
+  **Not checked:** on the live machine: 2.33.0 is not deployed yet.
+
+## 2.32.0 — 2026-10-14
+
+- **A cell the scout started is found again, also while it loads.** The scout's start-up adoption knew a cell by the
+  command line its record remembered, then by the port it serves — and forgot a cell whose process lived but whose
+  port was silent. A model that loads (Strata: 37 GB into RAM, a minute and more) does not listen yet, and the
+  record's marker for such a cell is the controller's command line, `$HOME` and quotes in it, which no `exec`-chained
+  launcher's argv can match. On 2026-10-14 systemd-oomd killed the scout in the middle of such a load; the new scout found
+  the pid alive, the marker gone and the port silent — and dropped the cell. It went on loading outside the registry:
+  the board saw no cell, Stop was off, Start ran a second copy beside it (the first held the card), and the machine's
+  memory went to two loads. Now a cell is known first by the mark every cell carries in its environment
+  (`CARAVAN_SCOUT_CELL=<port>`, kept through every exec and every child): the recorded pid with the mark, or, when the
+  pid was clobbered, the process that carries the mark of the port; a silent port with such a process is adopted while
+  it loads. Only a port nothing runs is forgotten, and the journal says so.
+- **Reconcile.** While the scout runs, a process that carries the mark of a port no cell of the scout holds is held again,
+  after two passes in a row (every 15 s; `[reconcile]` in the journal). A cell with no record gets one from what the
+  machine says of its process — its command line, its start time, the log it was given by name.
+- **A start does not run a second copy.** A start for a port whose cell this scout lost track of holds that cell and
+  answers that a server already runs there; a port held by a process no scout started is refused with its pid and
+  command line, before the cell loads its model and fails to bind. The watchdog does not relaunch a crashed cell while
+  another process of the scout's still runs its port.
+- **Stop reaches a cell by its mark.** A cell no registry held was "an unrecognized process" however plainly it was a
+  scout's: Strata's record carried a marker no argv could match. Now what carries the mark of the port is the cell's —
+  listening or loading, with the engine under its server — and goes; and a stop that ended with something of the cell
+  still carrying its mark ends that too (an engine that holds 31 GB of the card when its server's SIGTERM does not reach it).
+- **A start the memory cannot hold is refused.** A command cell that keeps its weights in RAM says so with its start
+  (`ram`: `reserveMiB`, `who`, `why`; lama-caravan 1.3.545 sends it for Strata). The scout refuses when what the kernel says
+  is available, less 2 GiB for the system, does not cover it, or when what the cells up or still loading promised, and
+  this cell, pass 90 % of the machine's memory — the second sees a cell still loading, whose memory has not come yet.
+  `MemoryLedger`; the promise is kept in the cell's record, so a restart still knows it.
+- **Tests:** `test_scout_lost_cell.py` — 54 checks: the questions to the OS (`port_of`, `tagged_cells`, `carrier`,
+  `started_at`) over a /proc of the pin's own; the incident replayed (a record whose marker cannot match, nothing
+  listening, the mark on the server and the engine: adopted, not forgotten); the clobbered pid; what is really gone;
+  Reconcile (two passes, a process that vanishes between them, a cell under way, a failing pass); a start that finds its cell
+  and one that meets a stranger on its port; the ledger, including the second cell started while the first loads; stop by
+  the mark, the sweep, the watchdog. `test_scout_cells.py`: the port is asked of the host before the firewall opens
+  (3 pins). Docs: `docs/architecture.md`, `docs/operations.md`, `docs/http-api.md` (`ram`).
+
 ## 2.31.0 — 2026-10-13
 
 - **A command cell keeps its models as the controller asks.** The scout

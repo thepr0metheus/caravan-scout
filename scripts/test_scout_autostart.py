@@ -194,11 +194,29 @@ def test_kept_requests():
 def test_the_launcher_runs_it():
     CHECKS.section("лаунчер поднимает автозапуск:")
     app = (Path(__file__).resolve().parent.parent / "caravan_scout" / "app.py").read_text(encoding="utf-8")
-    adopt, start = app.find("agent.cells.adopt_survivors()"), app.find("target=agent.autostart.start_all")
+    adopt, start = app.find("agent.cells.adopt_survivors()"), app.find("target=agent.start_cells")
     serve = app.find("serve_forever()")
-    check(0 <= adopt < start < serve and "threading.Thread(target=agent.autostart.start_all, daemon=True).start()" in app,
+    check(0 <= adopt < start < serve and "threading.Thread(target=agent.start_cells, daemon=True).start()" in app,
           "после усыновления выживших и до того, как откроется порт, — в отдельном потоке: медленный старт ячейки "
           "не держит порт скаута закрытым; negative: без вызова ячейки после перезагрузки не поднимутся")
+    s = make_scout()
+    order = []
+    with patched(s.autostart, start_all=lambda: order.append("start_all")), patched(s.cells.keeper, trim=lambda: order.append("trim")):
+        s.start_cells()
+    check(order == ["start_all", "trim"],
+          "что запускается с машиной — сначала ячейки, потом кэш подрезается до своей настройки (2.34): к тому времени ячейки уже "
+          "назвали свои файлы, и подрезка их не заберёт")
+
+    def broken():
+        order.append("trim")
+        raise OSError("disk gone")
+
+    order.clear()
+    with patched(s.autostart, start_all=lambda: order.append("start_all")), patched(s.cells.keeper, trim=broken), \
+            contextlib.redirect_stdout(io.StringIO()) as out:
+        s.start_cells()
+    check(order == ["start_all", "trim"] and "cache trim at start failed: disk gone" in out.getvalue(),
+          "negative: подрезка, что упала, не останавливает скаут — строка в журнале, остальное работает")
 
 
 for fn in (test_the_launcher_runs_it, test_turning_it_on_and_off, test_refresh_on_start, test_what_a_boot_starts, test_routes, test_boot_id,

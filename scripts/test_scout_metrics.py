@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Prism/llama.cpp rates survive idle scrapes and independent metrics readers."""
+"""Prism/llama.cpp rates survive idle scrapes and independent metrics readers; a Strata cell's speed, queue and context use are read (2.35.1).
+
+On 2026-10-18 the owner talked to a local model through a chat page and found the machine's token speed at zero: "prompt 0 / gen 0 t/s". The model
+ran in a Strata cell. The scout read a cell's /metrics as Prometheus text, and Strata answers Prometheus text only to a reader that asks for it (`Accept:
+text/plain`) — asked without, it answers the JSON of its Monitor tab, where the reader found no sample at all. The cell said no speed, no queue, no
+context use. Pinned here, each with its negative: that the cell is asked the way Prometheus asks; the speeds at the first scrape (the accumulated
+average, the prompt tokens its cache already held left out); the running request's own speeds while it works; the last measured speed held while idle;
+the new work since the last scrape; the queue and the context use; no rate invented from a sample the server does not say; a restart; a JSON answer.
+"""
 import json
 import sys
 from pathlib import Path
@@ -29,6 +37,11 @@ class Response:
         return False
 
 
+def where(url):
+    """The address a stub of urlopen was asked for: the metrics are asked with a Request (an Accept header), the props with a string."""
+    return getattr(url, "full_url", url)
+
+
 def metrics(prompt=431, prompt_s=0.379305, gen=432, gen_s=3.15469, *, prompt_rate=0, gen_rate=0):
     # Actual metric names exported by prism-b10743-adfffbe; its gauges reset
     # on every scrape, while these four counters keep the completed work.
@@ -50,6 +63,7 @@ def test_prism_idle_and_new_work():
     calls = []
 
     def answer(url, **_kw):
+        url = where(url)
         calls.append(url)
         return Response(json.dumps({"n_ctx": 262144}) if url.endswith("/props") else body[0])
 
@@ -77,6 +91,7 @@ def test_gauges_and_ports():
     body = [metrics(prompt_rate=104.75, gen_rate=138.14)]
 
     def answer(url, **_kw):
+        url = where(url)
         if url.endswith("/props"):
             return Response("{}")
         return Response(body[0] if ":22013/" in url else metrics(prompt=0, prompt_s=0, gen=0, gen_s=0))
@@ -100,6 +115,7 @@ def test_restart_and_absence():
     failed = [False]
 
     def answer(url, **_kw):
+        url = where(url)
         if url.endswith("/props"):
             return Response("{}")
         if failed[0]:
@@ -147,7 +163,7 @@ llamacpp:tokens_predicted_seconds_total{engine="1"} 2
 """
 
     def answer(url, **_kw):
-        return Response("{}" if url.endswith("/props") else body, start="")
+        return Response("{}" if where(url).endswith("/props") else body, start="")
 
     with patched(urllib.request, urlopen=answer):
         body += counters
@@ -158,6 +174,107 @@ llamacpp:tokens_predicted_seconds_total{engine="1"} 2
         check(older == {"promptTps": 123.46, "genTps": 42.12}, "gauge-only llama.cpp builds keep their existing behavior")
 
 
-for test in (test_prism_idle_and_new_work, test_gauges_and_ports, test_restart_and_absence, test_labels_and_old_servers):
+def strata(prompt=86650, hits=38423, gen=8111, prompt_s=18.053, decode_s=38.392, *, running=0, waiting=0, live_gen=0, live_prompt=0, ratio=0.0):
+    """What a Strata server answers to a reader that asks for text/plain (its names as `/metrics` gave them on 2026-10-18)."""
+    return f"""# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{{model_name="m"}} {running}
+vllm:num_requests_waiting{{model_name="m"}} {waiting}
+vllm:kv_cache_usage_perc{{model_name="m"}} {ratio}
+vllm:prompt_tokens_total{{model_name="m"}} {prompt}
+vllm:generation_tokens_total{{model_name="m"}} {gen}
+vllm:prefix_cache_hits_total{{model_name="m"}} {hits}
+strata:live_state{{model_name="m",state="idle"}} {int(not running)}
+strata:live_state{{model_name="m",state="generating"}} {int(bool(running))}
+strata:live_tok_s{{model_name="m"}} {live_gen}
+strata:live_prefill_tok_s_mean{{model_name="m"}} {live_prompt}
+strata:totals_prompt_seconds_total{{model_name="m"}} {prompt_s}
+strata:totals_decode_seconds_total{{model_name="m"}} {decode_s}
+"""
+
+
+def test_strata_speed():
+    CHECKS.section("a Strata cell: speed, queue, context use:")
+    clock = [1000.0]
+    body = [strata()]
+    asked = []
+
+    def answer(req, **_kw):
+        url = where(req)
+        asked.append((url, dict(req.header_items()) if hasattr(req, "header_items") else None))
+        return Response(json.dumps({"default_generation_settings": {"n_ctx": 131072}}) if url.endswith("/props") else body[0], start="")
+
+    probe = ServerProbe(clock=lambda: clock[0])
+    with patched(urllib.request, urlopen=answer):
+        first = probe.metrics(22028)
+        check(asked[0] == ("http://127.0.0.1:22028/metrics", {"Accept": "text/plain"}),
+              f"the cell is asked the way Prometheus asks — Strata answers text only then, otherwise the JSON of its Monitor tab: {asked[0]}")
+        check(first == {"requestsProcessing": 0, "requestsWaiting": 0, "promptTps": 2671.41, "genTps": 211.27, "ctxMax": 131072, "ctxUsed": 0},
+              f"first scrape, idle: the accumulated average — the prompt tokens its cache already held (38423 of 86650) are not read ones, so "
+              f"48227 over 18.053 s, 8111 tokens over 38.392 s; nobody working, the queue empty, no context in use: {first}")
+        clock[0] += 3
+        check(probe.metrics(22028) == first, "an idle scrape holds what was measured instead of replacing it with zero")
+
+        body[0] = strata(running=1, live_gen=188.4, live_prompt=4100.55, ratio=0.0125)
+        clock[0] += 3
+        live = probe.metrics(22028)
+        check(live.get("genTps") == 188.4 and live.get("promptTps") == 4100.55 and live.get("requestsProcessing") == 1 and live.get("ctxUsed") == 1638,
+              f"a request at work: its own speeds, one in work, its share of the context (0.0125 of 131072 = 1638): {live}")
+
+        body[0] = strata(prompt=87650, hits=39023, gen=8411, prompt_s=18.253, decode_s=39.892)
+        clock[0] += 3
+        done = probe.metrics(22028)
+        check(done.get("promptTps") == 2000.0 and done.get("genTps") == 200.0 and done.get("requestsProcessing") == 0 and done.get("ctxUsed") == 0,
+              f"the request is done: the speed of the new work only — 400 tokens read (1000 less 600 cached) in 0.2 s, 300 generated in 1.5 s — "
+              f"not the growth of the counters over the 3 s between scrapes (that would say 133 and 100): {done}")
+        clock[0] += 60
+        check(probe.metrics(22028) == done, "and held while the cell idles, a minute later the same")
+
+        body[0] = strata(prompt=87650, hits=39023, gen=8411, prompt_s=18.253, decode_s=39.892, waiting=2)
+        clock[0] += 3
+        check(probe.metrics(22028).get("requestsWaiting") == 2, "the queue is said as it is")
+
+        body[0] = strata(prompt=100, hits=100, gen=0, prompt_s=0, decode_s=0)
+        clock[0] += 3
+        restarted = probe.metrics(22028)
+        check("promptTps" not in restarted and "genTps" not in restarted,
+              f"negative: counters that went down are a restarted cell: the old rates are dropped, and a new one has measured nothing yet — no speed, "
+              f"not a zero and not the old one: {restarted}")
+
+        body[0] = strata(prompt=100, hits=150, gen=10, prompt_s=1.0, decode_s=1.0)
+        other = ServerProbe(clock=lambda: clock[0]).metrics(22029)
+        check(other.get("promptTps") == 0.0 and other.get("genTps") == 10.0,
+              f"boundary: more tokens held by the cache than were asked for (a server that miscounts) — the read ones are none, the speed 0 and never "
+              f"a negative one: {other}")
+
+        body[0] = "vllm:prompt_tokens_total 500\nstrata:live_tok_s 0\n"
+        clock[0] += 3
+        partial = probe.metrics(22028)
+        check("promptTps" not in partial and "genTps" not in partial,
+              f"negative: a server that does not say its compute seconds gets no rate invented from its token counts: {partial}")
+
+        body[0] = json.dumps({"engine": {"model": "m"}, "live": {"state": "idle", "tok_s": 0}, "totals": {"requests": 24, "output_tokens": 8111}})
+        clock[0] += 3
+        old = probe.metrics(22028)
+        check(old == {"ctxMax": 131072}, f"negative: the JSON of the Monitor tab (a server that was not asked for text) says nothing here: {old}")
+
+    plain = "vllm:prompt_tokens_total 1000\nvllm:generation_tokens_total 400\nvllm:num_requests_running 1\n"
+    seen = [plain]
+
+    def vllm(req, **_kw):
+        url = where(req)
+        if url.endswith("/props"):
+            raise OSError("404")
+        return Response(seen[0], start="")
+    probe = ServerProbe(clock=lambda: clock[0])
+    with patched(urllib.request, urlopen=vllm):
+        probe.metrics(22012)
+        seen[0] = "vllm:prompt_tokens_total 1600\nvllm:generation_tokens_total 520\nvllm:num_requests_running 1\n"
+        clock[0] += 4
+        grown = probe.metrics(22012)
+        check(grown.get("promptTps") == 150.0 and grown.get("genTps") == 30.0,
+              f"a vLLM server (no `strata:` sample) is still read by the growth of its counters per second: {grown}")
+
+
+for test in (test_prism_idle_and_new_work, test_gauges_and_ports, test_restart_and_absence, test_labels_and_old_servers, test_strata_speed):
     test()
-CHECKS.finish()
+sys.exit(CHECKS.finish())

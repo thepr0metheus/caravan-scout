@@ -167,8 +167,17 @@ class ReportSample:
         builds = {"binary_version": lambda: "version: 9947 (abc1234)", "binary_built_at": lambda: built_at,
                   "binary_mtime": lambda: "2026-09-01T10:00:00", "status_slim": lambda: dict(self.UPDATE),
                   "archive": lambda: archive}
+        # What the cache folder holds that this scout did not download (2.34): a model copied in by hand and an engine's own
+        # file. The sample lists them, so a controller that drops a figure of the answer is seen — an empty answer shows nothing.
+        cache = scout.models.cache_dir()
+        foreign = [(cache / "hand-copied" / "model-a-00001-of-00002.gguf", 31_000_000_000),
+                   (cache / "hand-copied" / "model-a-00002-of-00002.gguf", 30_000_000_000),
+                   (cache / "speech" / "small.bin", 6_300_000_000)]
         with patched(scout.machine, **machine), patched(scout.builds, **builds), \
                 patched(scout.driver, facts=lambda: json.loads(json.dumps(self.DRIVER))), \
+                patched(scout.models, footprint=lambda: 12_000_000_000), \
+                patched(scout.cells.keeper, disk=lambda cache: {"totalBytes": 915_000_000_000, "freeBytes": 412_000_000_000},
+                        foreign_files=lambda: list(foreign)), \
                 patched(scout.cells.probe, metrics=lambda port: dict(self.VLLM_METRICS if port == 22012
                                                                       else self.METRICS if port == 22001
                                                                       else {}),

@@ -210,8 +210,7 @@ python3 -m caravan_scout.app --config config.json --state state.json
   "heartbeatIntervalSeconds": 60,
   "llamaServerBin": "~/llama.cpp/build/bin/llama-server",
   "modelsBasePath": "~/llama-model-cache",
-  "llamaNodeDefaultPort": 8180,
-  "cleanOldModels": false
+  "llamaNodeDefaultPort": 8180
 }
 ```
 
@@ -222,7 +221,6 @@ python3 -m caravan_scout.app --config config.json --state state.json
 | `controllerUrl` | The LAMA CARAVAN admin URL the heartbeat posts to — written by the controller when it adds the scout. |
 | `llamaServerBin` | Path to the `llama-server` binary (set by `install.sh`). |
 | `modelsBasePath` | Local cache dir for downloaded models. The scout deletes only files it downloaded there, so it may point at a shared folder. |
-| `cleanOldModels` | After a start with caching on, delete the other cached models this scout downloaded (off by default); what running cells hold stays. |
 | `controllerToken` | The fleet token, when the controller has sign-in enabled (the controller hands it over when it adds the scout). |
 
 ## API

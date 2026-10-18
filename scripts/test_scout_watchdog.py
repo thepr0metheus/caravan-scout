@@ -88,6 +88,10 @@ class Clock:
 
 def rig(relaunch_ok=True):
     s = make_scout()
+    # What listens on the machine, written by the test; None is "the machine will not say" (the rule of a cell that never gets ready
+    # is then silent, and the older pins below are about the other rule).
+    s.listening = {"ports": None}
+    s.cells.machine.listening_ports = lambda: s.listening["ports"]
     cell = s.cells.at(22021)
     proc = FakeProcess(relaunch_ok)
     cell.process = proc
@@ -168,7 +172,7 @@ def test_the_last_lines():
     clock.now += 10
     ticks(dog)
     with patched(s.cells.probe, metrics=lambda port: {}), \
-            patched(s.cells.machine, firewall=lambda port: {}, listening_ports=lambda: {22021}):
+            patched(s.cells.machine, firewall=lambda port: {}, listening_ports=lambda: {22021}, processes=lambda: None):
         view = s.cells.view(cell)
     check(proc.relaunches == 1 and (view.get("crash") or {}).get("tail") == "E load: tensor data is not within the file bounds\nE main: exiting",
           "перезапуск отодвинул лог, а строки в заметке — всё ещё того падения; карточка их читает")
@@ -216,6 +220,120 @@ def test_a_signal_by_its_name():
           "negative: обычный код — как был; неизвестный номер сигнала — числом, без выдумок")
     check(Watchdog.how({"exitCode": None}) == "ended with an unknown exit code (adopted after a scout restart)",
           "defect-history: код усыновлённой ячейки неизвестен — так и сказано словами, а не «exited (code None)»")
+
+
+def test_killed_from_outside_says_so():
+    CHECKS.section("убита снаружи — так и сказано:")
+    hint = Watchdog.KILLED
+    check(hint.startswith(" (killed from outside") and "systemd-oomd" in hint and "OOM killer" in hint,
+          "подсказка названа словами, а не прочитана из константы: убийцы по имени (systemd-oomd, убийца памяти ядра) — пустая подсказка "
+          "оставила бы одно «died of SIGKILL», с которым владелец не знает, что делать")
+    s, cell, proc, clock, dog = rig()
+    proc.crash("[strata] still starting (461 s) - please wait ...", code=-9)
+    ticks(dog)
+    check(cell.crash["reason"] == "died of SIGKILL" + hint + " — its last words: [strata] still starting (461 s) - please wait ..."
+          and "died of SIGKILL" in dog.suspect.words[0],
+          "defect-history (2026-10-18): SIGKILL — процесс сам не ловит её, и последняя строка лога лишь последнее, что он сказал; причина на карточке "
+          "начинается с сигнала и подсказки (systemd-oomd или убийца памяти ядра), строка лога идёт после; подозрение на сборку видит «died of SIGKILL»")
+    s, cell, proc, clock, dog = rig()
+    proc.crash("", code=-9)
+    ticks(dog)
+    check(cell.crash["reason"] == "died of SIGKILL" + hint, "лог молчит — одна подсказка, без «its last words» после неё")
+    s, cell, proc, clock, dog = rig()
+    proc.crash("E ggml: something went wrong", code=-6)
+    ticks(dog)
+    check(cell.crash["reason"] == "E ggml: something went wrong",
+          "negative: SIGABRT, SIGSEGV — процесс сам себя прервал и сказал почему: причина — строка лога, как была")
+    s, cell, proc, clock, dog = rig()
+    proc.crash("E ggml: bad", code=1)
+    ticks(dog)
+    check(cell.crash["reason"] == "E ggml: bad", "negative: обычный код выхода — строка лога, как была")
+    s, cell, proc, clock, dog = rig()
+    proc.crash("[strata] still starting (9 s) - please wait ...", code=None)
+    ticks(dog)
+    check(cell.crash["reason"] == "[strata] still starting (9 s) - please wait ...",
+          "negative: код неизвестен (усыновлённая ячейка) — не выдумываем, что это был SIGKILL")
+    long = Watchdog.reason({"exitCode": -9, "lastError": "x" * 400})
+    check(len(long) == 300 and long.startswith("died of SIGKILL"), "boundary: причина не длиннее 300 знаков")
+
+
+def test_a_cell_that_never_gets_ready_is_not_restarted_forever():
+    CHECKS.section("ячейка, что не доходит до готовности, не перезапускается вечно:")
+
+    def die(s, proc, clock, dog, ready=False, minutes=5):
+        """One run that lasts `minutes` and dies: it listens first when `ready`."""
+        proc.state = {"running": True, "pid": 11}
+        s.listening["ports"] = {22021} if ready else set()
+        ticks(dog)
+        clock.now += minutes * 60
+        proc.crash("[strata] still starting (300 s) - please wait ...", code=-9)
+        ticks(dog)
+        clock.now += Watchdog.RESTART_SEC
+        ticks(dog)
+
+    s, cell, proc, clock, dog = rig()
+    for _ in range(4):
+        die(s, proc, clock, dog)
+    check(cell.crash["gaveUp"] is True and cell.crash["neverReady"] is True and cell.crash["count"] == 4 and proc.relaunches == 3,
+          "defect-history (2026-10-18): четыре запуска по пять минут, каждый убит, ни один не открыл порт — окно «3 за 10 минут» не набирается, "
+          "но после трёх перезапусков, что не прижились, ячейка остаётся лежать (раньше круг шёл, пока владелец не нажал Stop)")
+    check(cell.crash["reason"].startswith("died of SIGKILL"), "причина — настоящая, а не строка прогресса")
+    got = s.cells.view(cell)
+    check(got.get("lastError", "").startswith("never ready in 4 starts — not restarting it: died of SIGKILL"),
+          "карточка говорит «never ready in 4 starts», а не «in 10 minutes», которых не было")
+    public = Watchdog.public(cell.crash)
+    check(public["gaveUp"] is True and public["neverReady"] is True, "контроллер читает оба признака")
+
+    s, cell, proc, clock, dog = rig()
+    for ready in (False, False, True, False, False, False):
+        die(s, proc, clock, dog, ready=ready)
+    check(cell.crash.get("gaveUp") is not True and proc.relaunches == 6,
+          "negative: запуск, что дошёл до открытого порта, обнуляет счёт «не прижилось»: три провала, один живой, ещё три — не сдаётся")
+    die(s, proc, clock, dog, ready=False)
+    check(cell.crash.get("gaveUp") is True and cell.crash["neverReady"] is True,
+          "четвёртый провал подряд после живого запуска — сдаётся")
+
+    s, cell, proc, clock, dog = rig()
+    for _ in range(6):
+        proc.state = {"running": True, "pid": 11}
+        ticks(dog)
+        clock.now += 300
+        proc.crash("x", code=-9)
+        ticks(dog)
+        clock.now += Watchdog.RESTART_SEC
+        ticks(dog)
+    check(cell.crash.get("gaveUp") is not True and proc.relaunches == 6,
+          "negative: машина не говорит, что слушает (None) — правило не включается, а не считает каждый запуск негодным")
+
+    s, cell, proc, clock, dog = rig()
+    s.listening["ports"] = {22021}
+    ticks(dog)
+    check(cell.listened is True, "запуск, чей порт слушает, отмечен: он дошёл до готовности")
+    proc.crash("x", code=-9)
+    ticks(dog)
+    check(cell.listened is None and cell.crash["unready"] == 0,
+          "упала — признак снят. Запуск, что начат вручную после «сдался» (перезапуска нет), не должен наследовать «слушал» мёртвого: "
+          "иначе он, не открыв порт, сошёл бы за готовый и обнулил счёт")
+    proc.state = {"running": True, "pid": 50}
+    ticks(dog)
+    check(cell.listened is True and proc.relaunches == 0,
+          "в десять секунд до перезапуска владелец сам запустил ячейку: она слушает — отмечено")
+    proc.crash("x", code=-9)
+    clock.now += Watchdog.RESTART_SEC
+    ticks(dog)
+    check(proc.relaunches == 1 and cell.listened is None,
+          "перезапуск начинает новый запуск с чистым признаком: слушание того, что умерло перед ним, к нему не относится")
+
+    s, cell, proc, clock, dog = rig()
+    s.listening["ports"] = set()
+    for _ in range(4):
+        proc.crash("x", code=1)
+        ticks(dog)
+        clock.now += Watchdog.RESTART_SEC
+        ticks(dog)
+    check(cell.crash["gaveUp"] is True and cell.crash["neverReady"] is False
+          and s.cells.view(cell)["lastError"].startswith("crashed 4 times in 10 minutes — not restarting it: x"),
+          "negative: четыре падения за минуты — прежнее правило окна и его слова («in 10 minutes»), признак neverReady не ставится")
 
 
 def test_the_card_knows_these_words():
@@ -343,7 +461,8 @@ def test_the_launcher_runs_it():
 
 
 for fn in (test_restart_after_ten_seconds, test_gives_up_after_three, test_the_last_lines, test_the_suspect_is_told,
-           test_a_signal_by_its_name, test_the_card_knows_these_words, test_what_is_not_a_crash,
+           test_a_signal_by_its_name, test_killed_from_outside_says_so, test_a_cell_that_never_gets_ready_is_not_restarted_forever,
+           test_the_card_knows_these_words, test_what_is_not_a_crash,
            test_by_hand,
            test_relaunch_itself, test_the_launcher_runs_it):
     fn()

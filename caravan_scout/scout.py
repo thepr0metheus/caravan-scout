@@ -12,6 +12,7 @@ from caravan_scout.engines import ForeignEngines
 from caravan_scout.heartbeat import Heartbeat
 from caravan_scout.identity import HostIdentity
 from caravan_scout.job import BackgroundJob
+from caravan_scout.reconcile import Reconcile
 from caravan_scout.driver import DriverFacts
 from caravan_scout.driver_packages import DriverPackages
 from caravan_scout.entry import Copies, MachineEntry, MachineModels
@@ -61,6 +62,8 @@ class Scout:
         self.engines = ForeignEngines(self.machine, self.cells, servers=EngineServers(
             self.state, EngineProcs(self.state.path.parent / "engine-logs")))
         self.watchdog = Watchdog(self.cells, self.suspect)
+        # A cell this scout started and lost track of is held again (Reconcile).
+        self.reconcile = Reconcile(self.cells)
         # What decides whether the NVIDIA card comes back after a reboot
         # (2.19): the controller warns before the reboot, not after it.
         self.driver = DriverFacts(Machine.run_text)
@@ -79,3 +82,13 @@ class Scout:
         # The machine's entry by OpenAI's API (2.27): its models by name, a request to a running copy.
         self.entry = MachineEntry(self.machine_models,
                                   Copies(lambda port: self.cells.probe.metrics(port).get("requestsProcessing")))
+
+    def start_cells(self) -> None:
+        """The cells that start with the machine, and then the cache trimmed to its setting: the cells have asked for their files
+        by then, so a trim does not take them. Off the main thread — a slow start does not keep the port closed."""
+        self.autostart.start_all()
+        try:
+            self.cells.keeper.trim()
+        except Exception as exc:  # noqa: BLE001 — a trim that fails does not stop a scout
+            print(f"[llama-node] cache trim at start failed: {exc}")
+

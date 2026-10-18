@@ -54,6 +54,8 @@ class Report:
         suspect = self.suspect.verdict(version)
         # Before the lock too, like the machine's probes: the list asks each cell's process.
         models = self.entry_models.listing() if self.entry_models else None
+        # And the cache: its setting is read from the state, under the lock this block takes.
+        model_cache = self.cells.keeper.facts()
         with self.state.lock:
             return {
                 "service": "caravan-scout",
@@ -105,6 +107,9 @@ class Report:
                 # The machine's models as GET /v1/models lists them (2.28): a controller
                 # names a model of this machine by its name, as a client of the entry does.
                 "entryModels": models,
+                # The model cache (2.34): how many of the last models it keeps, what it holds, what of that this scout did
+                # not download (never deleted by itself), what the disk has left.
+                "modelCache": model_cache,
                 "time": int(time.time()),
             }
 
@@ -166,6 +171,7 @@ class Report:
             "autostart": state["autostart"],
             "autostartRequests": state["autostartRequests"],
             "entryModels": state["entryModels"],
+            "modelCache": state["modelCache"],
             "agentUrl": f"http://{state['host']['ip']}:{self.config.get('listenPort')}",
             "time": state["time"],
         }

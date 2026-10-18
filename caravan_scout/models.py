@@ -88,6 +88,10 @@ class DownloadedFiles:
         base = self.cache_dir()
         return [base / name for name in sorted(self._read())]
 
+    def names(self) -> set[str]:
+        """What is written down, as paths inside the cache folder (a folder model by its own name)."""
+        return self._read()
+
 
 class SplitGguf:
     """A GGUF in parts — `<stem>-00001-of-00002.gguf` and the rest beside it.
@@ -513,21 +517,6 @@ class ModelFetcher:
                 time.sleep(delay)
         raise AppError(f"model download failed: {last_exc}", 500)
 
-    def cleanup_old(self, keep_paths: Any) -> None:
-        """Delete the .gguf files this scout downloaded, except the kept ones
-        (model + mmproj + spec draft).
-
-        Called after a successful llama-server start when cleanOldModels is
-        on (off by default). Only files the scout downloaded (DownloadedFiles)
-        — it used to be every .gguf under the cache dir.
-        """
-        if isinstance(keep_paths, (str, Path)):
-            keep_paths = [keep_paths]
-        keep_resolved = {Path(p).resolve() for p in keep_paths if p}
-        deleted = [p.name for p in self._delete_downloaded((".gguf",), keep_resolved)[0]]
-        if deleted:
-            print(f"[llama-node] cleanOldModels: removed {len(deleted)} file(s): {deleted}")
-
     def _delete_downloaded(self, suffixes: tuple, keep_resolved: set,
                            folders: bool = False) -> tuple[list[Path], int]:
         """Delete the downloaded files with these suffixes that are not kept,
@@ -579,6 +568,17 @@ class ModelFetcher:
         if not path.is_dir():
             return path.stat().st_size
         return sum(f.lstat().st_size for f in path.rglob("*") if f.is_symlink() or f.is_file())
+
+    def footprint(self) -> int:
+        """Bytes the files and folders this scout downloaded take now: what the ledger says is its own and the disk still holds."""
+        total = 0
+        for path in self.downloaded.paths():
+            try:
+                if path.exists():
+                    total += self._size(path)
+            except OSError:
+                continue
+        return total
 
     def purge(self, keep: Any = None) -> dict[str, Any]:
         """Delete the .gguf/.tmp files and the model folders this scout

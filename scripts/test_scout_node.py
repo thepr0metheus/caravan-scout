@@ -296,6 +296,7 @@ PRIORITY_CASES = [
     ("mtmd_init_from_file", "mtmd_init_from_file: cannot load the projector"),
     ("no such file", "main: cannot stat /models/model.gguf: No such file or directory"),
     ("failed to open", "llama_model_load_from_file_impl: failed to open /models/model.gguf"),
+    ("no kernel image", "CUDA error: no kernel image is available for execution on the device"),
 ]
 MARKER_CASES = [
     ("error", "whisper: error reading audio chunk 3"),
@@ -389,6 +390,94 @@ def test_read_log_error_catastrophes():
              line, f"as-is: катастрофы не смотрят на уровень — W с «{name}» становится причиной")
     same(read(log_with("loading model weights", "Segmentation fault (core dumped)", "cleanup done")),
          "Segmentation fault (core dumped)", "лог без уровней: катастрофа важнее последней строки")
+
+
+def test_read_log_error_debugger_noise():
+    CHECKS.section("причина из лога — шум отладчика после падения:")
+    cuda = lv("E", "CUDA error: no kernel image is available for execution on the device", "0.02.871.671")
+    frames = ["#2  0x00007c873ab4d82b in ggml_abort () from /home/u/llama.cpp/build/bin/libggml-base.so.0",
+              "#3  0x00007c8736078757 in ggml_cuda_error(char const*, char const*) () from /home/u/libggml-cuda.so.0",
+              "   #5  0x0000601cc4f612a5 in abort_handler ()",
+              "warning: 360\t../csu/libc-start.c: No such file or directory.",
+              "[Inferior 1 (process 9089) detached]"]
+    same(read(log_with(lv("E", "  current device: 1, in function ggml_cuda_kernel_can_use_pdl", "0.02.871.677"), *frames)), "",
+         "as-is: без самой строки ошибки, одни кадры отладчика причиной не становятся — ни «abort» из кадра, ни «no such file» "
+         "из предупреждения о чужом исходнике; уровневый лог без причины — пусто")
+    same(read(log_with(lv("I", "main: loading model"), cuda, lv("E", "  current device: 1, in function ggml_cuda_kernel_can_use_pdl",
+                                                             "0.02.871.677"), *frames)), cuda,
+         "после падения llama-server gdb пишет кадры и «No such file» — причина остаётся строка ошибки CUDA («no kernel image»), "
+         "а не libc-start.c (на доске 2026-10-17 стояло именно оно)")
+    same(read(log_with(cuda, "later: step failed on shutdown")), cuda,
+         "«no kernel image» — приоритетный шаблон: перед более поздней общей ошибкой он причина")
+    real = "main: cannot stat /models/model.gguf: No such file or directory"
+    same(read(log_with(real, *frames)), real,
+         "negative: настоящее «No such file or directory» из строки программы остаётся причиной — отбрасывается только шум gdb")
+    same(read(log_with("warning: model file is incomplete, failed to read header")), "warning: model file is incomplete, failed to read header",
+         "negative: предупреждение программы с «failed» — не кадр и не предупреждение gdb о исходнике: остаётся причиной")
+    same(read(log_with("[New LWP 1234]", "[Thread debugging using libthread_db enabled]", "Using host libthread_db library /lib/x86_64-linux-gnu/libthread_db.so.1.",
+                       "[Inferior 1 (process 7) detached]")), "",
+         "строки подключения и отключения gdb — тоже шум: лог из одного шума — пусто, а не «последняя строка»")
+
+
+def test_read_log_error_library_footers():
+    CHECKS.section("причина из лога — хвост pydantic после причины:")
+    head = "(APIServer pid=2051606) pydantic_core._pydantic_core.ValidationError: 1 validation error for ModelConfig"
+    cause = ("(APIServer pid=2051606)   Value error, Unrecognized model in /m/x. Should have a `model_type` key in its config.json. "
+             "[type=value_error, input_value=ArgsKwargs((), {'model': 'x'}), input_type=ArgsKwargs]")
+    footer = "(APIServer pid=2051606)     For further information visit https://errors.pydantic.dev/2.13/v/value_error"
+    same(read(log_with(head, cause, footer)), cause,
+         "vLLM: после строки «Value error, …» pydantic пишет ссылку на свои доки; причина — строка до неё, а не ссылка (на доске 2026-10-17 стояла ссылка)")
+    trust = ("(APIServer pid=2030657) Please pass the argument `trust_remote_code=True` to allow custom code to be run. "
+             "[type=value_error, input_value=ArgsKwargs((), {'model': ...}), input_type=ArgsKwargs]")
+    same(read(log_with(head, "(APIServer pid=2030657)   Value error, The repository /m/x contains custom code which must be executed.",
+                       trust, footer.replace("2051606", "2030657"))), trust,
+         "положительный: «trust_remote_code=True» — строка, которая говорит, что делать, и она причина")
+    same(read(log_with(footer)), "", "as-is: лог из одной ссылки причину не называет — пусто, а не «последняя строка»")
+    same(read(log_with("listening", "For further information see the log of the engine")), "For further information see the log of the engine",
+         "negative: другая фраза «For further information …» — не ссылка pydantic и не хвост: лог читается как раньше, последняя строка остаётся")
+    plain = "    For further information visit https://errors.pydantic.dev/2.13/v/value_error"
+    same(read(log_with("config check failed [type=value_error]", plain)), "config check failed [type=value_error]",
+         "ссылка без префикса процесса и с отступом — тоже хвост: причина — строка до неё")
+    same(read(log_with("Traceback (most recent call last):", "  File \"x.py\", line 3, in <module>",
+                       "https://errors.pydantic.dev/2.13/v/value_error")), "https://errors.pydantic.dev/2.13/v/value_error",
+         "negative: адрес без «For further information visit» — не хвост, остаётся как было")
+
+
+def test_read_log_error_progress_lines():
+    CHECKS.section("причина из лога — строка «ещё живу» не причина:")
+    beat = lambda n: f"[strata] still starting ({n} s) - please wait ..."  # noqa: E731
+    same(read(log_with(beat(90), beat(110), beat(461))), "",
+         "defect-history (2026-10-18): Strata пишет «still starting (N s)» раз в 20 с, пока движок грузится; убитый посреди загрузки процесс оставляет её "
+         "последней строкой — и она была причиной на доске. Лог из одних таких строк причину не называет: пусто, а не «последняя строка»")
+    err = "strata generate: engine died: CUDA error: out of memory"
+    same(read(log_with(err, beat(20), beat(40))), err,
+         "строки «ещё живу» после настоящей причины её не заслоняют: причина — строка до них")
+    same(read(log_with("[strata] engine started: /home/u/Strata/engine/strata --serve", beat(30))), "[strata] engine started: /home/u/Strata/engine/strata --serve",
+         "negative: другая строка с «[strata]» — не «ещё живу»: лог читается как раньше, последняя строка остаётся")
+    same(read(log_with("[strata] still starting (soon) - please wait ...")), "[strata] still starting (soon) - please wait ...",
+         "negative: «still starting» без числа секунд — не та строка: остаётся как была")
+
+
+def test_read_log_error_exception_lines():
+    CHECKS.section("причина из лога — последняя строка исключения, а не обёртка над ней:")
+    cause = "(EngineCore pid=2087114) torch._inductor.exc.InductorError: AssertionError: auto_functionalized was not removed"
+    wrapper = "(APIServer pid=2086514) RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}"
+    same(read(log_with("(EngineCore pid=2087114) Traceback (most recent call last):", cause, "(APIServer pid=2086514)     raise RuntimeError(", wrapper)),
+         cause, "vLLM: «See root cause above» — причина строка исключения выше обёртки, а не обёртка и не «raise RuntimeError(» (на доске 2026-10-17 стояла обёртка)")
+    same(read(log_with("Traceback (most recent call last):", '  File "run.py", line 3, in <module>', "ValueError: bad value 7", "cleanup: done")),
+         "ValueError: bad value 7", "обычный python: причина — последняя строка исключения, лог после неё без ошибок не мешает")
+    same(read(log_with("Traceback (most recent call last):", "RuntimeError: first", "cleanup failed: socket was closed")),
+         "RuntimeError: first", "as-is: после строки исключения общая «failed» строка причиной не становится — исключение главнее")
+    same(read(log_with("Traceback (most recent call last):", "ValueError: first", "During handling of the above exception, another exception occurred:",
+                       "KeyError: second")), "KeyError: second", "цепочка исключений: причина — последнее, не первое")
+    same(read(log_with("Traceback (most recent call last):", "Exception: odd thing", "cleanup failed: x")), "Exception: odd thing",
+         "исключение без «Error» в имени (Exception) — тоже строка исключения")
+    only = "(APIServer pid=1) RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}"
+    same(read(log_with("starting", only)), only,
+         "boundary: выше обёртки исключения нет — остаётся она сама: чтение, как до правила (строка с «error»)")
+    last = lv("E", "srv: exiting due to model loading error", "0.00.300.000")
+    same(read(log_with(lv("I", "main: loading model"), "RuntimeError: odd", last)), last,
+         "negative: в логе llama.cpp (с уровнями) правило исключений не применяется — читается, как читалось: строка E, а не «RuntimeError» без уровня")
 
 
 def test_read_log_error_window():
@@ -987,7 +1076,7 @@ def test_slot_defaults():
 
 
 TESTS = (test_read_log_error_absent, test_read_log_error_priority, test_read_log_error_markers,
-         test_read_log_error_levels, test_read_log_error_catastrophes, test_read_log_error_window,
+         test_read_log_error_levels, test_read_log_error_catastrophes, test_read_log_error_debugger_noise, test_read_log_error_library_footers, test_read_log_error_progress_lines, test_read_log_error_exception_lines, test_read_log_error_window,
          test_log_tail, test_log_scrub, test_rotate_log, test_pid_alive, test_adopt, test_adopted_death, test_start, test_start_command,
          test_stop_own, test_stop_adopted, test_status, test_slot_defaults)
 

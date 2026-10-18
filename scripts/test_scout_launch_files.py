@@ -86,7 +86,7 @@ def test_on_the_card():
     proc = held(f["model"])
     with patched(proc, status=lambda: {"running": True, "pid": 7, "startedAt": START}), \
             patched(scout.cells.probe, metrics=lambda port: {}), \
-            patched(scout.machine, firewall=lambda port: {}, listening_ports=lambda: None):
+            patched(scout.machine, firewall=lambda port: {}, listening_ports=lambda: None, processes=lambda: None):
         cell = scout.cells.at(22031)
         cell.process = proc
         view = scout.cells.view(cell)

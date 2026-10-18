@@ -35,6 +35,29 @@ class CellLog:
     # own cells from their journal.
     TAIL_LINES = 8
     TAIL_CHARS = 1500
+    #: What a debugger prints into a crashed server's log after the server's own message (llama.cpp's crash handler runs
+    #: gdb): a frame ("#3  0x… in ggml_abort () from …"), a source file it cannot find ("warning: 360\t../csu/libc-start.c:
+    #: No such file or directory."), the detach lines. None of it says why the server died, and its "abort", "error" and
+    #: "no such file" were taken for the reason: a cell that died of "no kernel image" showed a libc source file on the
+    #: board (2026-10-17).
+    DEBUGGER_NOISE = re.compile(r"^\s*(?:#\d+\s+0x[0-9a-f]+\s|warning: \d+\s|\[Inferior \d+ \(process \d+\) detached\]"
+                                r"|\[New LWP |\[Thread debugging |Using host libthread_db)")
+    #: What a Python library prints AFTER the cause and which says nothing about it: pydantic ends every validation
+    #: error with a pointer to its docs ("For further information visit https://errors.pydantic.dev/…"), and that line's
+    #: "error" took the place of the cause the line above it states ("Value error, Unrecognized model in … model_type",
+    #: "Please pass the argument `trust_remote_code=True`"): the board showed the pointer for two vLLM cells (2026-10-17).
+    LIBRARY_FOOTERS = re.compile(r"^\s*(?:\([A-Za-z]+ pid=\d+\)\s+)?For further information visit https?://errors\.pydantic\.dev/")
+    #: A line a program prints to say it is still alive: Strata's launcher says "[strata] still starting (461 s) - please wait ..."
+    #: every 20 s while its engine loads. A process that was killed in the middle (systemd-oomd, 2026-10-18) leaves one of them
+    #: last in its log, and that line was taken for the reason: the board said "still starting" of a cell that had died four times.
+    PROGRESS_NOISE = re.compile(r"^\s*\[strata\]\s+still starting \(\d+ s\)")
+    #: An exception line of a Python log: "(EngineCore pid=2087114) torch._inductor.exc.InductorError: AssertionError: …".
+    EXCEPTION_LINE = re.compile(r"^\s*(?:\([A-Za-z]+ pid=\d+\)\s+)?(?:[A-Za-z_]\w*\.)*\w*(?:Error|Exception)\b:\s")
+    #: An exception line that is not the cause itself. A wrapper says the cause stands ABOVE it: vLLM ends with
+    #: "RuntimeError: Engine core initialization failed. See root cause above." — the cause is the exception line before
+    #: (2026-10-17, a vLLM cell whose card said only that the engine core failed). A header says it stands BELOW it:
+    #: pydantic's "ValidationError: 1 validation error for ModelConfig" is followed by the lines that say what is wrong.
+    CAUSE_ELSEWHERE = re.compile(r"see root cause above|validation errors? for ", re.I)
     SECRETS = (
         # A key by its prefix, wherever it stands.
         (re.compile(r"\b(lcv1_|sk-|hf_|ghp_|glpat-)[A-Za-z0-9_\-]{6,}"), r"\1…"),
@@ -102,7 +125,8 @@ class CellLog:
                 encoding="utf-8", errors="replace").splitlines() if ln.strip()]
         except Exception:
             return ""
-        tail = lines[-80:]  # look further back than before
+        # look further back than before; what only follows the cause (a debugger's lines, a library's footer) is no cause
+        tail = [ln for ln in lines[-80:] if not (self.DEBUGGER_NOISE.match(ln) or self.LIBRARY_FOOTERS.match(ln) or self.PROGRESS_NOISE.match(ln))]
         # llama.cpp: "0.00.817.809 W load: …" — capture the level per line.
         _lvl = re.compile(r"^\s*[\d.]+\s+([IWED])\s")
         levels = {ln: (_lvl.match(ln).group(1) if _lvl.match(ln) else "") for ln in tail}
@@ -126,6 +150,9 @@ class CellLog:
             "mtmd_init_from_file",
             "no such file",
             "failed to open",
+            # The engine has no code for the card it runs on (a build for the RTX 5090 alone on an RTX 3090): the fix
+            # is a build for that card, and the message says nothing else.
+            "no kernel image",
         )
         # NOT level-filtered on purpose. These patterns are unambiguous failure
         # signatures — nothing benign says "corrupted or incomplete" — and the
@@ -136,6 +163,12 @@ class CellLog:
             low = ln.lower()
             if any(p in low for p in priority):
                 return ln[:300]
+        # A Python log has no levels: its cause is the last exception line — unless that line only says where the cause
+        # stands (CAUSE_ELSEWHERE): then the one before it, or, for a header, the generic reading below.
+        if not levelled:
+            for ln in reversed(tail):
+                if self.EXCEPTION_LINE.match(ln) and not self.CAUSE_ELSEWHERE.search(ln):
+                    return ln[:300]
         # Fallback: any error/failure line
         markers = ("error", "abort", "failed", "invalid argument", "what()")
         for ln in reversed(tail):
@@ -154,7 +187,7 @@ class CellLog:
         # Levelled log with nothing but I/W left: we genuinely do not know why it
         # went. Say nothing rather than blame the last harmless line — the board
         # renders an unexplained failure as such.
-        return "" if levelled else (lines[-1][:300] if lines else "")
+        return "" if levelled else (tail[-1][:300] if tail else "")
 
     def open_new(self):
         """The file this run writes to, opened fresh: its folder made first,
@@ -631,6 +664,94 @@ class HostProcesses:
             return None
         return f" {cls.CELL_ENV}=" in out.stdout
 
+    @classmethod
+    def port_of(cls, pid: Any) -> int:
+        """The port a scout started `pid` for — what CELL_ENV says in its
+        environment — or 0: not a scout's, gone, unreadable, or a machine that
+        keeps no /proc.
+
+        This, not the command line, is how a cell is known again. A command
+        cell's launcher is often an `exec` chain (bash → run_strata.sh →
+        python server.py → the engine), each link rewriting argv, so the
+        marker the record keeps from the controller's command line is not in
+        what `ps` shows (2026-10-14: the marker of Strata's record carried a
+        literal $HOME). The environment is kept through every exec and every
+        child."""
+        try:
+            raw = (cls.PROC / str(int(pid)) / "environ").read_bytes()
+        except (OSError, TypeError, ValueError):
+            return 0
+        prefix = cls.CELL_ENV.encode() + b"="
+        for item in raw.split(b"\0"):
+            if item.startswith(prefix):
+                value = item[len(prefix):].decode("ascii", "ignore")
+                return int(value) if value.isdigit() else 0
+        return 0
+
+    @classmethod
+    def parent_of(cls, pid: Any) -> int:
+        """The parent of `pid`, from /proc/<pid>/stat; 0 when it does not say."""
+        try:
+            fields = (cls.PROC / str(int(pid)) / "stat").read_text(errors="replace").rsplit(")", 1)[1].split()
+            return int(fields[1])
+        except (OSError, TypeError, ValueError, IndexError):
+            return 0
+
+    @classmethod
+    def tagged_cells(cls) -> dict[int, list[int]]:
+        """The cells of this machine that a scout started, found by the mark
+        their processes carry: {port: [the pids at the root of the cell's
+        tree]}. A cell is a tree — Strata's server and the engine under it
+        both carry the mark — and its root is the one whose parent does not.
+        {} where /proc does not say (macOS): the questions below then fall back
+        to the port and the command line, as before."""
+        if not cls.PROC.is_dir():
+            return {}
+        me = os.getpid()
+        trees: dict[int, dict[int, int]] = {}
+        try:
+            names = [entry.name for entry in cls.PROC.iterdir() if entry.name.isdigit()]
+        except OSError:
+            return {}
+        for name in names:
+            pid = int(name)
+            port = cls.port_of(pid) if pid != me else 0
+            if port:
+                trees.setdefault(port, {})[pid] = cls.parent_of(pid)
+        return {port: sorted(pid for pid, parent in tree.items() if parent not in tree)
+                for port, tree in trees.items()}
+
+    @classmethod
+    def started_at(cls, pid: Any) -> int:
+        """When `pid` started, in epoch seconds, from /proc: the clock ticks of
+        its start since the boot, and the boot's own time. 0 when /proc does not
+        say — a cell found again without a record is then as old as its
+        adoption."""
+        try:
+            ticks = int((cls.PROC / str(int(pid)) / "stat").read_text(errors="replace")
+                        .rsplit(")", 1)[1].split()[19])
+            booted = next(int(line.split()[1]) for line in (cls.PROC / "stat").read_text().splitlines()
+                          if line.startswith("btime "))
+            return booted + ticks // os.sysconf("SC_CLK_TCK")
+        except (OSError, StopIteration, TypeError, ValueError, IndexError, AttributeError):
+            return 0
+
+    @classmethod
+    def carrier(cls, port: Any, prefer: Any = 0) -> int:
+        """The process a scout started for `port` that still runs, listening
+        or not yet — a cell loading its model does not listen for a minute and
+        more. `prefer` when it is one of them, else the first root; 0 when no
+        process carries the mark of that port."""
+        port = int(port)
+        try:
+            want = int(prefer or 0)
+        except (TypeError, ValueError):
+            want = 0
+        if want > 1 and cls.port_of(want) == port:
+            return want
+        roots = cls.tagged_cells().get(port) or []
+        return roots[0] if roots else 0
+
     #: How many processes a cell's tree may name: a server with its engine and
     #: helpers has a handful, and a runaway fork is not walked.
     TREE_LIMIT = 64
@@ -671,6 +792,34 @@ class HostProcesses:
                         found.append(kid)
                         todo.append(kid)
         return found
+
+    @classmethod
+    def resident(cls, pid: Any, table: dict[int, dict[str, Any]] | None) -> int | None:
+        """The memory a cell's processes hold in RAM, in bytes: the RSS of the process `pid` and of everything it started (the server's engine,
+        vLLM's workers), read from one `ps` table (`Machine.processes()`: pid -> {ppid, rssKb, name}) — the figure an engine's `ramBytes`
+        is. None when there is no table (ps did not answer) or the table does not hold the process: "not told" is not "nothing".
+
+        RSS counts the memory-mapped model files a process has touched: the weights of a CPU cell are in it, and a file that two cells map
+        is in both of them. The tree is walked by parent pid, so it works where /proc does not (macOS), and is cut at TREE_LIMIT as
+        `descendants` is."""
+        try:
+            root = int(pid)
+        except (TypeError, ValueError):
+            return None
+        if not table or root not in table:
+            return None
+        children: dict[int, list[int]] = {}
+        for child, row in table.items():
+            children.setdefault(int(row.get("ppid") or 0), []).append(child)
+        found: list[int] = []
+        todo = [root]
+        while todo and len(found) < cls.TREE_LIMIT + 1:
+            current = todo.pop(0)
+            if current in found:
+                continue
+            found.append(current)
+            todo.extend(children.get(current, []))
+        return sum(int(table[p].get("rssKb") or 0) for p in found) * 1024
 
     @staticmethod
     def marker_matches(marker: str, cmdline: str) -> bool:

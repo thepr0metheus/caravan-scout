@@ -80,7 +80,7 @@ def view(listening, tail="[caravan] provisioning vLLM venv\nCollecting vllm==0.2
     cell = s.cells.at(22013)
     cell.process = Running(tail)
     with patched(s.cells.probe, metrics=lambda port: {}), \
-            patched(s.machine, firewall=lambda port: {}, listening_ports=lambda: listening):
+            patched(s.machine, firewall=lambda port: {}, listening_ports=lambda: listening, processes=lambda: None):
         return s.cells.view(cell)
 
 

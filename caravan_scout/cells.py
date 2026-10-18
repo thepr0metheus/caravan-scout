@@ -13,6 +13,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
+from caravan_scout.cache_keeper import CacheKeeper
 from caravan_scout.models import ModelFetcher
 from caravan_scout.process import CellProcess, HostProcesses
 from caravan_scout.prism import PrismRuntime
@@ -33,8 +34,13 @@ class Cell:
         self.startup: dict[str, Any] = {"phase": "idle"}
         self.lock = threading.Lock()
         self.cache_models = False
+        # The memory its start promised to keep resident (MemoryLedger), in MiB; 0 = none promised.
+        self.ram_mib = 0
         # Crashes since it was last started by hand (Watchdog); None = none.
         self.crash: dict[str, Any] | None = None
+        # Whether THIS run's port has listened yet (Watchdog): None = not watched (the machine will not say what listens),
+        # False = watched and silent so far, True = it listened — the run got ready.
+        self.listened: bool | None = None
         # What its model is called at the machine's entry (2.27, entry.ModelName), from the start
         # that made it — said from the start's first moment, so a model being loaded is found by its
         # name as "starting"; "" for a cell no start of this scout made (its record keeps the name).
@@ -47,7 +53,12 @@ class ServerProbe:
     llama-server was launched with and how many requests it takes at once
     from /props (kept ~30 s).
 
-    llama-server and vLLM tell the same facts under different names.
+    llama-server and vLLM tell the same facts under different names, and
+    Strata tells them in vLLM's names and its own (`strata:`) — but only in
+    Prometheus text, which it gives to a reader that asks for it (`Accept:
+    text/plain`); asked without, it answers the JSON of its Monitor tab,
+    which carries no sample this reader knows (2.35.1: until then a Strata
+    cell showed no token speed, no queue and no context use).
     llama.cpp reports rates for the window since the last scrape; newer
     builds (including PrismML) reset that window after every scrape. Its
     cumulative token/compute-time pairs recover the speed even if another
@@ -65,7 +76,10 @@ class ServerProbe:
     #: Read as they are: Prometheus name -> the view's key.
     GAUGES = {"llamacpp:prompt_tokens_seconds": "promptTps", "llamacpp:predicted_tokens_seconds": "genTps",
               "llamacpp:requests_processing": "requestsProcessing", "llamacpp:kv_cache_usage_ratio": "_kvRatio",
-              "vllm:num_requests_running": "requestsProcessing", "vllm:num_requests_waiting": "requestsWaiting"}
+              "vllm:num_requests_running": "requestsProcessing", "vllm:num_requests_waiting": "requestsWaiting",
+              # vLLM's own number is its KV block pool, and a vLLM server says no context window to take a share of (no /props);
+              # Strata says the running request's share of its context here.
+              "vllm:kv_cache_usage_perc": "_kvRatio"}
     #: Counted: the growth per second between two readings is the rate.
     COUNTERS = {"vllm:prompt_tokens_total": "promptTps", "vllm:generation_tokens_total": "genTps"}
     #: Token counts divided by engine compute seconds, not elapsed wall time.
@@ -73,6 +87,19 @@ class ServerProbe:
         "promptTps": ("llamacpp:prompt_tokens_total", "llamacpp:prompt_seconds_total"),
         "genTps": ("llamacpp:tokens_predicted_total", "llamacpp:tokens_predicted_seconds_total"),
     }
+    #: What a Strata server says of its speed (2.35.1). The running request's own rates are read as they are, and the
+    #: token/compute-time pairs give the last measured ones, as llama.cpp's do. Its prompt tokens include the ones its cache
+    #: already held (`vllm:prefix_cache_hits_total`): only the rest was read, and cost the time, so the pair is made of the rest.
+    STRATA_GAUGES = {"strata:live_tok_s": "genTps", "strata:live_prefill_tok_s_mean": "promptTps"}
+    STRATA_READ = "strata:prompt_tokens_read"
+    STRATA_TIMED = {
+        "promptTps": (STRATA_READ, "strata:totals_prompt_seconds_total"),
+        "genTps": ("vllm:generation_tokens_total", "strata:totals_decode_seconds_total"),
+    }
+    #: The samples of a scrape that the Strata reading needs, by their names in the text.
+    STRATA_NAMES = frozenset({"vllm:prompt_tokens_total", "vllm:generation_tokens_total", "vllm:prefix_cache_hits_total",
+                              "strata:totals_prompt_seconds_total", "strata:totals_decode_seconds_total",
+                              *STRATA_GAUGES})
 
     def __init__(self, clock: Callable[[], float] | None = None):
         # None asks time.time at each reading, so a patched clock is seen.
@@ -96,9 +123,12 @@ class ServerProbe:
         out: dict[str, Any] = {}
         counted: dict[str, float] = {}
         timed: dict[str, float] = {}
+        strata: dict[str, float] = {}
         start = ""
         try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{int(port)}/metrics", timeout=1) as r:
+            # A reader that asks for text/plain is what Prometheus is: llama.cpp and vLLM answer it anyway, Strata only then.
+            asked = urllib.request.Request(f"http://127.0.0.1:{int(port)}/metrics", headers={"Accept": "text/plain"})
+            with urllib.request.urlopen(asked, timeout=1) as r:
                 start = r.headers.get("Process-Start-Time-Unix", "")
                 for line in r.read().decode("utf-8", "replace").splitlines():
                     if line.startswith("#") or not line.strip():
@@ -110,6 +140,8 @@ class ServerProbe:
                         continue
                     if not math.isfinite(num) or num < 0:
                         continue
+                    if name in self.STRATA_NAMES:
+                        strata[name] = strata.get(name, 0.0) + num
                     if name in self.GAUGES:
                         key = self.GAUGES[name]
                         out[key] = out.get(key, 0.0) + num
@@ -118,8 +150,13 @@ class ServerProbe:
                     elif any(name in pair for pair in self.TIMED_COUNTERS.values()):
                         timed[name] = timed.get(name, 0.0) + num
         except Exception:
-            out, counted, timed = {}, {}, {}
-        if timed:
+            out, counted, timed, strata = {}, {}, {}, {}
+        if any(name.startswith("strata:") for name in strata):
+            # A Strata server: its own readings of its speed. The growth of vLLM's counters between two scrapes is vLLM's way to say
+            # it — here it would be zero between two requests and a spike at the one that finished.
+            out.update(self.strata_rates(port, strata))
+            counted = {}
+        elif timed:
             for key, value in self.timed_rates(port, timed, start, out).items():
                 if not out.get(key):
                     out[key] = value
@@ -148,8 +185,19 @@ class ServerProbe:
         self._metrics[port] = (now, out)
         return out
 
+    def strata_rates(self, port, sample: dict[str, float]) -> dict[str, float]:
+        """The token rates of a Strata server: the running request's own while it reads or generates (`strata:live_*`), else the last
+        measured — tokens over compute seconds of the work done since the last scrape, held while idle (`timed_rates`). A sample it does
+        not say makes no rate: none is invented."""
+        values = {name: sample[name] for name in ("vllm:generation_tokens_total", "strata:totals_prompt_seconds_total",
+                                                  "strata:totals_decode_seconds_total") if name in sample}
+        if "vllm:prompt_tokens_total" in sample and "vllm:prefix_cache_hits_total" in sample:
+            values[self.STRATA_READ] = max(0.0, sample["vllm:prompt_tokens_total"] - sample["vllm:prefix_cache_hits_total"])
+        live = {key: sample[name] for name, key in self.STRATA_GAUGES.items() if name in sample}
+        return self.timed_rates(port, values, "", live, pairs=self.STRATA_TIMED)
+
     def timed_rates(self, port, values: dict[str, float], start: str,
-                    gauges: dict[str, Any]) -> dict[str, float]:
+                    gauges: dict[str, Any], pairs: dict[str, tuple[str, str]] | None = None) -> dict[str, float]:
         """The latest observed token/compute-time rates, retained while idle.
 
         The first scrape uses the server's accumulated average. Later scrapes
@@ -160,7 +208,7 @@ class ServerProbe:
         previous, rates = (dict(before[1]), dict(before[2])) if before and before[0] == start else ({}, {})
         if any(value < previous.get(name, 0) for name, value in values.items()):
             previous, rates = {}, {}
-        for key, (tokens, seconds) in self.TIMED_COUNTERS.items():
+        for key, (tokens, seconds) in (pairs or self.TIMED_COUNTERS).items():
             if tokens not in values or seconds not in values:
                 rates.pop(key, None)
                 continue
@@ -222,7 +270,8 @@ class CellRecords:
 
     def add(self, port: int, kind: str, pid: int, marker: str,
             cfg: dict, log_path, cache_models: bool,
-            health_path: str = "/health", launch: dict | None = None, name: str = "") -> None:
+            health_path: str = "/health", launch: dict | None = None, name: str = "",
+            ram_mib: float = 0) -> None:
         with self.state.lock:
             cells = self.state.setdefault("cells", {})
             cells[str(int(port))] = {
@@ -242,6 +291,9 @@ class CellRecords:
                 # What its model is called at the machine's entry (2.27,
                 # entry.ModelName): kept, as a restart no longer has the request.
                 **({"name": str(name)} if name else {}),
+                # The memory it promised to keep resident (MemoryLedger): kept, as a restart
+                # no longer has the request.
+                **({"ramMiB": int(ram_mib)} if ram_mib else {}),
             }
             self.state.save()
 
@@ -262,6 +314,23 @@ class CellRecords:
         with self.state.lock:
             rec["pid"] = pid
             self.state.save()
+
+    def found(self, port: int, pid: int, llama_bin: Any, log_dir: Path) -> dict[str, Any]:
+        """The record of a cell this scout started and has none of: what the
+        machine says of its process — its command line, when it started, the
+        log it was given by name — and nothing more; the controller sends the
+        rest with the next start."""
+        cmdline = HostProcesses.cmdline(pid)
+        kind = "llama" if llama_bin and str(llama_bin) in cmdline else "command"
+        log = Path(log_dir) / (f"llama-server.{int(port)}.log" if kind == "llama" else f"command-cell.{int(port)}.log")
+        self.add(port, kind, pid, cmdline[:200], {"port": int(port)}, log if log.exists() else "", False)
+        with self.state.lock:
+            rec = (self.state.get("cells") or {}).get(str(int(port))) or {}
+            started = HostProcesses.started_at(pid)
+            if started:
+                rec["startedAt"] = started
+                self.state.save()
+        return rec
 
 
 class Cells:
@@ -285,6 +354,8 @@ class Cells:
         # The model files are the cells': downloads report into a cell's
         # startup record, and a purge keeps what a running cell holds.
         self.models = ModelFetcher(config, self.report)
+        # How many models the cache keeps, and the trim to it: asks the cells at the moment it deletes.
+        self.keeper = CacheKeeper(state, self.models, held=self.held_files, live=self.live_ports)
 
     def at(self, port) -> Cell:
         """The cell on `port`, made on first use."""
@@ -328,9 +399,12 @@ class Cells:
         with cell.lock:
             return dict(cell.startup)
 
-    def view(self, cell: Cell) -> dict[str, Any]:
+    def view(self, cell: Cell, table: Callable[[], dict[int, dict[str, Any]] | None] | None = None) -> dict[str, Any]:
         """The process's status merged with its start's phase and progress, so
-        the admin sees downloading/loading state before the server is up."""
+        the admin sees downloading/loading state before the server is up.
+
+        `table` gives the machine's process table (`Machine.processes()`) for the memory a running cell holds; `views()` hands every cell the
+        one it took, and a lone call takes its own."""
         port = cell.port
         st = cell.process.status()
         with cell.lock:
@@ -346,6 +420,9 @@ class Cells:
                     # The processes it started (2.31): the card's memory may be
                     # a child's — Strata's engine under its server.
                     "pids": self.processes.descendants(st.get("pid")),
+                    # The memory its processes hold in RAM (2.35), their RSS in bytes: the card's row says it beside the video memory.
+                    # None when ps did not answer — "not told", never a zero.
+                    "ramBytes": self.processes.resident(st.get("pid"), (table or self.machine.processes)()),
                     "firewall": self.machine.firewall(p) if p else {},
                     # Which of the files it holds changed on disk after it
                     # started (2.11): ⟳ on the card — restart to pick them up.
@@ -366,8 +443,11 @@ class Cells:
             reason = st.get("lastError") or Watchdog.how(st)
             if crash and crash.get("gaveUp"):
                 # Said on the card: the watchdog stopped trying, and why.
-                reason = (f"crashed {crash['count']} times in {Watchdog.WINDOW_SEC // 60} minutes — "
-                          f"not restarting it: {crash.get('reason') or reason}")
+                if crash.get("neverReady"):
+                    reason = (f"never ready in {crash['count']} starts — not restarting it: {crash.get('reason') or reason}")
+                else:
+                    reason = (f"crashed {crash['count']} times in {Watchdog.WINDOW_SEC // 60} minutes — "
+                              f"not restarting it: {crash.get('reason') or reason}")
             return {**st, "phase": "error", "port": startup.get("port") or port,
                     "modelPath": startup.get("modelPath", ""), "lastError": reason}
         if phase in ("resolving", "downloading", "loading"):
@@ -386,7 +466,14 @@ class Cells:
         return {**st, "port": port}
 
     def views(self) -> list[dict[str, Any]]:
-        return [self.view(cell) for _port, cell in self.all()]
+        asked: list = []
+
+        def table():
+            """One `ps` for every cell, and none when no cell runs."""
+            if not asked:
+                asked.append(self.machine.processes())
+            return asked[0]
+        return [self.view(cell, table) for _port, cell in self.all()]
 
     def first_view(self) -> dict[str, Any]:
         """The single-cell view older controllers read: the first cell's."""
@@ -400,6 +487,20 @@ class Cells:
             keep.extend(cell.process.held_files())
         return keep
 
+    #: The phases of a start that has asked the cache for its files and not let go of them.
+    STARTING = ("resolving", "downloading", "loading", "running")
+
+    def live_ports(self) -> set[int]:
+        """The ports whose cell is starting or running: the files its start asked for are in use, though its process may not run
+        yet. A cell that failed (error) or was stopped (dropped) is not."""
+        ports: set[int] = set()
+        for port, cell in self.all():
+            with cell.lock:
+                phase = str(cell.startup.get("phase") or "")
+            if phase in self.STARTING or cell.process.status().get("running"):
+                ports.add(int(port))
+        return ports
+
     # ── what outlives a scout restart ───────────────────────────────────────
 
     def adopt_survivors(self) -> None:
@@ -407,13 +508,21 @@ class Cells:
         truly orphaned llama-server processes.
 
         The registry (state.json "cells") records every started cell with its
-        pid + a cmdline marker. On startup: pid alive AND its command line still
-        contains the marker → adopt into a fresh slot (same pid, same uptime —
-        deploys stop killing inference). When the marker no longer matches — an
-        exec-chained command cell rewrote its argv, or a failed restart clobbered
-        the recorded pid — fall back to identity by PORT: adopt whoever is healthily
-        serving the cell's port. Anything matching llamaServerBin that was NOT
-        adopted is a real stray and gets reaped as before."""
+        pid + a cmdline marker. On startup, for each record, in this order:
+        the pid is alive and carries this scout's mark for the cell's port in
+        its environment (CELL_ENV, kept through every exec of a launcher and
+        every child) → adopt it; or its command line still contains the marker
+        → adopt it into a fresh slot (same pid, same uptime — deploys stop
+        killing inference). When neither holds — a failed restart clobbered the
+        recorded pid, or the process is not there — fall back to identity by
+        PORT: adopt whoever is healthily serving the cell's port. And when
+        nothing serves the port yet, adopt the process that carries the mark of
+        it: a cell loading its model does not listen for a minute and more, and
+        a scout restarted in that minute used to forget it — the cell went on
+        loading outside the registry, the board saw none, and its Stop was dead
+        (Strata, 2026-10-14). Only a port with no process at all is forgotten.
+        Anything matching llamaServerBin that was NOT adopted is a real stray
+        and gets reaped as before."""
         adopted_pids = set()
         for key, rec in self.records.items():
             try:
@@ -423,47 +532,96 @@ class Cells:
                 continue
             marker = str(rec.get("marker") or "")
             cmdline = self.processes.cmdline(rec_pid) if rec_pid > 1 else ""
-            if rec_pid > 1 and self.processes.marker_matches(marker, cmdline):
+            if rec_pid > 1 and (self.processes.port_of(rec_pid) == port
+                                or self.processes.marker_matches(marker, cmdline)):
                 pid = rec_pid
             else:
-                # Marker gone (an exec-chained wrapper like run_whisper.sh → exec
-                # python rewrote argv) or the recorded pid was clobbered by a failed
-                # restart. Identify the cell by its real contract instead: whoever
-                # is healthily serving the cell's PORT right now IS the cell.
+                # The mark and the marker are both gone (an exec-chained wrapper
+                # like run_whisper.sh → exec python rewrote argv) or the recorded
+                # pid was clobbered by a failed restart. Identify the cell by its
+                # real contract instead: whoever is healthily serving the cell's
+                # PORT right now IS the cell.
                 pid = self.processes.listener(port)
                 if not pid:
-                    self.records.forget(port)   # nothing serves it — really gone
-                    continue
-                if self.processes.owned(pid) is False:
-                    # Someone else serves the port now — the controller's own
-                    # cell, a hand-run server. Ours is gone; theirs stays theirs.
-                    print(f"[llama-node] :{port} is served by pid {pid}, which no scout "
-                          f"started — not adopting it")
-                    self.records.forget(port)
-                    continue
-                if not self.processes.healthy(port, timeout=4.0, attempts=3,
-                                              health_path=rec.get("healthPath") or "/health"):
-                    # Something owns the port but stayed quiet. On a loaded host
-                    # that is a timeout, not a death — and unregistering here
-                    # stranded a live cell as "stopped" forever while its process
-                    # kept serving traffic, with no way back short of killing it.
-                    # Keep the record, adopt the listener, let polling set phase.
-                    print(f"[llama-node] :{port} holds the port but "
-                          f"{rec.get('healthPath') or '/health'} stayed quiet — "
-                          f"adopting anyway rather than forgetting it")
+                    pid = self.processes.carrier(port, rec_pid)
+                    if not pid:
+                        self.records.forget(port)   # nothing runs it — really gone
+                        print(f"[llama-node] :{port} is gone: no process serves it or carries its mark — "
+                              f"forgetting it")
+                        continue
+                    print(f"[llama-node] :{port} does not listen yet, but pid {pid} still runs it (it "
+                          f"carries this scout's mark for the port) — adopting it while it loads")
+                else:
+                    if self.processes.owned(pid) is False:
+                        # Someone else serves the port now — the controller's own
+                        # cell, a hand-run server. Ours is gone; theirs stays theirs.
+                        print(f"[llama-node] :{port} is served by pid {pid}, which no scout "
+                              f"started — not adopting it")
+                        self.records.forget(port)
+                        continue
+                    if not self.processes.healthy(port, timeout=4.0, attempts=3,
+                                                  health_path=rec.get("healthPath") or "/health"):
+                        # Something owns the port but stayed quiet. On a loaded host
+                        # that is a timeout, not a death — and unregistering here
+                        # stranded a live cell as "stopped" forever while its process
+                        # kept serving traffic, with no way back short of killing it.
+                        # Keep the record, adopt the listener, let polling set phase.
+                        print(f"[llama-node] :{port} holds the port but "
+                              f"{rec.get('healthPath') or '/health'} stayed quiet — "
+                              f"adopting anyway rather than forgetting it")
                 if pid != rec_pid:            # re-discovered by port → keep registry honest
                     self.records.repoint(rec, pid)
-            cell = self.at(port)
-            log = rec.get("log") or ""
-            cell.process.adopt(pid, dict(rec.get("cfg") or {}),
-                               log_path=Path(log) if log else None,
-                               started_at=int(rec.get("startedAt") or 0),
-                               launch=rec.get("launch"))
-            cell.cache_models = bool(rec.get("cacheModels"))
-            self.report(port, phase="running", error="")
+            self.take_over(port, pid, rec)
             adopted_pids.add(pid)
-            print(f"[llama-node] adopted running cell :{port} (pid {pid})")
         self.reap_strays(keep_pids=adopted_pids)
+
+    def take_over(self, port: int, pid: int, rec: dict[str, Any]) -> None:
+        """Hold a process this scout started and had lost track of as the cell
+        of its port: the start-up adoption, Reconcile and a start that finds
+        its cell already running all end here."""
+        cell = self.at(port)
+        log = rec.get("log") or ""
+        cell.process.adopt(pid, dict(rec.get("cfg") or {}),
+                           log_path=Path(log) if log else None,
+                           started_at=int(rec.get("startedAt") or 0),
+                           launch=rec.get("launch"))
+        cell.cache_models = bool(rec.get("cacheModels"))
+        cell.ram_mib = int(rec.get("ramMiB") or 0)
+        self.report(port, phase="running", error="")
+        print(f"[llama-node] adopted running cell :{port} (pid {pid})")
+
+    def tracking(self, port: Any) -> bool:
+        """Whether a cell of this scout runs on `port`, or its start is under
+        way there: what it holds, as far as the scout knows."""
+        port = int(port)
+        with self._lock:
+            cell = self.by_port.get(port)
+        if cell is None:
+            return False
+        if cell.process.status().get("running"):
+            return True
+        with cell.lock:
+            return cell.startup.get("phase") in ("resolving", "downloading", "loading")
+
+    def survivor(self, port: Any) -> int:
+        """The process a scout started for `port` that no cell of this scout
+        holds: found by its mark, listening or still loading. 0 when there is
+        none — or when this scout's own cell on the port is held."""
+        if self.tracking(port):
+            return 0
+        return self.processes.carrier(port, self.records.get(port).get("pid") or 0)
+
+    def adopt_found(self, port: Any, pid: int) -> None:
+        """Hold the process `survivor` found. A record of the port, if one is
+        left, keeps what the start knew (config, launch, log); without one the
+        cell is written down from what the machine can say of the process."""
+        port = int(port)
+        rec = self.records.get(port)
+        if not rec:
+            rec = self.records.found(port, pid, self.config.get("llamaServerBin"), self.models.cache_dir())
+        elif int(rec.get("pid") or 0) != int(pid):
+            self.records.repoint(rec, int(pid))
+        self.take_over(port, int(pid), rec)
 
     def reap_strays(self, keep_pids=None) -> None:
         """Kill any llama-server left from a previous agent run.
@@ -529,6 +687,8 @@ class Cells:
             res = cell.process.stop()
             if res.get("detail") == "not running":
                 res = self._reclaim(p, res)
+            elif res.get("ok"):
+                self._sweep(p)
             results.append(res)
             if not res.get("ok"):
                 continue
@@ -560,27 +720,68 @@ class Cells:
         NOTHING — the port may still be served by a process this scout lost
         track of (that is precisely how a stop once reported success while
         10.7 GB stayed occupied). Verify the port; kill only what we can
-        recognize as ours, never an arbitrary listener."""
+        recognize as ours, never an arbitrary listener.
+
+        Ours is first of all what carries this scout's mark for the port
+        (HostProcesses.port_of), listening or still loading, with the tree
+        under it; then what the record's command-line marker or the llama
+        binary says it is. A process that stood in none of those used to be
+        "unrecognized" however plainly it was a scout's cell: Strata's record
+        carried a marker no argv could match (2026-10-14)."""
         lpid = self.processes.listener(port)
-        if not lpid:
+        marked = self.processes.tagged_cells().get(int(port)) or []
+        if not lpid and not marked:
             return res
-        cmd = self.processes.cmdline(lpid)
-        mark = str(self.records.get(port).get("marker") or "")
-        bin_path = str(self.config.get("llamaServerBin") or "")
-        if (mark and self.processes.marker_matches(mark, cmd)) or (bin_path and bin_path in cmd):
+        targets = list(marked)
+        if lpid and lpid not in targets and self.processes.port_of(lpid) != int(port):
+            cmd = self.processes.cmdline(lpid)
+            mark = str(self.records.get(port).get("marker") or "")
+            bin_path = str(self.config.get("llamaServerBin") or "")
+            if not ((mark and self.processes.marker_matches(mark, cmd)) or (bin_path and bin_path in cmd)):
+                return {"ok": False, "listenerPid": lpid,
+                        "error": f"port {port} is held by an unrecognized "
+                                 f"process (pid {lpid}) — not killing it"}
+            targets.append(lpid)
+        elif lpid and lpid not in targets:
+            targets.append(lpid)        # carries the mark: a child of the cell that holds the port
+        try:
+            self._terminate([pid for root in targets for pid in [root, *self.processes.descendants(root)]])
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"reclaim failed: {exc}", "listenerPid": lpid or targets[0]}
+        return {"ok": True, "reclaimed": True, "pid": lpid or targets[0]}
+
+    def _sweep(self, port: int) -> None:
+        """After a stop: whatever still carries this scout's mark for the port
+        goes too. A server that hands the card to a child (Strata's engine
+        under its server) leaves the child holding 31 GB when the parent's
+        SIGTERM does not reach it; a stop that ends with a cell's memory still
+        in use is no stop."""
+        left = self.processes.tagged_cells().get(int(port)) or []
+        if left:
+            print(f"[llama-node] :{port} stopped, but {left} still carry its mark — terminating them")
             try:
-                os.kill(lpid, signal.SIGTERM)
-                deadline = time.time() + 10
-                while time.time() < deadline and self.processes.cmdline(lpid):
-                    time.sleep(0.3)
-                if self.processes.cmdline(lpid):
-                    os.kill(lpid, signal.SIGKILL)
-                return {"ok": True, "reclaimed": True, "pid": lpid}
+                self._terminate([pid for root in left for pid in [root, *self.processes.descendants(root)]])
             except Exception as exc:  # noqa: BLE001
-                return {"ok": False, "error": f"reclaim failed: {exc}", "listenerPid": lpid}
-        return {"ok": False, "listenerPid": lpid,
-                "error": f"port {port} is held by an unrecognized "
-                         f"process (pid {lpid}) — not killing it"}
+                print(f"[llama-node] :{port} sweep failed: {exc}")
+
+    def _terminate(self, pids: list[int]) -> None:
+        """SIGTERM, up to 10 s for them to go, then SIGKILL for the rest."""
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        # Alive is asked of `ps`, as the stop of a cell it has no handle of always did: a
+        # signal-0 probe also says "alive" of a process that is a zombie until its parent reaps it.
+        deadline = time.time() + 10
+        while time.time() < deadline and any(self.processes.cmdline(p) for p in pids):
+            time.sleep(0.3)
+        for pid in pids:
+            if self.processes.cmdline(pid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     # ── starting ────────────────────────────────────────────────────────────
 

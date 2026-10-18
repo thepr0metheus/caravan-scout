@@ -553,10 +553,11 @@ def test_node_public_views():
     check(view == {"running": True, "pid": 5353, "adopted": True, "startedAt": NOW - 500, "uptimeSec": 500,
                    "modelPath": "/m/model-q4.gguf", "port": 22021, "phase": "running",
                    "promptTps": 123.46, "genTps": 45.68, "requestsProcessing": 2, "ctxMax": 8192,
-                   "ctxUsed": 2048, "pids": [], "firewall": {"state": "open", "allowedFrom": []},
+                   "ctxUsed": 2048, "pids": [], "ramBytes": None, "firewall": {"state": "open", "allowedFrom": []},
                    "launchDiskNewer": []},
           "живой процесс: фаза running, метрики, окно контекста, файрвол и файлы, изменившиеся после старта "
-          "(2.11; файла модели здесь нет — пусто), влиты в вид")
+          "(2.11; файла модели здесь нет — пусто), влиты в вид; ps не ответил — память в RAM «не сказана» (2.35): None, "
+          "а не ноль")
     check("cmd" not in view, "negative: командная строка процесса (cmd) в вид не попадает")
     check(view.get("phase") == "running", "negative: живой процесс сильнее записанной ошибки старта")
     check([c["url"] for c in web.calls] == ["http://127.0.0.1:22021/metrics", "http://127.0.0.1:22021/props"],
@@ -567,7 +568,7 @@ def test_node_public_views():
     with Rig(web=web, kill=FakeKill(alive={5454})):
         view = s.cells.view(sl)
     check(view.get("port") == 22022 and web.calls[:1] == [{"url": "http://127.0.0.1:22022/metrics",
-                                                          "headers": {}, "timeout": 1}],
+                                                          "headers": {"Accept": "text/plain"}, "timeout": 1}],
           "negative: без порта в cfg процесса — порт слота")
     check(view.get("firewall") == {"state": "unknown"} and "promptTps" not in view,
           "negative: метрик нет и ufw не ответил — метрик в виде нет, файрвол «unknown», а не выдуманные нули")
@@ -1116,6 +1117,71 @@ def test_descendants():
     check(limited == [4001, 4003], "boundary: дерево обрезано по TREE_LIMIT — убежавший fork не обходится целиком")
 
 
+PS_A = ("ps", "-A", "-o", "pid=,ppid=,rss=,comm=")
+
+
+def test_resident():
+    table = {4000: {"ppid": 1, "rssKb": 1000, "name": "llama-server"}, 4001: {"ppid": 4000, "rssKb": 500, "name": "engine"},
+             4004: {"ppid": 4001, "rssKb": 200, "name": "worker"}, 4005: {"ppid": 4001, "rssKb": 100, "name": "worker"},
+             5000: {"ppid": 1, "rssKb": 9999, "name": "llama-server"}}
+    got = HostProcesses.resident(4000, table)
+    with patched(HostProcesses, TREE_LIMIT=2):
+        limited = HostProcesses.resident(4000, table)
+    cycle = HostProcesses.resident(4000, {4000: {"ppid": 4001, "rssKb": 1}, 4001: {"ppid": 4000, "rssKb": 2}})
+    odd = HostProcesses.resident(4000, {4000: {"ppid": 1}, 4001: {"ppid": 4000, "rssKb": None}, 4002: {"rssKb": 5}})
+    none = [HostProcesses.resident(4000, None), HostProcesses.resident(4000, {}), HostProcesses.resident(7777, table),
+            HostProcesses.resident("x", table), HostProcesses.resident(None, table), HostProcesses.resident(0, table)]
+    check(got == (1000 + 500 + 200 + 100) * 1024,
+          "память в RAM — сумма RSS процесса ячейки и всех, кого он запустил (дерево по parent pid, из одной таблицы ps): "
+          "движок и его работники входят (2.35), байты")
+    check(got != 9999 * 1024 and got < (1000 + 500 + 200 + 100 + 9999) * 1024,
+          "negative: дерево другой ячейки в сумму не попадает")
+    check(limited == (1000 + 500 + 200) * 1024, "boundary: дерево обрезано по TREE_LIMIT — убежавший fork не обходится целиком")
+    check(cycle == 3 * 1024, "negative: таблица с кольцом parent pid не зацикливает обход — каждый процесс один раз")
+    check(odd == 0, "процессы без RSS (нет поля, None) считаются нулём, а не ошибкой; чужой родитель не мешает")
+    check(none == [None] * 6,
+          "negative: нет таблицы, пустая таблица, процесса нет в таблице, pid не число, None, 0 — None («не сказано»), "
+          "а не ноль и не исключение")
+
+
+def test_cells_memory_in_views():
+    s = make_scout()
+    ps = "  5353     1  1000 llama-server\n  5360  5353   500 helper\n  5454     1  2000 llama-server\n  9999     1 77777 other\n"
+    for port, pid in ((22061, 5353), (22062, 5454)):
+        sl = s.cells.at(port)
+        sl.process.adopt(pid, {"modelPath": f"/m/x{port}.gguf", "port": port}, started_at=NOW)
+    s.cells.at(22063)    # a cell with no process at all
+    web = FakeUrlopen({"/metrics": URLError_("down"), "/props": URLError_("down")})
+    run = FakeRun({PS_A: (0, ps)})
+    with patched(HostProcesses, PROC=TMP / "proc-empty"), Rig(web=web, run=run, kill=FakeKill(alive={5353, 5454})):
+        views = {v.get("port"): v for v in s.cells.views()}
+    asked = [c for c in run.calls if tuple(c) == PS_A]
+    check(views[22061].get("ramBytes") == 1500 * 1024 and views[22062].get("ramBytes") == 2000 * 1024,
+          "живая ячейка говорит, сколько держит в RAM: RSS её процесса и его детей из таблицы ps (2.35); у каждой своё число")
+    check("ramBytes" not in views[22063], "negative: у ячейки без процесса поля нет — нечего мерить, и нуля не выдумано")
+    check(len(asked) == 1, f"одна таблица ps на все ячейки, а не по запросу на каждую (спрошено {len(asked)})")
+    idle = FakeRun({PS_A: (0, ps)})
+    s2 = make_scout()
+    s2.cells.at(22064)
+    with patched(HostProcesses, PROC=TMP / "proc-empty"), Rig(run=idle):
+        s2.cells.views()
+    check([c for c in idle.calls if tuple(c) == PS_A] == [], "negative: ни одна ячейка не бежит — ps не спрашивается")
+    down = FakeRun({PS_A: (1, "")})
+    sl = s.cells.at(22065)
+    sl.process.adopt(5555, {"modelPath": "/m/y.gguf", "port": 22065}, started_at=NOW)
+    with patched(HostProcesses, PROC=TMP / "proc-empty"), Rig(web=web, run=down, kill=FakeKill(alive={5555})):
+        view = s.cells.view(sl)
+    check("ramBytes" in view and view["ramBytes"] is None,
+          "negative: ps не ответил — поле есть и пусто: «не сказано», не ноль (карточка рисует «—»)")
+    sl = s.cells.at(22066)
+    sl.process.adopt(5454, {"modelPath": "/m/z.gguf", "port": 22066}, started_at=NOW)
+    lone = FakeRun({PS_A: (0, ps)})
+    with patched(HostProcesses, PROC=TMP / "proc-empty"), Rig(web=web, run=lone, kill=FakeKill(alive={5454})):
+        view = s.cells.view(sl)
+    check(view.get("ramBytes") == 2000 * 1024 and len([c for c in lone.calls if tuple(c) == PS_A]) == 1,
+          "отдельный вызов вида (без общей таблицы от views()) берёт свою таблицу ps — один раз: память не пропадает из карточки одной ячейки")
+
+
 def test_owned():
     proc = TMP / "proc-owned"
     for pid, env in ((5151, b"PATH=/bin\0CARAVAN_SCOUT_CELL=22062\0HOME=/h\0"),
@@ -1153,7 +1219,8 @@ def test_adopt_nothing_listening():
     run = FakeRun({("ps", "-p", "4444"): (0, ""), ("ps", "-p", "4545"): (0, "/usr/bin/python3 keep.py\n"),
                    ("ss", "-ltnpH"): (0, ss_line(22999, 7777))})
     web = FakeUrlopen()
-    with Rig(run=run, web=web, kill=FakeKill(alive={4545})):
+    # No process carries the mark of the port either (2.32): the /proc of this pin is empty.
+    with Rig(run=run, web=web, kill=FakeKill(alive={4545})), patched(HostProcesses, PROC=TMP / "no-proc-here"):
         s.cells.adopt_survivors()
     check(str(port) not in disk_cells(s), "никто не слушает порт — ячейка правда ушла: снята с реестра на диске")
     check(port not in s.cells.by_port, "negative: для ушедшей ячейки слот не создан — на доске её нет")
@@ -1363,6 +1430,13 @@ def test_llama_start_refusals():
               f"negative: фаза {phase} без живого процесса не мешает новому старту")
 
 
+def port_asked_then_ufw(port):
+    """The calls of an accepted start since 2.32: the port is asked of the host first (`ss`, and `lsof` where
+    the host has no `ss` — the fake host has neither), only then the firewall opens it."""
+    return [["ss", "-ltnpH"], ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+            ["sudo", "-n", "ufw", "allow", str(port)]]
+
+
 def test_llama_start_accepted():
     port = 22085
     payload = {"modelPath": MODEL, "cacheModels": True, "args": llama_args(port),
@@ -1382,7 +1456,8 @@ def test_llama_start_accepted():
          "HOST": "0.0.0.0"},
         MODEL, MMPROJ, SPEC, True, llama_args(port)),
         "аргументы воркера: порт, бинарь, config с HOST по умолчанию, пути (обрезанные), кэш, аргументы контроллера")
-    check(r.run.calls == [["sudo", "-n", "ufw", "allow", str(port)]], "порт открыт в ufw: sudo -n ufw allow <port>")
+    check(r.run.calls == port_asked_then_ufw(port),
+          "порт сначала спрошен у хоста (2.32: чужой слушатель — отказ), потом открыт в ufw: sudo -n ufw allow <port>")
     check(r.s.cells.views() == [{"running": False, "phase": "resolving", "modelPath": MODEL, "port": port,
                                         "downloadedBytes": 0, "totalBytes": 0, "downloadingFile": "",
                                         "startedAt": NOW}],
@@ -1433,7 +1508,7 @@ def test_llama_start_port_order():
 
 def test_llama_start_misc():
     r = start_llama({"modelPath": MODEL, "config": {"MODEL_FILE": MODEL, "PORT": 22087}}, run=FakeRun())
-    check((r.res or {}).get("ok") is True and r.run.calls == [["sudo", "-n", "ufw", "allow", "22087"]],
+    check((r.res or {}).get("ok") is True and r.run.calls == port_asked_then_ufw(22087),
           "ufw нет (или нет sudo) — старт всё равно идёт")
     r = start_llama({"modelPath": MODEL, "config": {"MODEL_FILE": MODEL, "PORT": 22088}},
                     config={"cacheModels": True})
@@ -1540,7 +1615,7 @@ def test_command_cell_start():
                        "config": {"PORT": port}})
     check(r.s.cells.by_port[port].cache_models is True and disk_cells(r.s).get(str(port), {}).get("cacheModels") is True,
           "negative: контроллер просит кэш — ячейка его держит, и запись тоже")
-    check(r.run.calls == [["sudo", "-n", "ufw", "allow", str(port)]], "порт открыт в ufw")
+    check(r.run.calls == port_asked_then_ufw(port), "порт спрошен у хоста и открыт в ufw")
 
     r = start_command({"cellKind": "command", "shellLine": "exec python3 srv.py",
                        "config": {"PORT": 22202, "COMMAND": "python3 srv.py"}})
@@ -1660,6 +1735,47 @@ def test_command_cell_model():
     st = r.s.cells.startup(port)
     check((st.get("phase"), st.get("error")) == ("error", why), "фаза error с той же причиной")
     check(r.popen.calls == [] and disk_cells(r.s) == {}, "negative: без модели не запущено и не записано")
+
+
+def test_the_starts_are_recorded_for_the_cache():
+    """The cache keeps the last models that ran (CacheKeeper, 2.34): the START records the files it asks for, before they are copied, and
+    the launch commits it once the server runs — a llama cell and a command cell alike, and only with caching on."""
+    port = 22271
+    r = start_llama({"modelPath": MODEL, "cacheModels": True, "args": llama_args(port),
+                     "config": {"MODEL_FILE": MODEL, "PORT": port}})
+    entries = r.s.cells.keeper.uses.entries()
+    check(len(entries) == 1 and entries[0]["files"] == [MODEL] and entries[0]["port"] == port and entries[0]["ok"] is False,
+          "a llama start is recorded when it is asked (LlamaStart.run), before its model is copied: the files it names, its port, not yet 'ran' — "
+          "a start that dies while loading is never 'the last model'")
+
+    first, second, draft = "models/org/big-00001-of-00002.gguf", "models/org/big-00002-of-00002.gguf", "models/org/mtp-q2.gguf"
+    bodies = {first: b"GGUF one", second: b"GGUF two", draft: b"GGUF mtp"}
+    port = 22272
+
+    def prep(s):
+        old = s.models.cache_dir() / "models/org/old.gguf"
+        old.parent.mkdir(parents=True, exist_ok=True)
+        old.write_bytes(b"GGUF old")
+        s.models.downloaded.add(old)
+        s.old = old
+
+    r = start_command({"cellKind": "command", "command": "bash ~/run_strata.sh $PORT", "shellLine": "exec true", "cacheModels": True,
+                       "modelFiles": [first, draft], "config": {"PORT": port}},
+                      config={"controllerUrl": CONTROLLER}, web=models_served(bodies), prep=prep)
+    cache = r.s.models.cache_dir()
+    entry = r.s.cells.keeper.uses.entries()[0]
+    check(entry["files"] == [first, draft] and entry["port"] == port and entry["ok"] is True,
+          "a command start is recorded as asked (CommandStart.run: the files the controller named) and committed once its launch ran (CommandLaunch.run)")
+    check(not r.s.old.exists() and all((cache / rel).exists() for rel in (first, second, draft)),
+          "after that start the cache is trimmed to the setting: what was downloaded before is gone; the model, its second part and its draft layer stay, whole")
+
+    port = 22273
+    r = start_command({"cellKind": "command", "command": "bash ~/run_strata.sh $PORT", "shellLine": "exec true", "cacheModels": False,
+                       "modelFiles": [first, draft], "config": {"PORT": port}},
+                      config={"controllerUrl": CONTROLLER}, web=models_served(bodies), prep=prep)
+    entry = r.s.cells.keeper.uses.entries()[0]
+    check(entry["ok"] is False and r.s.old.exists(),
+          "negative: caching off — the start is recorded, but never committed and nothing is trimmed: the files go at the stop")
 
 
 def test_command_cell_model_files():
@@ -2203,7 +2319,10 @@ def test_worker_corruption_only_own():
           "фаза error называет файл, говорит, почему он не тронут, и что делать")
 
 
-def test_worker_cleanup_when_caching():
+def test_worker_trims_the_cache_when_caching():
+    """The cache keeps the last models (CacheKeeper, 2.34): a start that reaches a running process is recorded and the cache is
+    trimmed to the setting. The start request records the start (LlamaStart.run: keeper.begin); the worker, once the server runs,
+    commits it (keeper.commit) — the test plays the first before the worker."""
     def with_old(s, rel="models/org/old-model.gguf", mine=True):
         path = s.models.cache_dir() / rel
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2212,37 +2331,50 @@ def test_worker_cleanup_when_caching():
             s.models.downloaded.add(path)
         return path
 
-    port = 22135
-    s = worker_scout(cleanOldModels=False)
-    old = with_old(s)
-    r = worker(s, port, {"MODEL_FILE": MODEL, "PORT": port}, cache=True)
-    check(r.err is None and old.exists() and (s.models.cache_dir() / MODEL).exists(),
-          "defect-history: cleanOldModels=false (по умолчанию) — после старта ничего не удаляется; флаг не "
-          "читался, и в кэше оставалась только активная модель")
+    def run(s, port, begin=True, cache=True, model=MODEL, **kw):
+        if begin:
+            s.cells.keeper.begin(port, [model])
+        return worker(s, port, {"MODEL_FILE": model, "PORT": port}, model=model, cache=cache, **kw)
 
-    port = 22139
-    s = worker_scout(cleanOldModels=True)
+    port = 22135
+    s = worker_scout()
     old, lib = with_old(s), with_old(s, "models/lib/library.gguf", mine=False)
-    r = worker(s, port, {"MODEL_FILE": MODEL, "PORT": port}, cache=True)
+    r = run(s, port)
     check(r.err is None and not old.exists() and (s.models.cache_dir() / MODEL).exists() and lib.exists(),
-          "cleanOldModels=true: после старта удалены старые скачанные модели; активная цела; .gguf, которого "
-          "скаут не скачивал, цел")
+          "defect-history (2026-10-18, the disk of a machine 94 % full of model copies): after a start that ran, the cache keeps the last model "
+          "(the setting is 1 until said otherwise) and what this scout downloaded before it is gone; the .gguf this scout did not download stays")
+
+    port = 22140
+    s = worker_scout()
+    old = with_old(s)
+    r = run(s, port, begin=False)
+    check(r.err is None and old.exists(),
+          "negative: a start no one recorded (no model is known to have run) deletes nothing — 'unknown' is not 'nothing', the cache is not guessed at")
+
+    port = 22141
+    s = worker_scout()
+    s.cells.keeper.keep.set(2)
+    first = with_old(s, "models/org/first.gguf")
+    s.cells.keeper.begin(22142, ["models/org/first.gguf"])
+    s.cells.keeper.uses.commit(22142)
+    never_ran = with_old(s, "models/org/never-ran.gguf")
+    r = run(s, port)
+    check(r.err is None and first.exists() and not never_ran.exists() and (s.models.cache_dir() / MODEL).exists(),
+          "with the setting at 2 the model that ran before this one stays, whole; a downloaded file no start ever ran is not 'the last model' and goes")
 
     port = 22136
-    s = worker_scout(cleanOldModels=True)
+    s = worker_scout()
     old = with_old(s)
-    worker(s, port, {"MODEL_FILE": MODEL, "PORT": port}, cache=False)
-    check(old.exists(), "negative: кэш выключен — чистки при старте нет (файлы уйдут при остановке)")
+    run(s, port, cache=False)
+    check(old.exists(), "negative: caching off — no trim at the start (the files go at the stop)")
 
     port = 22137
-    s = worker_scout(cleanOldModels=True)
+    s = worker_scout()
     neighbour = with_old(s, "models/org/neighbour.gguf")
     s.cells.at(22138).process.adopt(5858, {"modelPath": str(neighbour), "port": 22138})
-    worker(s, port, {"MODEL_FILE": MODEL, "PORT": port}, cache=True, kill=FakeKill(alive={5858}))
+    run(s, port, kill=FakeKill(alive={5858}))
     check(neighbour.exists(),
-          "defect-history: чистка при старте не трогает модель СОСЕДНЕЙ работающей ячейки — раньше удаляла "
-          "(оставляла только файлы стартующей)")
-
+          "defect-history: the trim at the start does not touch the model of a NEIGHBOUR cell that runs — a running process holds its file, however old it is")
 
 
 def test_cell_env_both_kinds():
@@ -2285,19 +2417,19 @@ TESTS = [
     test_update_status_views, test_update_start_commands, test_update_job_run, test_update_conflict,
     test_builds_list, test_cell_artifacts, test_cell_artifacts_env, test_registry, test_marker_matches, test_pid_cmdline,
     test_port_listener_pid, test_port_health_ok,
-    test_adopt_by_marker, test_adopt_by_port, test_adopt_by_port_stranger, test_owned, test_descendants,
+    test_adopt_by_marker, test_adopt_by_port, test_adopt_by_port_stranger, test_owned, test_descendants, test_resident, test_cells_memory_in_views,
     test_adopt_nothing_listening, test_adopt_quiet_health,
     test_adopt_bad_records, test_reap_strays,
     test_node_configs, test_delete_node_config,
     test_llama_start_refusals, test_llama_start_accepted, test_llama_start_port_order, test_llama_start_misc,
     test_llama_start_then_worker, test_llama_engine_env,
     test_command_cell_start, test_command_exec_stripping, test_command_cell_refusals, test_command_cell_model,
-    test_command_cell_model_files, test_command_cell_scratch_and_stop, test_command_cell_stopped_mid_download,
+    test_command_cell_model_files, test_the_starts_are_recorded_for_the_cache, test_command_cell_scratch_and_stop, test_command_cell_stopped_mid_download,
     test_command_cell_markers, test_command_cell_syncs_assets_first,
     test_resolve_arg_paths,
     test_worker_success, test_worker_engine_env, test_worker_download_error, test_worker_log_dir_missing, test_worker_refuses_without_args,
     test_worker_gpu_layers_and_spec, test_worker_cancelled_mid_download, test_worker_stopped_during_start,
-    test_worker_corruption_retry, test_worker_corruption_only_own, test_worker_cleanup_when_caching,
+    test_worker_corruption_retry, test_worker_corruption_only_own, test_worker_trims_the_cache_when_caching,
     test_models_in_place, test_cell_env_both_kinds, test_cell_env_marker_last,
 ]
 

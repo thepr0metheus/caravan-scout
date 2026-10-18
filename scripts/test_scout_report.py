@@ -70,8 +70,9 @@ def test_config():
           "as-is: строка «0» непуста, значит задана — и становится нижней границей 2 с, а не 60")
     scout = make_scout({"heartbeatIntervalSeconds": 1})
     check(scout.config["heartbeatIntervalSeconds"] == 2, "boundary: интервал не короче 2 с")
-    check(scout.config["llamaNodeDefaultPort"] == 8180 and scout.config["cleanOldModels"] is False,
-          "умолчания доливаются из DEFAULT_CONFIG")
+    check(scout.config["llamaNodeDefaultPort"] == 8180 and "cleanOldModels" not in scout.config,
+          "умолчания доливаются из DEFAULT_CONFIG; старого флага cleanOldModels в них нет — его заменил хранитель кэша (2.34), "
+          "в config.json он читается и молча не действует")
     from caravan_scout.paths import DEFAULT_CONFIG
     check(not {"agents", "registryUrl", "applyCommand", "openclawConfigPath", "openclawAgentId"} & set(DEFAULT_CONFIG),
           "negative: в умолчаниях нет ничего про агентов — ни списка, ни реестра, ни команды применения")
@@ -229,6 +230,9 @@ def _stub_probes(scout, gpus=None, nodes=None, gpu_error=""):
         scout.driver,
         facts=lambda: {"secureBoot": True, "kernelRunning": "7.0.0-31-generic"},
     ), patched(
+        scout.cells.keeper,
+        disk=lambda cache: {"totalBytes": 1_000_000, "freeBytes": 400_000},
+    ), patched(
         scout.builds,
         binary_version=lambda: "version: 9947 (abc1234)",
         binary_mtime=lambda: "2026-09-01T10:00:00",
@@ -258,8 +262,13 @@ def test_public_state():
     check(sorted(state) == sorted(["service", "scoutVersion", "prismRuntime", "llamaBinaryVersion", "llamaBinaryMtime", "llamaUpdate",
                                    "llamaSuspect", "telemetry", "host", "controllerUrl", "gpus", "gpuError",
                                    "computeApps", "engines", "cpu", "platform", "driver", "heartbeat", "llamaNode",
-                                   "llamaNodes", "autostart", "autostartRequests", "entryModels", "time"]),
+                                   "llamaNodes", "autostart", "autostartRequests", "entryModels", "modelCache", "time"]),
           "ровно эти поля — только машина: ни агентов, ни найденных VM, ни назначений")
+    mc = state.get("modelCache") or {}
+    check(sorted(mc) == ["disk", "foreign", "keep", "managedBytes"] and mc["keep"] == 1 and mc["managedBytes"] == 0
+          and mc["foreign"] == {"files": 0, "bytes": 0, "folders": []} and mc["disk"] == {"totalBytes": 1_000_000, "freeBytes": 400_000},
+          "кэш моделей (2.34): сколько последних моделей он держит (1 по умолчанию), сколько занимает скачанное скаутом, сколько лежит "
+          "чужого и что на диске — тот же словарь, что у GET /api/llama-node/cache")
     check(state.get("entryModels") == [] and state["entryModels"] == scout.entry.listing()["data"],
           "модели машины (2.28) — ровно список входа GET /v1/models; ячеек нет — пустой список")
     check(state.get("engines", "absent") is None,
@@ -293,7 +302,7 @@ def test_heartbeat_payload():
                                      "driver", "llamaNode",
                                      "llamaNodes", "llamaBinaryVersion", "llamaBinaryMtime", "llamaUpdate",
                                      "llamaSuspect", "telemetry", "scoutVersion", "autostart", "autostartRequests", "entryModels",
-                                     "agentUrl", "time"]),
+                                     "modelCache", "agentUrl", "time"]),
           "ровно эти поля — только машина")
     check(payload["agentUrl"] == "http://10.0.0.5:18099", "адрес скаута — его IP и порт, на котором он слушает")
     check(payload.get("driver") == {"secureBoot": True, "kernelRunning": "7.0.0-31-generic"},
@@ -517,6 +526,7 @@ def test_live_numbers():
     asked = []
 
     def urlopen(url, timeout=None):
+        url = getattr(url, "full_url", url)    # the metrics are asked for with a Request (an Accept header), the props with a string
         asked.append(url)
         return FakeResponse(metrics if url.endswith("/metrics") else props)
     clock = [1000.0]
@@ -559,6 +569,7 @@ def test_live_numbers_vllm():
     clock = [5000.0]
 
     def urlopen(url, timeout=None):
+        url = getattr(url, "full_url", url)
         if url.endswith("/props"):
             raise OSError("404")
         return FakeResponse((VLLM_METRICS % readings[0]).encode())
@@ -582,6 +593,7 @@ def test_live_numbers_vllm():
     late = [{"prompt": 500.0}, {"prompt": 900.0, "gen": 800.0}]
 
     def partial(url, timeout=None):
+        url = getattr(url, "full_url", url)
         if url.endswith("/props"):
             raise OSError("404")
         body = "".join(f'vllm:{k}_tokens_total{{engine="0"}} {v}\n'

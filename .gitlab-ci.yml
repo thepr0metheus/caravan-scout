@@ -1,0 +1,75 @@
+# The checks of caravan-scout in GitLab CI: the same steps as .github/workflows/ci.yml, which stays
+# as it is for the public copy. Keep the two in step.
+#
+# A pipeline starts for a merge request, and for main after a merge. A branch with no merge request
+# makes none: it would only repeat the run of its merge request.
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+default:
+  # The group runner with the Docker executor.
+  tags: [docker]
+  # A new push to a merge request cancels the run that is still going.
+  interruptible: true
+  timeout: 20m
+
+checks:
+  image: python:3.12
+  script:
+    - python3 -m py_compile $(git ls-files '*.py')
+    # What the scout does, pinned by value. Every door to the host (processes, signals, network)
+    # is shut in scripts/_scout_harness.py, so these cannot reboot or kill anything.
+    - |
+      set -e
+      for t in scripts/test_scout_*.py; do
+        echo "== $t"
+        python3 "$t"
+      done
+    # The scout's shape: classes with one job each. The self-test plants each breakage and proves
+    # the guard goes red on it.
+    - python3 scripts/check_oop.py
+    - python3 scripts/test_check_oop.py
+    # Every test script's exit code is its verdict: one that ended with `CHECKS.finish()` as a statement could not fail.
+    - python3 scripts/check_test_verdicts.py
+    # The public-mirror script names the operator's machines in its scan, so the mirror does not
+    # carry it: its guard runs only in the tree that has the script.
+    # The guard calls rsync, which the python image does not carry.
+    - |
+      if [ -f scripts/sync-public.sh ]; then
+        apt-get update -qq && apt-get install -y -qq rsync > /dev/null
+        python3 scripts/test_sync_public.py
+      else
+        echo "sync guard: skipped, no scripts/sync-public.sh in this tree (not mirrored)"
+      fi
+    # The agent boots and answers on its own port.
+    - |
+      set -e
+      mkdir -p /tmp/ci
+      printf '{"hostId":"ci","listenHost":"127.0.0.1","listenPort":18092,"controllerUrl":""}\n' > /tmp/ci/config.json
+      python3 -m caravan_scout.app --config /tmp/ci/config.json --state /tmp/ci/state.json &
+      for i in $(seq 1 20); do
+        if curl -sf -o /dev/null http://127.0.0.1:18092/api/health; then break; fi
+        sleep 1
+      done
+      curl -sf http://127.0.0.1:18092/api/health
+      curl -sf -o /dev/null http://127.0.0.1:18092/api/state
+      curl -sf -o /dev/null http://127.0.0.1:18092/
+      curl -sf http://127.0.0.1:18092/openapi.json | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["openapi"] == "3.1.0" and d["paths"]'
+      curl -sf http://127.0.0.1:18092/v1/models | python3 -c 'import json,sys; assert json.load(sys.stdin) == {"object": "list", "data": []}'
+      echo "smoke OK"
+
+# The macOS scout runs on the system's Python 3.9, so the same snapshots run on the oldest Python
+# the fleet uses.
+snapshots-py39:
+  image: python:3.9
+  script:
+    - |
+      set -e
+      python3 --version
+      for t in scripts/test_scout_*.py scripts/test_check_oop.py; do
+        echo "== $t"
+        python3 "$t"
+      done

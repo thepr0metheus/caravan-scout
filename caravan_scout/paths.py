@@ -29,7 +29,6 @@ DEFAULT_CONFIG = {
     "llamaServerBin": "",      # path to llama-server binary
     "modelsBasePath": "",      # local cache dir for downloaded models (~/.llama-model-cache)
     "llamaNodeDefaultPort": 8180,
-    "cleanOldModels": False,   # delete previously cached models when starting a new one
 }
 
 

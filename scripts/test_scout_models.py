@@ -465,43 +465,6 @@ def test_ensure_model_retries():
           "negative: _download_all_model_files тоже повторяет, а не падает TypeError")
 
 
-def test_cleanup_old_models():
-    s = make_scout()
-    cache = s.models.cache_dir()
-    lay(cache, {MODEL: 10, "models/org/old-q4.gguf": 5, "models/other/stale.gguf": 7,
-                "models/org/partial.tmp": 3, "notes.json": 2, "models/lib/library.gguf": 9})
-    fetched(s, MODEL, "models/org/old-q4.gguf", "models/other/stale.gguf", "models/org/partial.tmp")
-    outside = TMP / "outside-cache" / "x.gguf"
-    lay(outside.parent, {"x.gguf": 1})
-    with Rig() as rig:
-        _, err = attempt(lambda: s.models.cleanup_old(str(cache / MODEL)))
-    check(err is None and tree(cache) == [RECORD, "models", "models/lib", "models/lib/library.gguf", "models/org",
-                                          "models/org/model-q4.gguf", "models/org/partial.tmp", "notes.json"],
-          "удалены скачанные скаутом .gguf, кроме оставленной модели; опустевшие папки убраны; не-.gguf не тронуты")
-    check((cache / "models/lib/library.gguf").exists(),
-          "defect-history: .gguf, который скаут не скачивал, цел — раньше удалялся любой .gguf в папке, кроме "
-          "активного, а папка кэша — настройка и может указывать на библиотеку моделей")
-    check(written_down(s) == [MODEL, "models/org/partial.tmp"], "удалённые вычеркнуты из записи о скачанном")
-    check(outside.exists(), "negative: файлы вне кэша не трогаются")
-    check("[llama-node] cleanOldModels: removed 2 file(s)" in rig.journal, "журнал считает удалённые файлы")
-
-    s = make_scout()
-    cache = s.models.cache_dir()
-    lay(cache, {"a.gguf": 1, MODEL: 1})
-    fetched(s, "a.gguf", MODEL)
-    with Rig():
-        attempt(lambda: s.models.cleanup_old(["", str(cache / "models" / "org" / ".." / "org" / "model-q4.gguf")]))
-    check(tree(cache) == [RECORD, "models", "models/org", "models/org/model-q4.gguf"],
-          "список путей: пустые пропущены, путь сравнивается после resolve (../ не мешает)")
-    with Rig():
-        attempt(lambda: s.models.cleanup_old([]))
-    check(tree(cache) == [] and cache.is_dir(),
-          "boundary: удалено всё — сама папка кэша остаётся, а пустая запись о скачанном уходит вместе с файлами")
-    s = make_scout()
-    _, err = attempt(lambda: s.models.cleanup_old([MODEL]))
-    check(err is None, "negative: папки кэша нет — тихо ничего")
-
-
 def test_purge_model_cache():
     def fresh():
         s = make_scout()
@@ -655,12 +618,6 @@ def test_purge_folders_and_flight():
         res, _ = attempt(lambda: s.models.purge(keep=[cache / "whisper/x/blob"]))
     check((cache / "whisper/x/blob").exists() and not (cache / "seam").exists(),
           "negative: папка, внутри которой лежит удерживаемый файл, цела")
-
-    s, cache = fresh()
-    with Rig():
-        attempt(lambda: s.models.cleanup_old([cache / MODEL]))
-    check((cache / "seam/FP32/weights.bin").exists() and (cache / "whisper/x/blob").exists(),
-          "negative: уборка старых моделей после старта (cleanOldModels) папки не трогает — только .gguf")
 
 
 def test_in_place():
@@ -1125,7 +1082,7 @@ def test_sync_malformed_manifest():
 TESTS = [
     test_model_cache_dir, test_is_corruption_error, test_ensure_model_local, test_ensure_model_download,
     test_ensure_model_progress_throttle, test_ensure_model_truncation, test_ensure_model_retries,
-    test_cleanup_old_models, test_purge_model_cache, test_purge_models_safely, test_split_gguf_parts,
+    test_purge_model_cache, test_purge_models_safely, test_split_gguf_parts,
     test_ensure_split_parts, test_purge_folders_and_flight, test_in_place, test_folder_download,
     test_list_cached_models,
     test_download_all_model_files,

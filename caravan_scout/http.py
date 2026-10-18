@@ -158,11 +158,15 @@ class Api:
                   "build and update status (`llamaUpdate`), the scout's own version (`scoutVersion`), per-cell "
                   "`llamaNodes` (a running cell's `promptTps`, `genTps` and `requestsProcessing` from its /metrics — "
                   "llama.cpp/Prism speeds from gauges or token/compute-time counters, retained while idle (2.23.2+); "
-                  "a vLLM cell's also `requestsWaiting`, and its rates from its token counters, 2.7+; `listening` — "
+                  "a vLLM cell's also `requestsWaiting`, and its rates from its token counters, 2.7+; a Strata cell's, "
+                  "asked for Prometheus text, the running request's own speeds while it works and the last measured "
+                  "ones while it idles, with `requestsWaiting` and `ctxUsed`, 2.35.1+; `listening` — "
                   "whether a running cell's port listens on this machine yet, and while it does not, "
                   "`startingTail`, the last lines of its log, 2.7+; `launchDiskNewer` — the roles (`model`, "
                   "`mmproj`, `draft`) of the files a running cell holds that changed on disk after it started, so a "
-                  "restart would pick them up (a folder by its newest file), 2.11+; a cell that crashed since it "
+                  "restart would pick them up (a folder by its newest file), 2.11+; `ramBytes` — the memory a running "
+                  "cell's processes hold in RAM, their RSS in bytes (the server and everything it started), `null` "
+                  "when ps did not answer, 2.35+; a cell that crashed since it "
                   "was last started by hand carries `crash: {count, at, reason, tail?, gaveUp?}`, 2.5+; `tail` — "
                   "the last 8 lines of the crashed run's log, keys scrubbed, 2.6+), `autostart` — the ports that "
                   "start with the machine, stopped ones too (2.4+), `autostartRequests` — the start request kept for "
@@ -215,6 +219,13 @@ class Api:
                   "Archived llama.cpp builds on this machine, newest first", tag="llama.cpp"),
             Route("GET", "/api/llama-node/list-cache", lambda: {"ok": True, "models": s.models.listing()},
                   "What the local model cache holds", tag="cells"),
+            Route("GET", "/api/llama-node/cache", lambda: {"ok": True, **s.cells.keeper.facts()},
+                  "The model cache: the setting, what it holds, what the disk has left",
+                  "(2.34+) `{ok, keep, managedBytes, foreign: {files, bytes, folders: [{folder, files, bytes}]}, disk: "
+                  "{totalBytes, freeBytes} | null}`. `keep` is how many of the last started models the cache keeps (1 to 5, "
+                  "1 until set); `managedBytes` is what this scout downloaded and still holds; `foreign` is what lies in "
+                  "the cache folder that it did not download — counted, never deleted by itself. The same object rides "
+                  "both reports as `modelCache`.", tag="cells"),
             # vLLM in this machine's venv: version, history, the install job.
             Route("GET", "/api/vllm", lambda: s.vllm.info(),
                   "vLLM in this machine's venv: version, history, the install job",
@@ -268,8 +279,17 @@ class Api:
                   "`GET /api/models/download` (2.30+, before that refused). `vram` "
                   "(optional, 2.7+) — `{device, reserveMiB, who, why, lower}`, what the cell reserves on a card the "
                   "moment it starts (the controller's rule: vLLM takes utilization × the card): a command cell "
-                  "whose card has less free right now is refused before it runs, naming the running cells that "
-                  "hold it. `env` (optional, 2.8.1+) — `{NAME: value}` a llama cell's server starts with, over the "
+                  "whose card has less free right now is refused before it runs, naming what holds THAT card "
+                  "and how much (2.33: the cells with a process on it, and any other process by its executable; "
+                  "not the cells of the other card), saying so when the card is too small for the reserve, and "
+                  "naming another card with the room when there is one. `ram` (optional, 2.32+) — `{reserveMiB, who, why}`, the memory a command cell keeps "
+                  "resident (Strata holds every expert in RAM): a start the machine's memory cannot hold — what "
+                  "the kernel says is available, and what the cells already up or still loading promised — is "
+                  "refused before it runs, naming the cells to stop. Since 2.32 a start for a port whose cell "
+                  "this scout lost track of (found by the mark in its environment, `CARAVAN_SCOUT_CELL`) holds "
+                  "that cell again and answers that a server already runs there, instead of starting a second "
+                  "copy beside it, and a port held by a process no scout started is refused with its pid and "
+                  "command line. `env` (optional, 2.8.1+) — `{NAME: value}` a llama cell's server starts with, over the "
                   "scout's own environment: a CPU-only cell (`N_GPU_LAYERS` 0) gets `CUDA_VISIBLE_DEVICES=\"\"`, "
                   "the environment the controller's start.sh exports; it is written into the cell's start.sh and "
                   "kept for a restart after a crash. A name that is not a shell variable name, or a value that is "
@@ -284,7 +304,7 @@ class Api:
                   "command cell obeys since 2.31). Async, a command cell's start too since 2.31 (it ran on the request, "
                   "download included): returns `{status: \"starting\", phase: \"resolving\"}` immediately; "
                   "progress is visible in `/api/llama-node/status` and the fast heartbeats.", tag="cells",
-                  body=("port", "args", "cellKind", "shellLine", "healthPath", "cacheModels", "inPlace", "vram", "env",
+                  body=("port", "args", "cellKind", "shellLine", "healthPath", "cacheModels", "inPlace", "vram", "ram", "env",
                         "modelFiles"),
                   body_more=True),
             Route("POST", "/api/llama-node/autostart", self._autostart,
@@ -338,6 +358,21 @@ class Api:
                   "(2.6+) A new build can raise it again.", tag="llama.cpp"),
             Route("POST", "/api/llama-node/purge-cache", lambda body: ({"ok": True, **s.cells.purge_models_safely()}, 200),
                   "Clear the model cache, never evicting a model a running cell serves", tag="cells"),
+            Route("POST", "/api/llama-node/cache/keep", self._cache_keep,
+                  "Set how many of the last started models the cache keeps, and trim it to that now",
+                  "(2.34+) `{keep}`, a whole number from 1 to 5 (400 for anything else) → `{ok, keep, removed, freedBytes, "
+                  "waiting}`. The cache keeps the files of the `keep` models that ran most recently, and of every cell "
+                  "that is starting or running whatever its age; the rest of what this scout downloaded is deleted — now, "
+                  "and after each start that reaches a running process. `waiting: true`: the scout knows no model that ran "
+                  "yet (it has just learned this), so nothing was deleted; the first start after that begins the trimming. "
+                  "The setting is kept in `state.json`.", tag="cells", body=("keep",)),
+            Route("POST", "/api/llama-node/cache/delete-foreign", self._cache_delete_foreign,
+                  "Delete the files of the cache folder that this scout did not download",
+                  "(2.34+) `{expectBytes}`: the size the operator was shown (`modelCache.foreign.bytes`) → `{ok, removed, "
+                  "freedBytes}`. 409 when it is no longer the size (something came or went since: nothing is deleted), "
+                  "400 without it. Files a running or starting cell holds stay. These files are not deleted by "
+                  "themselves — they were there before this scout kept a record, or came by another road, and the cache "
+                  "folder is a setting that can name a library.", tag="cells", body=("expectBytes",)),
             Route("POST", "/api/llama-node/configs/delete", self._delete_config,
                   "Delete a saved launch config by its filename", tag="cells", body=("filename",)),
             # A model of an engine next to the cells (Ollama, LM Studio)
@@ -401,6 +436,12 @@ class Api:
     def _delete_config(self, body) -> tuple[Any, int]:
         self.scout.configs.delete(str(body().get("filename") or ""))
         return {"ok": True}, 200
+
+    def _cache_keep(self, body) -> tuple[Any, int]:
+        return {"ok": True, **self.scout.cells.keeper.set_keep(body().get("keep"))}, 200
+
+    def _cache_delete_foreign(self, body) -> tuple[Any, int]:
+        return {"ok": True, **self.scout.cells.keeper.delete_foreign(body().get("expectBytes"))}, 200
 
     def handler(self) -> type[BaseHTTPRequestHandler]:
         """The request handler class for this scout's server."""

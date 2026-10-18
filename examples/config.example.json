@@ -7,6 +7,5 @@
   "heartbeatIntervalSeconds": 60,
   "llamaServerBin": "",
   "modelsBasePath": "",
-  "llamaNodeDefaultPort": 8180,
-  "cleanOldModels": false
+  "llamaNodeDefaultPort": 8180
 }

@@ -50,7 +50,7 @@ OPEN = {("get", "/"), ("get", "/index.html"), ("get", "/api/pairing"), ("get", "
 # The fields each POST route names, as the description says them. The routes that read no body are not here.
 BODIES = {
     "/api/controller-url": ["url", "token"],
-    "/api/llama-node/start": ["port", "args", "cellKind", "shellLine", "healthPath", "cacheModels", "inPlace", "vram", "env",
+    "/api/llama-node/start": ["port", "args", "cellKind", "shellLine", "healthPath", "cacheModels", "inPlace", "vram", "ram", "env",
                               "modelFiles"],
     "/api/llama-node/autostart": ["port", "enabled", "payload"],
     "/api/llama-node/stop": ["port"],
@@ -63,6 +63,8 @@ BODIES = {
     "/api/engines/delete": ["kind", "port", "model"],
     "/api/engines/start": ["kind", "port"],
     "/api/engines/stop": ["kind", "port"],
+    "/api/llama-node/cache/keep": ["keep"],
+    "/api/llama-node/cache/delete-foreign": ["expectBytes"],
     "/v1/{path}": ["model"],
 }
 NO_BODY = ["/api/heartbeat", "/api/unpair", "/api/host/reboot", "/api/host/poweroff",
@@ -112,7 +114,7 @@ def test_the_document():
     check(doc["components"]["securitySchemes"]["fleetToken"]
           == {"type": "apiKey", "in": "header", "name": "X-Caravan-Token", "description": ApiSpec.SECURITY},
           "вход: токен флота в заголовке X-Caravan-Token, и сказано, когда скаут открыт без него")
-    check(len(ops) == len(api.routes) == 42, f"операций столько же, сколько строк в таблице путей — 42 (got {len(ops)})")
+    check(len(ops) == len(api.routes) == 45, f"операций столько же, сколько строк в таблице путей — 45 (got {len(ops)})")
     check(list(doc["paths"]) == sorted(doc["paths"]), "пути в документе по алфавиту — он не зависит от порядка строк таблицы")
     ids = [op["operationId"] for _m, _p, op in ops]
     check(len(set(ids)) == len(ids) and "getApiLlamaNodeStatus" in ids and "postApiHeartbeat" in ids
