@@ -64,6 +64,8 @@ BODIES = {
     "/api/engines/start": ["kind", "port"],
     "/api/engines/stop": ["kind", "port"],
     "/api/llama-node/cache/keep": ["keep"],
+    "/api/llama-node/cache/budget": ["budgetBytes"],
+    "/api/llama-node/cache/dir": ["path"],
     "/api/llama-node/cache/delete-foreign": ["expectBytes"],
     "/v1/{path}": ["model"],
 }
@@ -114,7 +116,7 @@ def test_the_document():
     check(doc["components"]["securitySchemes"]["fleetToken"]
           == {"type": "apiKey", "in": "header", "name": "X-Caravan-Token", "description": ApiSpec.SECURITY},
           "вход: токен флота в заголовке X-Caravan-Token, и сказано, когда скаут открыт без него")
-    check(len(ops) == len(api.routes) == 45, f"операций столько же, сколько строк в таблице путей — 45 (got {len(ops)})")
+    check(len(ops) == len(api.routes) == 48, f"операций столько же, сколько строк в таблице путей — 48 (got {len(ops)})")
     check(list(doc["paths"]) == sorted(doc["paths"]), "пути в документе по алфавиту — он не зависит от порядка строк таблицы")
     ids = [op["operationId"] for _m, _p, op in ops]
     check(len(set(ids)) == len(ids) and "getApiLlamaNodeStatus" in ids and "postApiHeartbeat" in ids
@@ -134,10 +136,12 @@ def test_the_document():
           "401 назван у закрытых путей и не назван у открытых")
 
     params = {p: op.get("parameters") for m, p, op in ops if "parameters" in op}
-    in_path = {p: [(x["name"], x["in"], x["required"], x["schema"]) for x in ps] for p, ps in params.items() if p != "/api/telemetry"}
-    check(params["/api/telemetry"] == [{"name": "since", "in": "query", "required": False,
-                                        "schema": {"description": ApiSpec.NOT_DESCRIBED}}],
-          "параметр запроса один — since у /api/telemetry; больше никто запроса не читает")
+    queried = ("/api/telemetry", "/api/llama-node/log")
+    in_path = {p: [(x["name"], x["in"], x["required"], x["schema"]) for x in ps] for p, ps in params.items() if p not in queried}
+    loose = {"in": "query", "required": False, "schema": {"description": ApiSpec.NOT_DESCRIBED}}
+    check(params["/api/telemetry"] == [{"name": "since", **loose}]
+          and params["/api/llama-node/log"] == [{"name": name, **loose} for name in ("port", "lines", "run")],
+          "запрос читают двое — since у /api/telemetry и port, lines, run у журнала ячейки (2.36); больше никто")
     check(in_path == {"/v1/models/{model}": [("model", "path", True, {"type": "string"})],
                       "/v1/{path}": [("path", "path", True, {"type": "string"})]}
           and all(x["description"] for p in in_path for x in params[p]),
@@ -221,8 +225,8 @@ def test_one_list():
     check(answered == described, f"скаут отвечает ровно на то, что описано (только у одного: {sorted(answered ^ described)})")
     check(sorted(api.pages) == ["/", "/index.html"] and sorted(api.open_get) == ["/api/health", "/api/pairing", "/openapi.json"],
           "страницы и открытые пути — те, что помечены в таблице")
-    check(list(api.get_query) == ["/api/telemetry"] and "/api/controller-url" not in api.post,
-          "запрос — у телеметрии; сопряжение обработчик отвечает сам, до ворот, и в таблице обработчиков его нет")
+    check(sorted(api.get_query) == ["/api/llama-node/log", "/api/telemetry"] and "/api/controller-url" not in api.post,
+          "запрос — у журнала ячейки и телеметрии; сопряжение обработчик отвечает сам, до ворот, и в таблице обработчиков его нет")
     unhandled = [r.path for r in api.routes if r.handler is None and not r.entry]
     entry = sorted(r.path for r in api.routes if r.entry)
     check(unhandled == ["/api/controller-url"] and entry == ["/v1/models", "/v1/models/{model}", "/v1/{path}"]

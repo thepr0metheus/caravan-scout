@@ -226,7 +226,7 @@ class EngineServers:
             if kind.id in running:
                 continue
             entry = self.known().get(kind.id) or {}
-            recipe = entry.get("recipe") or kind.installed(self.home)
+            recipe = self.recipe_for(kind)
             if not recipe:
                 continue
             port = int(entry.get("port") or recipe.get("port") or kind.default_port)
@@ -236,8 +236,18 @@ class EngineServers:
         return out
 
     def recipe_for(self, kind) -> dict[str, Any] | None:
-        entry = self.known().get(kind.id) or {}
-        return entry.get("recipe") or kind.installed(self.home)
+        """How to start the kind's server: the recipe learned from its run, or where the kind is installed. A learned
+        recipe whose binary is gone — the engine moved, as Ollama did from the home to /usr/local (2026-10-24) — keeps
+        its arguments and environment and takes the binary from where the kind is installed now."""
+        learned = (self.known().get(kind.id) or {}).get("recipe")
+        if not learned:
+            return kind.installed(self.home)
+        exe = str(learned.get("exe") or "")
+        if exe and not os.access(exe, os.X_OK):
+            found = kind.installed(self.home)
+            if found and found.get("exe"):
+                return {**learned, "exe": found["exe"]}
+        return learned
 
     def start(self, kind, port: int) -> str:
         """Start the server as the recipe says; it starts with the machine

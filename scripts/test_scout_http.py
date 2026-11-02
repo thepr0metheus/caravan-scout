@@ -366,7 +366,7 @@ def test_stop():
     alive = {}
 
     def listener(port):
-        return {22001: 4242, 22002: 5151}.get(port, 0)
+        return {22001: 4242, 22002: 5151, 22004: 6161}.get(port, 0)
 
     def cmdline(pid):
         return alive.get(pid, "")
@@ -374,9 +374,24 @@ def test_stop():
     def kill(pid, sig):
         kills.append((pid, sig))
         alive.pop(pid, None)
+    released = []
+
+    def release(files, keep=None):
+        released.append(sorted(Path(f).name for f in files))
+        purged.append(1)
+        return {"removed": len(files), "freedBytes": 0}
     with patched(scout.cells.processes, listener=listener, cmdline=cmdline), \
-            patched(scout.cells, purge_models_safely=lambda: purged.append(1) or {"removed": 0, "freedBytes": 0}), \
+            patched(scout.cells.models, release=release), \
+            patched(scout.cells, purge_models_safely=lambda: purged.append("all") or {"removed": 0, "freedBytes": 0}), \
             patched(os, kill=kill), Served(scout) as srv:
+        # This cell's start asked the cache for its model and projector; the keeper's log also holds another cell's start…
+        scout.cells.asks(22001, ["org/a/Q4/a-Q4.gguf", "org/a/Q4/mmproj-a.gguf"])
+        scout.cells.keeper.uses.begin(22009, ["org/b/Q4/b-Q4.gguf"])
+        # …a cell that ran once on :22003 and runs no more (the board removes it with one more stop)…
+        scout.cells.keeper.uses.begin(22003, ["org/c/Q4/c-Q4.gguf"])
+        # …and a deleted cell's start on :22004, the port a cell in an engine is made on next: its start asks for nothing.
+        scout.cells.keeper.uses.begin(22004, ["org/d/Q4/d-Q4.gguf"])
+        scout.cells.asks(22004, [])
         scout.cells.records.add(22001, "llama", 4242, "/opt/llama/bin/llama-server", {"port": 22001}, None, False)
         alive[4242] = "/opt/llama/bin/llama-server --port 22001"
         result = srv.post("/api/llama-node/stop", {"port": 22001})
@@ -384,7 +399,11 @@ def test_stop():
               "узел ничего не держал, но порт слушает наш llama-server — SIGTERM и «reclaimed»")
         check("22001" not in (scout.state.get("cells") or {}) and 22001 not in dict(scout.cells.all()),
               "после остановки ячейка ушла из реестра и из слотов")
-        check(purged == [1], "кэш без cacheModels чистится один раз, безопасной чисткой")
+        check(released == [["a-Q4.gguf", "mmproj-a.gguf"]] and purged == [1],
+              "ячейка без cacheModels отпускает свои модели — те, что просили её старты, — один раз")
+        check("b-Q4.gguf" not in sum(released, []) and "all" not in purged,
+              "defect-history (2026-10-26): чужие модели кэша остаются — остановка чистила всё, чего не держит работающая ячейка: "
+              "стоп ячейки Ollama, у которой своих файлов нет вовсе, стёр 92 ГБ чужих моделей")
 
         scout.cells.records.add(22002, "command", 5151, "python3 other.py", {"port": 22002}, None, True)
         alive[5151] = "/usr/bin/some-dev-server --port 22002"
@@ -397,9 +416,22 @@ def test_stop():
         check("22002" in (scout.state.get("cells") or {}),
               "negative: неподтверждённая остановка не стирает запись реестра — ячейка не становится ничьей")
 
+        scout.cells.records.add(22004, "llama", 6161, "/opt/llama/bin/llama-server", {"port": 22004}, None, False)
+        alive[6161] = "/opt/llama/bin/llama-server --port 22004"
+        result = srv.post("/api/llama-node/stop", {"port": 22004})
+        check(result == (200, {"ok": True, "reclaimed": True, "pid": 6161}) and released == [["a-Q4.gguf", "mmproj-a.gguf"]]
+              and purged == [1] and scout.cells.keeper.uses.entries()[0]["files"] == ["org/d/Q4/d-Q4.gguf"],
+              "defect-history (2026-10-26): ячейка, чей старт ничего у кэша не просил (ячейка движка), не отпускает ничего, хотя в "
+              "журнале кэша на её порту — старт удалённой ячейки: стоп ячейки Ollama на порту тестовых ячеек стёр их модели, "
+              "101,5 ГБ копий библиотеки на машине контроллера; запись журнала остаётся — она для подсчёта последних моделей")
+
         result = srv.post("/api/llama-node/stop", {"port": 22003})
         check(result == (200, {"ok": True, "detail": "not running"}),
               "boundary: порт никто не слушает — «not running», это успех")
+        check(purged == [1] and len(released) == 1 and not scout.cells.at(22003).asked,
+              "defect-history (2026-10-26): остановка, которая ничего не остановила, кэш не чистит — доска удаляет остановленную "
+              "ячейку ещё одной остановкой, скаут заводил ячейку заново без кэша и стирал все модели кэша, которых не держит "
+              "работающая ячейка (116 ГБ на машине контроллера за одно «Remove cell»)")
 
 
 def test_stop_every_slot():

@@ -127,9 +127,10 @@ class Api:
             # it reaches; ScoutHandler answers these paths before the token gate and the tables.
             Route("GET", "/v1/models", None, "This machine's models, by OpenAI's API",
                   "`{object: \"list\", data: [{id, object: \"model\", created, owned_by, caravan: {state, slots, busy, "
-                  "copies: [{port, state, slots, busy}]}}]}`: every cell the scout runs, starts or keeps a start request for, by its model's "
-                  "name — the name its operator gave (`MODEL_NAME`), else the cell's `ALIAS`, else one made of its "
-                  "model — two cells of one model are its copies. `state`: running, starting, failed, stopped; a "
+                  "copies: [{port, state, slots, busy}]}}]}`: every cell the scout runs, starts or keeps a start request for, and every "
+                  "one the controller keeps for this machine, a stopped one as stopped (2.37) — by its model's "
+                  "name: the name its operator gave (`MODEL_NAME`), else the cell's `ALIAS`, else one made of its "
+                  "model (a folder of HF's cache by its repository) — two cells of one model on one runner are its copies, one name on two runners is two models `<name>@<runner>` (2.39). `state`: running, starting, failed, stopped; a "
                   "model's is the best of its copies'. `slots`, `busy` — how many requests a running copy takes at once "
                   "(/props `total_slots`) and works on now (/metrics); a model's are its running copies' sums, 0 when none "
                   "runs, null when one does not say (2.29+). `created` — when its first copy started, 0 for none; "
@@ -156,11 +157,17 @@ class Api:
                   "`name` is the process's executable, \"\" when nvidia-smi cannot name it, 2.12+), `engines` — the "
                   "model engines on this machine that are not its cells (2.12+, below), heartbeat status, llama.cpp "
                   "build and update status (`llamaUpdate`), the scout's own version (`scoutVersion`), per-cell "
-                  "`llamaNodes` (a running cell's `promptTps`, `genTps` and `requestsProcessing` from its /metrics — "
+                  "`llamaNodes` (a running cell's `promptTps`, `genTps` and `requestsProcessing` from its /metrics, or "
+                  "`noMetrics: true` when its server answers it keeps none — 404, 501: llama.cpp started without --metrics, 2.41+ — "
                   "llama.cpp/Prism speeds from gauges or token/compute-time counters, retained while idle (2.23.2+); "
                   "a vLLM cell's also `requestsWaiting`, and its rates from its token counters, 2.7+; a Strata cell's, "
                   "asked for Prometheus text, the running request's own speeds while it works and the last measured "
-                  "ones while it idles, with `requestsWaiting` and `ctxUsed`, 2.35.1+; `listening` — "
+                  "ones while it idles, with `requestsWaiting` and `ctxUsed`, 2.35.1+; a cell copying its model says "
+                  "`downloadedBytes` of `totalBytes` of `downloadingFile`, and `downloadBytesPerSec` — how fast, over the "
+                  "copy's last seconds, null while not measured, 2.42+; a running cell says `readBytes` — what its "
+                  "processes have read, the larger of rchar and read_bytes of each, summed — `readBytesPerSec` over the "
+                  "run's last seconds and `modelBytes`, what its files weigh, measured by its start; null each while not "
+                  "known, 2.43+; `listening` — "
                   "whether a running cell's port listens on this machine yet, and while it does not, "
                   "`startingTail`, the last lines of its log, 2.7+; `launchDiskNewer` — the roles (`model`, "
                   "`mmproj`, `draft`) of the files a running cell holds that changed on disk after it started, so a "
@@ -219,11 +226,21 @@ class Api:
                   "Archived llama.cpp builds on this machine, newest first", tag="llama.cpp"),
             Route("GET", "/api/llama-node/list-cache", lambda: {"ok": True, "models": s.models.listing()},
                   "What the local model cache holds", tag="cells"),
+            # The board's window reads a cell's log (2.36): the last lines of a run, and the runs there are to read.
+            Route("GET", "/api/llama-node/log", lambda q: s.cells.log(q.get("port"), q.get("lines"), q.get("run") or ""),
+                  "The last lines a cell's server wrote, and the runs there are to read",
+                  "(2.36+) `port` — the cell; `lines` — how many of the last (300 when not said, 2000 at most); `run` — an "
+                  "earlier run's log, by a name `runs` gives (the newest run when not said). `{ok, port, run, lines: [...], "
+                  "runs: [{name, bytes, modifiedAt}]}`, the newest run first; keys are scrubbed out of the lines as out of a "
+                  "crash's tail. `{ok: false, error}` for a port with no log here, or a name that is not one of its runs.",
+                  tag="cells", query=("port", "lines", "run")),
             Route("GET", "/api/llama-node/cache", lambda: {"ok": True, **s.cells.keeper.facts()},
                   "The model cache: the setting, what it holds, what the disk has left",
-                  "(2.34+) `{ok, keep, managedBytes, foreign: {files, bytes, folders: [{folder, files, bytes}]}, disk: "
-                  "{totalBytes, freeBytes} | null}`. `keep` is how many of the last started models the cache keeps (1 to 5, "
-                  "1 until set); `managedBytes` is what this scout downloaded and still holds; `foreign` is what lies in "
+                  "(2.34+) `{ok, keep, budgetBytes, dir, managedBytes, foreign: {files, bytes, folders: [{folder, files, "
+                  "bytes}]}, disk: {totalBytes, freeBytes} | null}`. `keep` is how many of the last started models the cache "
+                  "keeps (1 to 5, 1 until set); `budgetBytes` (2.38+) how much its models may take in all, null until set — "
+                  "then `keep` rules; `dir` (2.38+) the folder the cache is in; `managedBytes` is what this scout downloaded "
+                  "and still holds; `foreign` is what lies in "
                   "the cache folder that it did not download — counted, never deleted by itself. The same object rides "
                   "both reports as `modelCache`.", tag="cells"),
             # vLLM in this machine's venv: version, history, the install job.
@@ -366,6 +383,23 @@ class Api:
                   "and after each start that reaches a running process. `waiting: true`: the scout knows no model that ran "
                   "yet (it has just learned this), so nothing was deleted; the first start after that begins the trimming. "
                   "The setting is kept in `state.json`.", tag="cells", body=("keep",)),
+            Route("POST", "/api/llama-node/cache/budget", self._cache_budget,
+                  "Set how much the cache's models may take in all, and trim it to that now",
+                  "(2.38+) `{budgetBytes}`, a whole number of bytes from 1 GiB up, or null to take it off (400 for anything "
+                  "else) → `{ok, budgetBytes, removed, freedBytes, waiting}`. The cache keeps the files of every cell that is "
+                  "starting or running, then the models that ran, newest first, as many as fit in the budget together with "
+                  "them; the rest of what this scout downloaded is deleted — now, and after each start that reaches a running "
+                  "process. Without a budget the cache keeps the last `keep` models. The setting is kept in `state.json`.",
+                  tag="cells", body=("budgetBytes",)),
+            Route("POST", "/api/llama-node/cache/dir", self._cache_dir,
+                  "Move the model cache to another folder",
+                  "(2.38+) `{path}`, an absolute folder → `{ok, dir, removed, freedBytes}`. What this scout downloaded into "
+                  "the folder it leaves is deleted — every model of it is the controller's copy, and a start brings its model "
+                  "into the new folder — then the cache is there; the folder is made when it is not. 400: no absolute path, "
+                  "the folder it is in now, a folder inside the old one or holding it, one that cannot be made or written to. "
+                  "409 while a cell is bringing its model (resolving, downloading, loading); a cell that runs keeps running. "
+                  "The setting is kept in `state.json`, before `modelsBasePath` of `config.json`.",
+                  tag="cells", body=("path",)),
             Route("POST", "/api/llama-node/cache/delete-foreign", self._cache_delete_foreign,
                   "Delete the files of the cache folder that this scout did not download",
                   "(2.34+) `{expectBytes}`: the size the operator was shown (`modelCache.foreign.bytes`) → `{ok, removed, "
@@ -439,6 +473,12 @@ class Api:
 
     def _cache_keep(self, body) -> tuple[Any, int]:
         return {"ok": True, **self.scout.cells.keeper.set_keep(body().get("keep"))}, 200
+
+    def _cache_budget(self, body) -> tuple[Any, int]:
+        return {"ok": True, **self.scout.cells.keeper.set_budget(body().get("budgetBytes"))}, 200
+
+    def _cache_dir(self, body) -> tuple[Any, int]:
+        return {"ok": True, **self.scout.cells.keeper.move_to(body().get("path"))}, 200
 
     def _cache_delete_foreign(self, body) -> tuple[Any, int]:
         return {"ok": True, **self.scout.cells.keeper.delete_foreign(body().get("expectBytes"))}, 200

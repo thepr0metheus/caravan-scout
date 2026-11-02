@@ -3,6 +3,7 @@ controller, verified, and purged."""
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import threading
@@ -10,10 +11,111 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from pathlib import Path
 from typing import Any, Callable
 
 from caravan_scout.errors import AppError
+
+
+class CopyPace:
+    """How fast a copy goes: bytes a second over its last few seconds (2.42). The board says it beside the copy's figures,
+    with the time left (the owner, 2026-10-26, shown "Downloading the model … 4.6/87.2 GB · 5%": "show at what speed it
+    downloads"). Over a window of samples, not the last two reads: two 32 MiB steps read a moment apart say nothing steady.
+    None — not measured, never a 0 — until the window spans two seconds; a count that went back (another file, a retry) starts
+    the window again."""
+
+    WINDOW = 10.0
+    SPAN = 2.0
+    STEP = 0.25
+
+    def __init__(self, clock: Callable[[], float] | None = None):
+        self.clock = clock or time.monotonic
+        self.samples: deque[tuple[float, int]] = deque()
+
+    def add(self, done: int) -> None:
+        """A count of bytes copied so far, at the clock's now: kept every STEP seconds, the window's oldest let go."""
+        now = self.clock()
+        if self.samples and done < self.samples[-1][1]:
+            self.samples.clear()
+        if self.samples and now - self.samples[-1][0] < self.STEP:
+            return
+        self.samples.append((now, int(done)))
+        while len(self.samples) > 2 and now - self.samples[1][0] >= self.WINDOW:
+            self.samples.popleft()
+
+    def rate(self) -> int | None:
+        """Bytes a second over the window, or None while it spans less than SPAN seconds."""
+        if len(self.samples) < 2:
+            return None
+        (t0, d0), (t1, d1) = self.samples[0], self.samples[-1]
+        return int((d1 - d0) / (t1 - t0)) if t1 - t0 >= self.SPAN else None
+
+
+class WrittenPages:
+    """A download's pages out of the page cache as they are written.
+
+    A model is tens of GB, written once by the scout and read by the cell that asked for it. Left in the page cache it
+    is the youngest memory of the machine, charged to the scout's cgroup, and the start that follows it pays: a Strata
+    cell reading 33 GiB of experts into RAM right after its 68 GB download made the kernel evict the working set of
+    everything else instead, the memory pressure of the user's session stayed above systemd-oomd's 50 % for 20 s, and
+    oomd killed the scout, GNOME Shell and the cell (2026-10-23 and 2026-10-26, on the controller's machine; the
+    watchdog's second start, with the pile gone, loaded at once). So every STEP bytes what was written is synced and
+    dropped — only clean pages leave the cache. A system with no posix_fadvise (macOS) keeps its cache; a refusal to
+    drop is said in the journal once and the download goes on: a cache hint is no reason to fail a model."""
+
+    STEP = 256 << 20
+
+    def __init__(self, fh, label: str):
+        self.fh = fh
+        self.label = label
+        self.dropped = 0
+        self.on = self.can()
+
+    @staticmethod
+    def can() -> bool:
+        return callable(getattr(os, "posix_fadvise", None))
+
+    def wrote(self, done: int) -> None:
+        if done - self.dropped >= self.STEP:
+            self.drop(done)
+
+    def drop(self, done: int) -> None:
+        """Sync what was written since the last drop, then take it out of the page cache."""
+        if not self.on or done <= self.dropped:
+            return
+        try:
+            self.fh.flush()
+            fd = self.fh.fileno()
+            os.fdatasync(fd)
+            os.posix_fadvise(fd, self.dropped, done - self.dropped, os.POSIX_FADV_DONTNEED)
+        except OSError as exc:
+            self.on = False
+            print(f"[llama-node] {self.label}: its pages stay in the page cache ({exc})")
+            return
+        self.dropped = done
+
+
+class CacheFolder:
+    """The setting: where the model cache is — the owner, 2026-10-26: a folder on an HDD, so the cached models stop spending the
+    SSD's writes. It lives in state.json, the scout's own memory, as the cache's other settings do (cache_keeper.CacheKeep): the
+    board changes it over HTTP (CacheKeeper.move_to), and config.json stays the file the operator wrote. Not set, the cache is
+    where config.json's `modelsBasePath` says, else ~/.llama-model-cache (ModelFetcher.cache_dir)."""
+
+    KEY = "cacheDir"
+
+    def __init__(self, state):
+        self.state = state
+
+    def value(self) -> Path | None:
+        with self.state.lock:
+            raw = self.state.get(self.KEY)
+        return Path(raw) if isinstance(raw, str) and raw.startswith("/") else None
+
+    def set(self, path: Path) -> None:
+        with self.state.lock:
+            self.state[self.KEY] = str(path)
+            self.state.save()
 
 
 class DownloadedFiles:
@@ -84,6 +186,40 @@ class DownloadedFiles:
         key = self._key(path)
         return key is not None and key in self._read()
 
+    @staticmethod
+    def covers(names: set[str], rel: str) -> bool:
+        """Whether the file at `rel` (its path inside the cache folder) is this scout's: written down itself, or under a
+        folder that is. The one rule of ownership: the cache keeper's foreign files and a folder fetch read it here."""
+        return rel in names or any(rel.startswith(entry + "/") for entry in names)
+
+    def foreign_in(self, folder: Path) -> list[Path]:
+        """The files under `folder` that this scout did not download — every file, hidden ones too, since a folder of
+        them is written into. None for a folder of its own downloads only."""
+        base, names = self.cache_dir(), self._read()
+        found = []
+        for root, _dirs, files in os.walk(folder):
+            for name in files:
+                path = Path(root) / name
+                try:
+                    rel = path.relative_to(base).as_posix()
+                except ValueError:
+                    found.append(path)
+                    continue
+                if not self.covers(names, rel):
+                    found.append(path)
+        return found
+
+    def forget_under(self, folder: Any) -> None:
+        """Forget what is written down inside `folder`: the files a folder, now written down as a whole, holds."""
+        key = self._key(folder)
+        if key is None:
+            return
+        with self._lock:
+            names = self._read()
+            kept = {name for name in names if not name.startswith(key + "/")}
+            if kept != names:
+                self._write(kept)
+
     def paths(self) -> list[Path]:
         base = self.cache_dir()
         return [base / name for name in sorted(self._read())]
@@ -122,6 +258,28 @@ class SplitGguf:
                 for i in range(1, count + 1)]
 
 
+class ModelBytes:
+    """How many bytes a start's model files take on this machine (2.43): what the board counts a loading cell's reading against.
+    A file that is the first part of a split GGUF counts every part; a folder (safetensors, a pack) everything under it; a file
+    that cannot be read is left out. None when no file could be measured: an unknown whole is no denominator."""
+
+    @staticmethod
+    def of(paths) -> int | None:
+        total = 0
+        for raw in paths or ():
+            if not raw:
+                continue
+            path = Path(str(raw))
+            try:
+                if path.is_dir():
+                    total += sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+                else:
+                    total += sum(Path(part).stat().st_size for part in SplitGguf(path).parts())
+            except OSError:
+                continue
+        return total or None
+
+
 class ModelFetcher:
     """The model cache: where downloaded files live, how they arrive from the
     controller, and how they go.
@@ -132,12 +290,17 @@ class ModelFetcher:
     Which files a RUNNING cell holds is the scout's to say (purge_safely).
     """
 
-    def __init__(self, config, report: Callable[..., None]):
+    def __init__(self, config, report: Callable[..., None], folder: CacheFolder | None = None,
+                 clock: Callable[[], float] | None = None):
         self.config = config
         self.report = report
+        # The clock a copy's pace is read by (CopyPace); None asks time.monotonic.
+        self.clock = clock
+        # The folder the board chose (CacheFolder), when it chose one: before config.json's.
+        self.folder = folder
         self.downloaded = DownloadedFiles(self.cache_dir)
-        # One fetch per folder at a time: two cells of one model starting
-        # together would write the same "<folder>.part".
+        # One fetch per folder or file at a time: two cells of one model starting
+        # together would write the same "<folder>.part", or the same "<file>.tmp".
         self._folders: dict[str, threading.Lock] = {}
         self._folders_lock = threading.Lock()
         # What is being written right now — a file's .tmp, a folder's .part.
@@ -180,6 +343,11 @@ class ModelFetcher:
         return True
 
     def cache_dir(self) -> Path:
+        """Where the cache is: the folder the board chose (CacheFolder), else config.json's `modelsBasePath`, else
+        ~/.llama-model-cache."""
+        chosen = self.folder.value() if self.folder is not None else None
+        if chosen is not None:
+            return chosen
         base = str(self.config.get("modelsBasePath") or "").strip()
         if base:
             return Path(base).expanduser()
@@ -318,13 +486,17 @@ class ModelFetcher:
                                       port=port, hint=hint)
         cache_dir = self.cache_dir()
         local = cache_dir / model_path_raw
-        if use_cache and local.exists():
-            return local
-        self.refuse_unreachable(model_path_raw, hint)
-        self.controller(model_path_raw)
-        label = report_label or Path(model_path_raw).name
-        local.parent.mkdir(parents=True, exist_ok=True)
-        return self._download(model_path_raw, local, local.with_suffix(".tmp"), label, report, port)
+        # One copy of a file at a time, as of a folder (ensure_folder). A stop does not end the copy it interrupts — it goes
+        # on to the end of the file, and a start that follows the stop at once is a second copy of the same file: two writers
+        # of one ".tmp". It waits for the first instead and finds the file whole.
+        with self._folder_lock(model_path_raw):
+            if use_cache and local.exists():
+                return local
+            self.refuse_unreachable(model_path_raw, hint)
+            self.controller(model_path_raw)
+            label = report_label or Path(model_path_raw).name
+            local.parent.mkdir(parents=True, exist_ok=True)
+            return self._download(model_path_raw, local, local.with_suffix(".tmp"), label, report, port)
 
     #: Written last into a folder this scout rebuilt: its listing, so a folder
     #: without it is one whose fetch did not finish.
@@ -351,9 +523,19 @@ class ModelFetcher:
         local = self.cache_dir() / raw
         if use_cache and (local / self.FOLDER_MARK).is_file():
             return local
+        # Whose the folder there is, is asked before a byte is fetched: it was asked after the whole model came down, and a
+        # start refused at its end had written gigabytes for nothing. A folder written down whole is replaced, as always.
+        # A folder of files this scout fetched one by one — another cell's start of the same model, which names a file of
+        # it (2026-10-24: the llama-server cell :22011 fetched MiniCPM-o's GGUF and a projector into the folder the omni
+        # cell :22024 needs whole, and :22024 was refused three times) — is completed where it is: what is there of its
+        # size stays, and the rest comes.
+        whole = self.downloaded.has(local)
+        in_place = not whole and local.is_dir() and not local.is_symlink() and not self.downloaded.foreign_in(local)
+        if (local.exists() or local.is_symlink()) and not (whole or in_place):
+            raise AppError(f"{local} is there and was not downloaded by this scout: not replaced", 409)
         self.refuse_unreachable(raw, hint)
         listing = self.folder_listing(raw)
-        part = local.with_name(local.name + ".part")
+        part = local if in_place else local.with_name(local.name + ".part")
         part.mkdir(parents=True, exist_ok=True)
         self.downloaded.add(part)
         self._flying(part, True)
@@ -384,13 +566,15 @@ class ModelFetcher:
                 at.unlink()
             at.symlink_to(target)
         (part / self.FOLDER_MARK).write_text(json.dumps(listing, indent=1), encoding="utf-8")
-        if local.exists() or local.is_symlink():
-            if not self.downloaded.has(local):
-                raise AppError(f"{local} is there and was not downloaded by this scout: not replaced", 409)
-            shutil.rmtree(local)
-        part.rename(local)
-        self.downloaded.add(local)
-        self.downloaded.forget(part)
+        if part != local:
+            if local.exists() or local.is_symlink():
+                if not self.downloaded.has(local):
+                    raise AppError(f"{local} is there and was not downloaded by this scout: not replaced", 409)
+                shutil.rmtree(local)
+            part.rename(local)
+            self.downloaded.add(local)
+            self.downloaded.forget(part)
+        self.downloaded.forget_under(local)
         print(f"[llama-node] folder complete: {raw} — {len(files)} files, {len(links)} links, "
               f"{listing['size']:,} bytes")
         return local
@@ -459,23 +643,29 @@ class ModelFetcher:
                     self.downloaded.add(tmp)
                 with urllib.request.urlopen(req, timeout=3600) as resp, open(tmp, "wb") as fh:
                     total = int(resp.headers.get("Content-Length") or 0)
+                    pace = CopyPace(self.clock)
                     if report:
                         self.report(port, phase="downloading", downloadedBytes=0,
-                                                totalBytes=total, downloadingFile=label)
+                                                totalBytes=total, downloadingFile=label, downloadBytesPerSec=None)
                     done = 0
                     last_report = 0
+                    pages = WrittenPages(fh, label)
+                    pace.add(0)
                     while True:
                         chunk = resp.read(1 << 20)  # 1 MiB
                         if not chunk:
+                            pages.drop(done)
                             break
                         fh.write(chunk)
                         done += len(chunk)
+                        pages.wrote(done)
+                        pace.add(done)
                         # Throttle progress updates to ~every 32 MiB to limit lock churn.
                         if report and done - last_report >= (32 << 20):
                             last_report = done
-                            self.report(port, downloadedBytes=done)
+                            self.report(port, downloadedBytes=done, downloadBytesPerSec=pace.rate())
                     if report:
-                        self.report(port, downloadedBytes=done)
+                        self.report(port, downloadedBytes=done, downloadBytesPerSec=pace.rate())
                 # Guard against silent truncation: server closes TCP without error
                 # but before sending all bytes (network blip, restart mid-stream).
                 if total and done != total:
@@ -517,26 +707,29 @@ class ModelFetcher:
                 time.sleep(delay)
         raise AppError(f"model download failed: {last_exc}", 500)
 
-    def _delete_downloaded(self, suffixes: tuple, keep_resolved: set,
-                           folders: bool = False) -> tuple[list[Path], int]:
-        """Delete the downloaded files with these suffixes that are not kept,
-        and the folders they leave empty; with `folders`, the downloaded model
-        folders too (a checkpoint, a whisper cache) — a folder holding a kept
-        path is kept. What is being written now is never deleted (in_flight).
-        Returns (deleted, freed bytes)."""
+    def _delete_downloaded(self, suffixes: tuple | None, keep_resolved: set,
+                           folders: bool = False, only: set | None = None) -> tuple[list[Path], int]:
+        """Delete the downloaded files with these suffixes (None: of any kind)
+        that are not kept, and the folders they leave empty; with `folders`, the
+        downloaded model folders too (a checkpoint, a whisper cache) — a folder
+        holding a kept path is kept. With `only` (resolved paths), nothing but
+        those. What is being written now is never deleted (in_flight). Returns
+        (deleted, freed bytes)."""
         cache_dir = self.cache_dir()
         deleted, freed = [], 0
         for p in self.downloaded.paths():
             if not p.exists():
-                if folders or p.suffix in suffixes:
+                if folders or suffixes is None or p.suffix in suffixes:
                     self.downloaded.forget(p)
                 continue
             is_folder = p.is_dir() and not p.is_symlink()
-            if not is_folder and p.suffix not in suffixes:
+            if not is_folder and suffixes is not None and p.suffix not in suffixes:
                 continue
             if is_folder and not folders:
                 continue
             resolved = p.resolve()
+            if only is not None and resolved not in only:
+                continue
             if resolved in keep_resolved or self.in_flight(p):
                 continue
             if is_folder and any(k == resolved or resolved in k.parents for k in keep_resolved):
@@ -584,15 +777,38 @@ class ModelFetcher:
         """Delete the .gguf/.tmp files and the model folders this scout
         downloaded (except `keep`).
 
-        Called on stop when caching is off, and on demand via the purge-cache
-        endpoint. Folders since 2.31: a folder model (2.30) was downloaded on
-        every machine that ran it and never left. Returns {removed, freedBytes}."""
+        Called on demand via the purge-cache endpoint — a stop lets go of its own
+        models only (release). Folders since 2.31: a folder model (2.30) was
+        downloaded on every machine that ran it and never left. Returns
+        {removed, freedBytes}."""
         if isinstance(keep, (str, Path)):
             keep = [keep]
         keep_resolved = {Path(p).resolve() for p in (keep or []) if p}
         deleted, freed = self._delete_downloaded((".gguf", ".tmp"), keep_resolved, folders=True)
         if deleted:
             print(f"[llama-node] purge cache: removed {len(deleted)} file(s), freed {freed} bytes")
+        return {"removed": len(deleted), "freedBytes": freed}
+
+    def clear(self) -> dict[str, Any]:
+        """Delete everything this scout downloaded into the cache, of any kind — a .gguf, a whisper .bin, a model folder — but
+        what is being written: the cache is moving to another folder (CacheKeeper.move_to), and a start brings its model there by
+        itself. Returns {removed, freedBytes}."""
+        deleted, freed = self._delete_downloaded(None, set(), folders=True)
+        return {"removed": len(deleted), "freedBytes": freed}
+
+    def release(self, files: Any, keep: Any = None) -> dict[str, Any]:
+        """Delete these files — the models of a stopped cell that keeps no cache — and nothing else: only what this scout
+        downloaded, not what `keep` names (a running cell's files), not what is being written. The rest of the cache is the
+        keeper's (CacheKeeper, the last models that ran): a stop purged every model no running cell held, and one stop of an
+        Ollama cell, which has no file here at all, deleted 92 GB of other cells' models (2026-10-26). Returns {removed,
+        freedBytes}."""
+        only = {Path(p).resolve() for p in (files or []) if p}
+        if not only:
+            return {"removed": 0, "freedBytes": 0}
+        keep_resolved = {Path(p).resolve() for p in (keep or []) if p}
+        deleted, freed = self._delete_downloaded((".gguf", ".tmp"), keep_resolved, folders=True, only=only)
+        if deleted:
+            print(f"[llama-node] a stopped cell's models: removed {len(deleted)} file(s), freed {freed} bytes")
         return {"removed": len(deleted), "freedBytes": freed}
 
     def listing(self) -> list[dict[str, Any]]:

@@ -33,6 +33,7 @@ from _scout_harness import TMP, make_scout, patched  # noqa: E402
 import caravan_scout.report as report_module  # noqa: E402
 from caravan_scout.engines import LmStudio, Ollama  # noqa: E402
 from caravan_scout.process import CellProcess, HostProcesses  # noqa: E402
+from caravan_scout.cells import RunPace  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -112,13 +113,25 @@ class ReportSample:
               "lastLine": "llama.cpp b9947 installed"}
 
     def build(self) -> dict:
-        scout = make_scout({"controllerUrl": "http://10.0.0.1:7990", "listenPort": 8092})
+        # A fixed folder for the cache: the sample says it (`modelCache.dir`, 2.38), and a temp folder's name would change it on
+        # every run. Nothing is written there — what the cache holds is faked below.
+        scout = make_scout({"controllerUrl": "http://10.0.0.1:7990", "listenPort": 8092,
+                            "modelsBasePath": "/home/scout/llama-model-cache"})
+        # A budget the owner chose (2.38): the sample says a size, so a controller that drops it is seen.
+        scout.cells.keeper.budget.set(100 << 30)
         scout.state["heartbeat"] = {"state": "ok", "lastAt": self.NOW - 60}
         running = scout.cells.at(22001)
         running.process.adopt(4242, {"modelPath": "/models/org/model-q4.gguf", "mmprojPath": "", "specPath": "",
                                      "specType": "", "port": 22001, "gpuLayers": 999, "ctxSize": 8192},
                               started_at=self.NOW - 600)
-        scout.cells.report(22001, phase="running", error="")
+        scout.cells.at(22001)
+        # What its files weigh, measured by its start (2.43): what the board counts its reading against while it loads.
+        scout.cells.report(22001, phase="running", error="", modelBytes=4_500_000_000)
+        # And how fast it has been reading (2.43): 1 GB three seconds before the report's 3 GB, by a clock of the sample's own.
+        clock = [0.0]
+        running.reading = RunPace(clock=lambda: clock[0])
+        running.reading.read(4242, 1_000_000_000)
+        clock[0] = 3.0
         # It crashed once and its watchdog brought it back (2.5): the note the
         # board shows as 💥 rides the cell's view, with the last lines of the
         # crashed run's log under it (2.6).
@@ -133,6 +146,7 @@ class ReportSample:
         vllm.process.adopt(4343, {"modelPath": "", "port": 22012, "cellKind": "command",
                                   "command": "$HOME/vllm-venv/bin/vllm serve org/model --port \"$PORT\""},
                            started_at=self.NOW - 300)
+        scout.cells.at(22012)
         scout.cells.report(22012, phase="running", error="")
         # Another vLLM cell still installs: its process runs, its port does
         # not listen yet, and it says where the start is (2.7).
@@ -143,9 +157,12 @@ class ReportSample:
         scout.cells.at(22013).process.adopt(4444, {"modelPath": "", "port": 22013, "cellKind": "command",
                                                    "command": "$HOME/vllm-venv/bin/vllm serve org/other"},
                                             log_path=log, started_at=self.NOW - 60)
+        scout.cells.at(22013)
         scout.cells.report(22013, phase="running", error="")
+        scout.cells.at(22002)
         scout.cells.report(22002, phase="downloading", modelPath="models/org/other-q8.gguf",
                            downloadedBytes=1_000_000, totalBytes=4_000_000, downloadingFile="other-q8.gguf",
+                           downloadBytesPerSec=250_000,
                            startedAt=self.NOW - 30)
         machine = {"gpus": lambda: [dict(self.GPU)],
                    "compute_apps": lambda: [dict(self.APP), dict(self.OLLAMA_APP)],
@@ -207,11 +224,14 @@ class ReportSample:
     def process_tree(self) -> Path:
         """/proc as the sample shows it, the same on every machine: the vLLM
         cell's server (4343) runs its engine as a child (4345) — the cell's
-        `pids` (2.31); the others start none."""
+        `pids` (2.31); the others start none. The llama.cpp cell (4242) has read
+        its model so far (2.43): 3 GB fetched from disk by mapping, a little by calls."""
         root = TMP / "sample-proc"
         children = root / "4343" / "task" / "4343" / "children"
         children.parent.mkdir(parents=True, exist_ok=True)
         children.write_text("4345 ", encoding="utf-8")
+        (root / "4242").mkdir(parents=True, exist_ok=True)
+        (root / "4242" / "io").write_text("rchar: 52000000\nread_bytes: 3000000000\nwrite_bytes: 0\n", encoding="ascii")
         return root
 
     def text(self) -> str:

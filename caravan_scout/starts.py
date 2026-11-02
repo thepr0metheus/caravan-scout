@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import re
 import shlex
-import subprocess
 import threading
 import time
 from pathlib import Path
@@ -15,6 +14,7 @@ from caravan_scout.cell_assets import CellAssets
 from caravan_scout.entry import ModelName
 from caravan_scout.errors import AppError
 from caravan_scout.ledger import MemoryLedger
+from caravan_scout.models import ModelBytes
 from caravan_scout.paths import (LLAMA_PATH_PLACEHOLDER_MMPROJ, LLAMA_PATH_PLACEHOLDER_MODEL,
                                  LLAMA_PATH_PLACEHOLDER_SPEC, SERVER_CELLS_DIR)
 from caravan_scout.process import HostProcesses
@@ -74,8 +74,15 @@ class CellStart:
     once and hands the slow part to a LlamaLaunch in the background,
     CommandStart does all of it on the request. Which one a payload is, the
     payload says: cellKind, or CELL_KIND in its config (KINDS, below). What
-    both share is here: the port, the refusal when the port is busy, and
-    opening the firewall.
+    both share is here: the port and the refusal when the port is busy.
+
+    The firewall is not opened here since 2.40: until then every start ran
+    `sudo -n ufw allow <port>`, which let the whole network reach the cell. The
+    owner decided on 2026-10-26 (step 4 of the plan, variant B) that the cells'
+    ports answer the controller alone, by his own rule for their whole range —
+    the one install.sh has always named — and a rule opening each port to
+    everyone undid it in the scout's own words (Machine.ufw_access read it as
+    "all").
     """
 
     #: cell kind -> the start that runs it; anything else is a llama cell.
@@ -277,16 +284,6 @@ class CellStart:
         want = self.payload.get("ram")
         return MemoryLedger(self.cells).short(port, want) if isinstance(want, dict) else None
 
-    @staticmethod
-    def open_firewall(port: int) -> None:
-        """Open the port in ufw so the admin can reach the cell. Silently
-        skips if ufw is inactive or passwordless sudo is not set up."""
-        try:
-            subprocess.run(["sudo", "-n", "ufw", "allow", str(port)],
-                           capture_output=True, timeout=5)
-        except Exception:
-            pass
-
 
 class LlamaStart(CellStart):
     """A llama cell's start: checked on the request, launched in the background.
@@ -333,7 +330,7 @@ class LlamaStart(CellStart):
         spec_raw = str(config.get("SPEC_DRAFT_MODEL_FILE") or "").strip()
         # The cache is told what this start asks of it before the first byte is copied: a trim that another start's end triggers
         # must find these files wanted, whole or half copied.
-        self.cells.keeper.begin(port, [model_path_raw, mmproj_raw, spec_raw])
+        self.cells.asks(port, [model_path_raw, mmproj_raw, spec_raw])
         cache_models = bool(payload.get("cacheModels", self.cells.config.get("cacheModels", False)))
         cell.cache_models = cache_models
 
@@ -345,7 +342,6 @@ class LlamaStart(CellStart):
             port, phase="resolving", modelPath=model_path_raw,
             downloadedBytes=0, totalBytes=0, error="", startedAt=int(time.time()),
         )
-        self.open_firewall(port)
         launch = LlamaLaunch(self.cells, port, bin_path, config, model_path_raw,
                              mmproj_raw, spec_raw, cache_models, incoming_args,
                              hints=self.hints(), env=env, name=cell.name)
@@ -411,6 +407,11 @@ class LlamaLaunch:
             if cells.holds(port, cell):
                 cells.report(port, phase="error", error=str(exc))
             return
+        # Stopped while the files came: nothing more is said or written for a start that no longer holds the port — not "loading"
+        # into the cell a new start may have made there since, not the cell's artifacts over those of the run before.
+        if not cells.holds(port, cell):
+            print(f"[llama-node] :{port} start cancelled — the cell was stopped mid-download")
+            return
 
         def build_args() -> list[str]:
             # The controller builds the arg list; this scout only substitutes the
@@ -425,7 +426,8 @@ class LlamaLaunch:
                     "than this agent (needs lama-caravan v1.3.115+)", 400)
             return self.resolve_paths(incoming_args, str(mp), mmproj_abs, spec_abs)
 
-        cells.report(port, phase="loading")
+        # What its files weigh here (2.43): what the board counts its reading against while it loads.
+        cells.report(port, phase="loading", modelBytes=ModelBytes.of([mp, mmproj_abs, spec_abs]))
         # A string field: an exact count, or "auto"/"all" (llama.cpp fits what
         # the device holds and leaves the rest in RAM). int() on "auto" raises,
         # which would have turned the one setting that makes an oversized model
@@ -469,7 +471,7 @@ class LlamaLaunch:
         if not cells.holds(port, cell):
             print(f"[llama-node] :{port} start cancelled — the cell was stopped mid-download")
             return
-        result = cell.process.start(bin_path, args, cfg, log_path=log_path, extra_env=self.env)
+        result = cell.process.start(bin_path, args, cfg, log_path=log_path, extra_env=self.env, ram_mib=cell.ram_mib)
 
         # Auto-recovery: if this start failed on a truncated/corrupted cached
         # file, delete the bad files and re-download once before giving up.
@@ -515,7 +517,7 @@ class LlamaLaunch:
                 if self.runner == "prism":
                     cfg["runner"] = self.runner
                 cfg["artifact"] = artifacts.write(port, bin_path, args, config, cfg, env=self.env)
-                result = cell.process.start(bin_path, args, cfg, log_path=log_path, extra_env=self.env)
+                result = cell.process.start(bin_path, args, cfg, log_path=log_path, extra_env=self.env, ram_mib=cell.ram_mib)
 
         if result.get("ok") and not cells.holds(port, cell):
             # Stopped between our start and here (the corruption retry keeps this
@@ -592,11 +594,9 @@ class CommandStart(CellStart):
         # kept, every start writes it again (the owner keeps them, 2026-10-13).
         cell.cache_models = bool(payload.get("cacheModels", cells.config.get("cacheModels", False)))
         # What this start asks of the cache, told before the first byte is copied (see LlamaStart.run).
-        cells.keeper.begin(port, files)
+        cells.asks(port, files)
         cells.report(port, phase="resolving", modelPath=files[0] if files else command[:80],
                      downloadedBytes=0, totalBytes=0, error="", startedAt=int(time.time()))
-        # Open the port in ufw so the admin/clients can reach the cell.
-        self.open_firewall(port)
         launch = CommandLaunch(cells, port, cell, command, shell_line, files, cell.cache_models,
                                hints=self.hints(), env=env, name=cell.name,
                                health_path=str(payload.get("healthPath") or "/health"),
@@ -696,7 +696,7 @@ class CommandLaunch:
         if len(held) > 1:
             cfg["files"] = held[1:]
         cells.report(port, phase="loading", modelPath=self.command[:80],
-                     downloadedBytes=0, totalBytes=0, error="", startedAt=int(time.time()))
+                     downloadedBytes=0, totalBytes=0, error="", startedAt=int(time.time()), modelBytes=ModelBytes.of(held))
         log_path = cells.models.cache_dir() / f"command-cell.{int(port)}.log"
         # The controller owns the cell servers; pick up its current copy before
         # running the launcher this command names. Never fatal — see CellAssets.
@@ -723,7 +723,7 @@ class CommandLaunch:
             cells.report(port, phase="error", error=str(exc))
             return {"ok": False, "error": str(exc)}
         env = {**self.env, **CellStart.models_root(model_raw, model_abs), CellStart.SCRATCH_ENV: str(scratch)}
-        result = cell.process.start_command(self.shell_line, cfg, log_path=log_path, extra_env=env)
+        result = cell.process.start_command(self.shell_line, cfg, log_path=log_path, extra_env=env, ram_mib=self.ram_mib)
         if result.get("ok") and not cells.holds(port, cell):
             print(f"[llama-node] :{port} stopped during startup — terminating the fresh process")
             try:

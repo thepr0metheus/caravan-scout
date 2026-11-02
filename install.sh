@@ -116,11 +116,13 @@ fi
 
 # ── 5. the firewall lets the controller in ───────────────────────────────────
 # The controller reaches the scout on its port and each cell on its own port.
-# The scout's port is opened here. The cells' ports are the controller's to
-# pick (its cell range, 22001–22999 unless changed there); a whole range is
-# left to the operator, who can open it to the controller's address alone.
+# The scout's port is opened here: the controller pairs it before anything else.
+# The cells' ports are the controller's to pick (its cell range, 22001–22999
+# unless changed there); a whole range is left to the operator, who opens it to
+# the controller's address alone — and, once the scout is paired, the scout's
+# port too: its /v1 entry answers without a key (the owner's variant B, 2.40).
 CELL_RANGE="22001:22999"
-CELL_HINT="the cells need the controller's cell ports (22001–22999 unless changed there): sudo ufw allow from <controller-ip> to any port ${CELL_RANGE} proto tcp"
+CELL_HINT="the cells need the controller's cell ports (22001–22999 unless changed there): sudo ufw allow from <controller-ip> to any port ${CELL_RANGE} proto tcp — and once the scout is paired, keep ${PORT} and the range for the controller alone (docs/operations.md, the cells' ports)"
 if on_linux && have ufw && sudo -n true 2>/dev/null \
    && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
   if ! sudo ufw status 2>/dev/null | grep -qE "^${PORT}(/tcp)?\b"; then

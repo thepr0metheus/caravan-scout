@@ -417,6 +417,12 @@ def start_command(payload, config=None, prep=None, popen=None, web=None, kill=No
     return rig
 
 
+def told(s, port, **fields):
+    """A start's words in a cell that is there: a report makes no cell (Cells.report), so a pin that wants a cell in a phase makes it first."""
+    s.cells.at(port)
+    return s.cells.report(port, **fields)
+
+
 def starting(port):
     """What a start answers at once since 2.31, a command cell's too."""
     return {"ok": True, "status": "starting", "phase": "resolving", "port": port}
@@ -453,7 +459,9 @@ def test_slot_plumbing():
     _, err = attempt(lambda: s.cells.drop(29999))
     check(err is None, "boundary: снятие несуществующего слота — без ошибки")
 
+    s.cells.at(22002)
     s.cells.report(22002, phase="resolving", modelPath=MODEL)
+    s.cells.at(22002)
     s.cells.report(22002, downloadedBytes=5)
     check(s.cells.startup(22002) == {"phase": "resolving", "modelPath": MODEL, "downloadedBytes": 5},
           "report дополняет запись старта, а не заменяет её")
@@ -466,6 +474,76 @@ def test_slot_plumbing():
           "as-is: чтение фазы порта без слота создаёт слот — поэтому holds обязан обходить at")
 
 
+def test_loading_ports():
+    """The cells whose start is still bringing its files (2.38): the cache's folder does not move under them (CacheKeeper.move_to).
+    A cell that runs has its weights loaded — its open files outlive their names — and moves nothing (the owner, 2026-10-26)."""
+    s = make_scout()
+    for port, phase in ((22401, "resolving"), (22402, "downloading"), (22403, "loading"), (22404, "running"),
+                        (22405, "error"), (22406, "idle")):
+        s.cells.at(port)
+        s.cells.report(port, phase=phase)
+    check(s.cells.loading_ports() == {22401, 22402, 22403},
+          "a start that resolves, downloads or loads its files is loading; negative: one that runs, failed or stands is not")
+    check(s.cells.keeper.loading() == {22401, 22402, 22403},
+          "the cache's keeper asks the cells themselves, at the moment it would move")
+
+
+def test_report_makes_no_cell():
+    s = make_scout()
+    check(s.cells.report(22301, phase="downloading") is False and 22301 not in s.cells.by_port,
+          "a report for a port that has no cell is dropped, and makes none")
+    s.cells.at(22302)
+    check(s.cells.report(22302, phase="downloading", downloadedBytes=7) is True
+          and s.cells.startup(22302) == {"phase": "downloading", "downloadedBytes": 7},
+          "negative: a report for a cell that is there is kept")
+    s.cells.drop(22302)
+    check(s.cells.report(22302, phase="loading") is False and 22302 not in s.cells.by_port,
+          "a report after the stop is late: it is dropped, and the stopped port does not come back")
+    new = s.cells.at(22302)
+    check(s.cells.report(22302, downloadedBytes=9) is True and new.startup == {"phase": "idle", "downloadedBytes": 9},
+          "as-is: a report goes to the cell the port has NOW: after a stop and a new start it is the new start's. "
+          "The new start waits for the old copy of the same file (ModelFetcher), so what it is told is that copy's")
+    check(s.cells.report("22302", downloadedBytes=10) is True and new.startup == {"phase": "idle", "downloadedBytes": 10},
+          "boundary: the port as text is the same port")
+
+
+def test_view_says_the_reading():
+    """A running cell's reading of its model (2.43): what its processes read, how fast, of how much."""
+    from caravan_scout.cells import RunPace
+    gib = 2 ** 30
+
+    def io(rchar, read_bytes):
+        return f"rchar: {rchar}\nread_bytes: {read_bytes}\nwrite_bytes: 0\n"
+
+    proc = TMP / "proc-reading"
+    (proc / "4242").mkdir(parents=True, exist_ok=True)
+    (proc / "4343").mkdir(parents=True, exist_ok=True)
+    (proc / "4242" / "io").write_text(io(gib, 12 * gib), encoding="ascii")
+    (proc / "4343" / "io").write_text(io(5, 2 * gib), encoding="ascii")
+    s = make_scout()
+    cell = s.cells.at(22031)
+    cell.process.adopt(4242, {"modelPath": "/m/model.gguf", "port": 22031, "cmd": ["/opt/llama-server"]}, started_at=NOW - 10)
+    s.cells.report(22031, phase="loading", modelBytes=42 * gib)
+    now = [50.0]
+    cell.reading = RunPace(clock=lambda: now[0])
+    adopted = s.cells.at(22032)
+    adopted.process.adopt(4343, {"modelPath": "/m/other.gguf", "port": 22032, "cmd": ["/opt/llama-server"]}, started_at=NOW - 10)
+    run = FakeRun({("sudo", "-n", "ufw", "status"): (0, "Status: inactive\n")})
+    with patched(HostProcesses, PROC=proc), Rig(web=FakeUrlopen({}), run=run, kill=FakeKill(alive={4242, 4343})):
+        first = s.cells.view(cell)
+        (proc / "4242" / "io").write_text(io(gib, 13 * gib), encoding="ascii")
+        now[0] = 52.0
+        second = s.cells.view(cell)
+        other = s.cells.view(adopted)
+    said = lambda v: [v.get(k) for k in ("readBytes", "readBytesPerSec", "modelBytes")]  # noqa: E731
+    check(said(first) == [12 * gib, None, 42 * gib],
+          f"a running cell says what it read (12 GiB of a mapped model), of how much (42 GiB, measured by its start), and no "
+          f"pace yet (got {said(first)})")
+    check(said(second) == [13 * gib, gib // 2, 42 * gib], f"two seconds later 1 GiB more: 512 MiB/s (got {said(second)})")
+    check(said(other) == [2 * gib, None, None],
+          "negative: a cell adopted after a restart — no start of this scout measured its files: what it read, no weight")
+
+
 def test_node_public_views():
     s = make_scout()
     idle = s.cells.view(s.cells.at(22011))
@@ -473,19 +551,22 @@ def test_node_public_views():
     check("phase" not in idle,
           "as-is: у простаивающего слота фазы нет вовсе, а вид без слотов говорит «idle» — одно состояние, две формы")
 
+    s.cells.at(22012)
     s.cells.report(22012, phase="downloading", modelPath=MODEL, downloadedBytes=64,
-                         totalBytes=128, downloadingFile="model-q4.gguf (1/2)", startedAt=NOW)
+                         totalBytes=128, downloadingFile="model-q4.gguf (1/2)", downloadBytesPerSec=96, startedAt=NOW)
     check(s.cells.view(s.cells.at(22012)) == {
         "running": False, "phase": "downloading", "modelPath": MODEL, "port": 22012,
-        "downloadedBytes": 64, "totalBytes": 128, "downloadingFile": "model-q4.gguf (1/2)",
-        "startedAt": NOW}, "фаза downloading: байты, файл и время старта видны до подъёма сервера")
+        "downloadedBytes": 64, "totalBytes": 128, "downloadingFile": "model-q4.gguf (1/2)", "downloadBytesPerSec": 96,
+        "startedAt": NOW}, "фаза downloading: байты, файл, скорость копии (2.42) и время старта видны до подъёма сервера")
     for port, phase in ((22013, "resolving"), (22014, "loading")):
+        s.cells.at(port)
         s.cells.report(port, phase=phase)
         check(s.cells.view(s.cells.at(port)) == {
             "running": False, "phase": phase, "modelPath": "", "port": port, "downloadedBytes": 0,
-            "totalBytes": 0, "downloadingFile": "", "startedAt": None},
-            f"фаза {phase} без данных: нули, пустые строки и startedAt=None — не выдуманное время")
+            "totalBytes": 0, "downloadingFile": "", "downloadBytesPerSec": None, "startedAt": None},
+            f"фаза {phase} без данных: нули, пустые строки, скорость и startedAt=None — не выдуманное")
 
+    s.cells.at(22015)
     s.cells.report(22015, phase="error", error="model not available")
     check(s.cells.view(s.cells.at(22015)) == {
         "running": False, "port": 22015, "phase": "error", "lastError": "model not available"},
@@ -493,6 +574,7 @@ def test_node_public_views():
     sl = s.cells.at(22016)
     with Rig(popen=FakePopen(OSError("exec format error"))):
         sl.process.start(str(LLAMA_BIN), [], {"port": 22016})
+    s.cells.at(22016)
     s.cells.report(22016, phase="error", error="")
     check(s.cells.view(sl) == {
         "running": False, "port": 22016, "phase": "error", "lastError": "exec format error"},
@@ -505,6 +587,7 @@ def test_node_public_views():
                    "0.00.300.000 I main: exiting\n", encoding="utf-8")
     sl = s.cells.at(22017)
     sl.process.adopt(5151, {"port": 22017}, log_path=log, started_at=NOW - 10)
+    s.cells.at(22017)
     s.cells.report(22017, phase="running", modelPath=MODEL)
     with Rig(kill=FakeKill()):
         view = s.cells.view(sl)
@@ -537,6 +620,7 @@ def test_node_public_views():
     sl = s.cells.at(22020)
     with Rig(popen=FakePopen({"running": False, "rc": 0, "pid": 6161})):
         sl.process.start(str(LLAMA_BIN), ["--port", "22020"], {"port": 22020})
+    s.cells.at(22020)
     s.cells.report(22020, phase="running")
     check(s.cells.view(sl) == {"running": False, "exitCode": 0, "lastError": "", "crashed": False,
                                         "port": 22020},
@@ -545,6 +629,7 @@ def test_node_public_views():
     sl = s.cells.at(22021)
     sl.process.adopt(5353, {"modelPath": "/m/model-q4.gguf", "port": 22021, "cmd": ["/opt/llama-server"]},
                   started_at=NOW - 500)
+    s.cells.at(22021)
     s.cells.report(22021, phase="error", error="old failure")
     web = FakeUrlopen({"/metrics": lambda url: FakeResponse(METRICS), "/props": lambda url: FakeResponse(PROPS)})
     run = FakeRun({("sudo", "-n", "ufw", "status"): (0, "Status: inactive\n")})
@@ -554,7 +639,7 @@ def test_node_public_views():
                    "modelPath": "/m/model-q4.gguf", "port": 22021, "phase": "running",
                    "promptTps": 123.46, "genTps": 45.68, "requestsProcessing": 2, "ctxMax": 8192,
                    "ctxUsed": 2048, "pids": [], "ramBytes": None, "firewall": {"state": "open", "allowedFrom": []},
-                   "launchDiskNewer": []},
+                   "launchDiskNewer": [], "readBytes": None, "readBytesPerSec": None, "modelBytes": None},
           "живой процесс: фаза running, метрики, окно контекста, файрвол и файлы, изменившиеся после старта "
           "(2.11; файла модели здесь нет — пусто), влиты в вид; ps не ответил — память в RAM «не сказана» (2.35): None, "
           "а не ноль")
@@ -579,7 +664,9 @@ def test_nodes_public_list():
     check(s.cells.views() == [], "нет слотов — пустой список")
     check(s.cells.first_view() == {"running": False, "phase": "idle"},
           "negative: одиночный вид без слотов — явное idle, а не пустота")
+    s.cells.at(22025)
     s.cells.report(22025, phase="loading")
+    s.cells.at(22023)
     s.cells.report(22023, phase="error", error="boom")
     nodes = s.cells.views()
     check([n.get("port") for n in nodes] == [22025, 22023],
@@ -1419,22 +1506,22 @@ def test_llama_start_refusals():
     check(r.threads.made == [] and r.run.calls == [], "negative: при отказе воркер не запущен, ufw не тронут")
     for phase in ("resolving", "downloading", "loading"):
         r = start_llama({"modelPath": MODEL, "config": {"MODEL_FILE": MODEL, "PORT": port}},
-                        prep=lambda s, ph=phase: s.cells.report(port, phase=ph))
+                        prep=lambda s, ph=phase: told(s, port, phase=ph))
         check(r.res == {"ok": False, "error": f"startup already in progress on port {port} ({phase})",
                         "phase": phase} and r.threads.made == [],
               f"старт уже идёт ({phase}) — второй отказан, с фазой")
     for phase in ("error", "idle", "running"):
         r = start_llama({"modelPath": MODEL, "config": {"MODEL_FILE": MODEL, "PORT": port}},
-                        prep=lambda s, ph=phase: s.cells.report(port, phase=ph))
+                        prep=lambda s, ph=phase: told(s, port, phase=ph))
         check((r.res or {}).get("ok") is True and len(r.threads.made) == 1,
               f"negative: фаза {phase} без живого процесса не мешает новому старту")
 
 
 def port_asked_then_ufw(port):
-    """The calls of an accepted start since 2.32: the port is asked of the host first (`ss`, and `lsof` where
-    the host has no `ss` — the fake host has neither), only then the firewall opens it."""
-    return [["ss", "-ltnpH"], ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
-            ["sudo", "-n", "ufw", "allow", str(port)]]
+    """The calls of an accepted start since 2.32: the port is asked of the host (`ss`, and `lsof` where the host has
+    no `ss` — the fake host has neither). Until 2.40 the firewall then opened it to everyone (`sudo -n ufw allow
+    <port>`); the cells' range is the owner's rule since (variant B), and no start touches ufw."""
+    return [["ss", "-ltnpH"], ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"]]
 
 
 def test_llama_start_accepted():
@@ -1457,10 +1544,11 @@ def test_llama_start_accepted():
         MODEL, MMPROJ, SPEC, True, llama_args(port)),
         "аргументы воркера: порт, бинарь, config с HOST по умолчанию, пути (обрезанные), кэш, аргументы контроллера")
     check(r.run.calls == port_asked_then_ufw(port),
-          "порт сначала спрошен у хоста (2.32: чужой слушатель — отказ), потом открыт в ufw: sudo -n ufw allow <port>")
+          "порт спрошен у хоста (2.32: чужой слушатель — отказ); negative (2.40): ufw не трогается — диапазон ячеек "
+          "открывает владелец своим правилом, только контроллеру")
     check(r.s.cells.views() == [{"running": False, "phase": "resolving", "modelPath": MODEL, "port": port,
                                         "downloadedBytes": 0, "totalBytes": 0, "downloadingFile": "",
-                                        "startedAt": NOW}],
+                                        "downloadBytesPerSec": None, "startedAt": NOW}],
           "на доске сразу фаза resolving с моделью и временем старта")
     check(r.s.cells.by_port[port].cache_models is True if port in r.s.cells.by_port else False,
           "флаг кэша моделей из запроса записан в слот")
@@ -1529,6 +1617,7 @@ def test_llama_start_misc():
     port = 22091
 
     def failed_before(s):
+        s.cells.at(port)
         s.cells.report(port, phase="error", error="model download failed",
                              downloadingFile="old-model.gguf (1/2)")
     r = start_llama({"modelPath": MODEL, "config": {"MODEL_FILE": MODEL, "PORT": port}}, prep=failed_before)
@@ -1602,8 +1691,8 @@ def test_command_cell_start():
         "имя модели для входа машины (2.27) — у ячейки без имени, алиаса и модели — cell-<порт>; "
         "в окружении запуска — её рабочая папка CARAVAN_CELL_SCRATCH (2.31)")
     check(r.s.cells.startup(port) == {"phase": "running", "modelPath": "bash ~/run_whisper.sh $PORT --lang en",
-                                           "downloadedBytes": 0, "totalBytes": 0, "error": "", "startedAt": NOW},
-          "фаза running; в modelPath записи старта — сама команда")
+                                           "downloadedBytes": 0, "totalBytes": 0, "error": "", "startedAt": NOW, "modelBytes": None},
+          "фаза running; в modelPath записи старта — сама команда; файлов модели нет — размера нет (None, 2.43)")
     check(port in r.s.cells.by_port and r.s.cells.by_port[port].cache_models is False,
           "defect-history: кэш командной ячейки — как просил контроллер (false): до 2.31 он включался "
           "принудительно, и её модель оставалась на машине после остановки")
@@ -1615,7 +1704,7 @@ def test_command_cell_start():
                        "config": {"PORT": port}})
     check(r.s.cells.by_port[port].cache_models is True and disk_cells(r.s).get(str(port), {}).get("cacheModels") is True,
           "negative: контроллер просит кэш — ячейка его держит, и запись тоже")
-    check(r.run.calls == port_asked_then_ufw(port), "порт спрошен у хоста и открыт в ufw")
+    check(r.run.calls == port_asked_then_ufw(port), "порт спрошен у хоста; negative (2.40): в ufw не открыт")
 
     r = start_command({"cellKind": "command", "shellLine": "exec python3 srv.py",
                        "config": {"PORT": 22202, "COMMAND": "python3 srv.py"}})
@@ -1662,7 +1751,7 @@ def test_command_cell_refusals():
     check(r.res == {"ok": False, "error": f"a server is already running on port {port}"} and r.popen.calls == [],
           "на порту уже работает процесс — отказ, второй не запущен")
     r = start_command({"cellKind": "command", "command": "python3 srv.py", "shellLine": "exec python3 srv.py",
-                       "config": {"PORT": port}}, prep=lambda s: s.cells.report(port, phase="loading"))
+                       "config": {"PORT": port}}, prep=lambda s: told(s, port, phase="loading"))
     check(r.res == {"ok": False, "error": f"startup already in progress on port {port} (loading)", "phase": "loading"},
           "старт уже идёт — второй отказан")
 
@@ -1747,6 +1836,8 @@ def test_the_starts_are_recorded_for_the_cache():
     check(len(entries) == 1 and entries[0]["files"] == [MODEL] and entries[0]["port"] == port and entries[0]["ok"] is False,
           "a llama start is recorded when it is asked (LlamaStart.run), before its model is copied: the files it names, its port, not yet 'ran' — "
           "a start that dies while loading is never 'the last model'")
+    check(r.s.cells.at(port).asked == [MODEL],
+          "and the cell keeps what its start asked (Cells.asks): what its stop lets go of when it keeps no cache (2.37.3)")
 
     first, second, draft = "models/org/big-00001-of-00002.gguf", "models/org/big-00002-of-00002.gguf", "models/org/mtp-q2.gguf"
     bodies = {first: b"GGUF one", second: b"GGUF two", draft: b"GGUF mtp"}
@@ -1776,6 +1867,14 @@ def test_the_starts_are_recorded_for_the_cache():
     entry = r.s.cells.keeper.uses.entries()[0]
     check(entry["ok"] is False and r.s.old.exists(),
           "negative: caching off — the start is recorded, but never committed and nothing is trimmed: the files go at the stop")
+    check(r.s.cells.at(port).asked == [first, draft], "a command cell keeps the files the controller named for its start")
+
+    port = 22274
+    r = start_command({"cellKind": "command", "command": "bash ~/run_engine.sh $PORT ollama 11434 qwen2.5:0.5b", "shellLine": "exec true",
+                       "cacheModels": False, "config": {"PORT": port}},
+                      config={"controllerUrl": CONTROLLER}, web=models_served(bodies))
+    check(r.s.cells.at(port).asked == [] and r.s.cells.keeper.uses.entries() == [],
+          "negative: a cell in an engine asks the cache for nothing — it keeps nothing to let go of, and the log gets no entry (2.37.3)")
 
 
 def test_command_cell_model_files():
@@ -1874,6 +1973,16 @@ def test_command_cell_stopped_mid_download():
           and str(port) not in disk_cells(r.s),
           "стоп пришёл во время загрузки — процесс не запускается и в реестр не пишется: иначе он жил бы "
           "сиротой, которого доска считает остановленным")
+    # 2026-10-19, the owner's seamless cell on :22008: stopped on its way through a checkpoint of 12 files, it stood on the board
+    # as "downloading, 12/12, 100 %" with START gone, and its scout refused a new start. The copy goes on to the end of the file;
+    # what it says after the stop is late.
+    check(port not in r.s.cells.by_port and r.s.cells.views() == [],
+          "defect-history: a stop in the middle of the copy leaves nothing on the board (the copy's late reports made the cell again)")
+    again = {"cellKind": "command", "command": "bash ~/run_x.sh $PORT", "shellLine": "exec true",
+             "modelFiles": [asr], "config": {"PORT": port}}
+    with env(HOME=str(HOME)), Rig(popen=FakePopen({"pid": 7070}), run=FakeRun({UFW_ALLOW: (0, "")})):
+        res, _ = attempt(lambda: r.s.cells.start(again))
+    check(res == starting(port), "a new start on that port is accepted: nothing is under way there")
     r = start_command({"cellKind": "command", "command": "bash ~/run_x.sh $PORT", "shellLine": "exec true",
                        "modelFiles": [asr], "config": {"PORT": port}}, config={"controllerUrl": CONTROLLER},
                       web=models_served({asr: b"GGUF asr"}))
@@ -1973,8 +2082,8 @@ def test_worker_success():
           "negative: имени модели нет — запуску его не дали (имя даёт старт, LlamaStart)")
     size = len(BODIES[MODEL])
     check(s.cells.startup(port) == {"phase": "running", "error": "", "downloadedBytes": size, "totalBytes": size,
-                                         "downloadingFile": "model-q4.gguf"},
-          "фаза running; прогресс загрузки остаётся в записи старта")
+                                         "downloadingFile": "model-q4.gguf", "downloadBytesPerSec": None, "modelBytes": size},
+          "фаза running; прогресс загрузки остаётся в записи старта; что весят её файлы здесь — для строки загрузки (2.43)")
     cell = json.loads((cd / "cell.json").read_text(encoding="utf-8")) if (cd / "cell.json").exists() else {}
     check(cell.get("runtime") == cfg, "cell.json.runtime — cfg без артефакта: артефакт дописан после записи файла")
     check(cell.get("config") == {"MODEL_FILE": MODEL, "PORT": port, "N_GPU_LAYERS": "auto", "CTX_SIZE": 8192},
@@ -2153,6 +2262,7 @@ def test_worker_cancelled_mid_download():
 
     def stop_arrives(_raw):
         # What http.py's /api/llama-node/stop does, in its order.
+        s.cells.at(port)
         s.cells.report(port, phase="idle", error="", downloadedBytes=0, totalBytes=0)
         s.cells.drop(port)
         s.cells.records.forget(port)
@@ -2162,22 +2272,21 @@ def test_worker_cancelled_mid_download():
     check(str(port) not in disk_cells(s), "negative: отменённая ячейка не вернулась в реестр")
     check(f"[llama-node] :{port} start cancelled — the cell was stopped mid-download" in r.journal,
           "журнал говорит, что старт отменён")
-    ghost = s.cells.by_port.get(port)
-    check(ghost is not None and ghost is not original,
-          "as-is: ДЕФЕКТ — отменённый старт пересоздал слот порта (report до проверки отмены)")
-    size = len(BODIES[MODEL])
-    check(s.cells.views() == [{"running": False, "phase": "loading", "modelPath": "", "port": port,
-                                      "downloadedBytes": size, "totalBytes": size,
-                                      "downloadingFile": "model-q4.gguf", "startedAt": None}],
-          "as-is: ДЕФЕКТ — остановленный порт висит на доске в фазе «loading»")
-    check((SERVER_CELLS_DIR / str(port) / "start.sh").exists(),
-          "as-is: артефакты отменённой ячейки (start.sh, cell.json) всё равно записаны")
+    # Until 2.35.2 the copy's late reports made the stopped port's cell again (2026-10-19, seamless on :22008: "downloading
+    # 12/12, 100 %" on the board for good, START gone, a new start refused "already in progress").
+    check(port not in s.cells.by_port and s.cells.holds(port, original) is False,
+          "a stop in the middle of the download leaves the port without a cell: the late reports of the copy do not make it again")
+    check(s.cells.views() == [], "negative: the stopped port is not on the board (it stood there as «loading» for good)")
+    check(not (SERVER_CELLS_DIR / str(port) / "start.sh").exists() and not (SERVER_CELLS_DIR / str(port) / "cell.json").exists(),
+          "negative: a start that no longer holds the port writes no artifacts (start.sh, cell.json) — they were written over "
+          "those of the run before, for a cell that never ran")
     rig = Rig(run=FakeRun({UFW_ALLOW: (0, "")}))
     with rig:
         res, _ = attempt(lambda: s.cells.start({"modelPath": MODEL, "args": llama_args(port),
                                                      "config": {"MODEL_FILE": MODEL, "PORT": port}}))
-    check(res == {"ok": False, "error": f"startup already in progress on port {port} (loading)", "phase": "loading"},
-          "as-is: ДЕФЕКТ — новый старт на этом порту отказан «уже стартует», пока не придёт ещё один Stop")
+    check((res or {}).get("ok") is True and (res or {}).get("phase") == "resolving",
+          "a new start on the port is accepted at once: nothing is under way there (it was refused «already in progress» "
+          "until another stop came)")
 
 
 def test_models_in_place():
@@ -2413,7 +2522,7 @@ def test_cell_env_marker_last():
           "иначе скаут потерял бы свою ячейку")
 
 TESTS = [
-    test_slot_plumbing, test_node_public_views, test_nodes_public_list,
+    test_slot_plumbing, test_node_public_views, test_view_says_the_reading, test_nodes_public_list,
     test_update_status_views, test_update_start_commands, test_update_job_run, test_update_conflict,
     test_builds_list, test_cell_artifacts, test_cell_artifacts_env, test_registry, test_marker_matches, test_pid_cmdline,
     test_port_listener_pid, test_port_health_ok,
@@ -2431,6 +2540,7 @@ TESTS = [
     test_worker_gpu_layers_and_spec, test_worker_cancelled_mid_download, test_worker_stopped_during_start,
     test_worker_corruption_retry, test_worker_corruption_only_own, test_worker_trims_the_cache_when_caching,
     test_models_in_place, test_cell_env_both_kinds, test_cell_env_marker_last,
+    test_report_makes_no_cell, test_loading_ports,
 ]
 
 

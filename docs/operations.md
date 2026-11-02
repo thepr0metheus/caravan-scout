@@ -76,7 +76,11 @@ page on `http://<host>:8092/` only reads.
 Runtime files (never in git): `state.json` (heartbeat status, the `cells`
 registry and the pinned `hostId`; a 1.x state's `assignments`/`applyStatus`
 are dropped once at start), `llama-node-configs/`, `var/server-cells/<port>/`, the model cache
-(`~/llama-model-cache` by default).
+(`~/llama-model-cache` by default). The cache's folder can move from the machine's page (2.38,
+`POST /api/llama-node/cache/dir`, kept in `state.json` as `cacheDir`, before `modelsBasePath`):
+what the scout downloaded into the folder it leaves is deleted — the controller's copies, which a
+start brings into the new folder by itself — and not while a cell is bringing its model (409); a
+cell that runs keeps running from its open files, its log stays where it was written.
 
 Files that hold a secret are 0600 (2.20): `config.json` (the fleet token)
 and `state.json` (the cells' start requests and launches). Before 2.20 the
@@ -153,11 +157,31 @@ Its messages are in the journal: `journalctl -t nvidia-kernel-guard`.
   (`lcv1_`, `sk-`, `hf_`, `ghp_`, `glpat-`), a `Bearer` value, whatever
   follows a name like `api_key` / `password` / `secret`, and a long value
   after `token` — `EOS token = 151645` stays as llama.cpp wrote it.
-- **`sudo -n ufw allow <port>`** on cell start is best-effort: without
-  passwordless sudo the port silently stays closed to the LAN.
+- **The cells' ports are the operator's firewall rule, not the scout's.** Until
+  2.40 every cell start ran `sudo -n ufw allow <port>`, which opened the port to
+  the whole network. Since the owner's decision of 2026-10-26 (variant B) the
+  cells' range answers the controller alone — the rule install.sh names,
+  `sudo ufw allow from <controller-ip> to any port 22001:22999 proto tcp`, with
+  a deny for the range under it — and no start touches ufw. Who ufw lets reach a
+  cell is read as ufw decides (2.40, `Machine.ufw_access`): the first rule that
+  holds the port and the caller wins — ranges, lists and rules for every port
+  counted, an outgoing or an IPv6 rule not — so the board's lock says
+  "restricted: <controller>" under the owner's rule, not the per-port
+  "ALLOW Anywhere" an older start left below it. The scout's own port belongs
+  under the same rule once it is paired: its `/v1` entry answers without a key,
+  and open to the network it would hand out the very models the closed cells
+  hold. The rules, the denies first since each `prepend` goes on top:
+  `sudo ufw prepend deny proto tcp to any port 22001:22999`,
+  `sudo ufw prepend deny proto tcp to any port 8092`,
+  `sudo ufw prepend allow proto tcp from <controller-ip> to any port 22001:22999`,
+  `sudo ufw prepend allow proto tcp from <controller-ip> to any port 8092`.
 - **`cacheModels=false` (default)**: models re-download on every start and are
   purged on stop — files and model folders, a command cell's too (2.31; it kept
-  them always); with caching on they stay, and a model is written to the disk
+  them always); its own models only, the files its starts asked for (2.37.2: the
+  stop deleted every model no running cell held — a stop of an Ollama cell, which
+  has no file in the cache, deleted 92 GB of other cells' models); a stop that
+  stopped nothing ("not running": the board removing a cell it stopped before)
+  lets go of nothing (2.37.1); with caching on they stay, and a model is written to the disk
   once. An engine starts only from a file on this machine's disk, so without a
   cache every start writes the whole model again. A download under way is
   never purged. With caching on, the cache keeps **the last N models that ran**
@@ -169,14 +193,21 @@ Its messages are in the journal: `journalctl -t nvidia-kernel-guard`.
   while no model is known to have run; a file this scout did not download (it
   was copied in by hand) is never deleted by itself, only counted and shown, and
   deleted when the operator asks with the figure he was shown (409 when it
-  changed since). `GET /api/llama-node/cache` says the setting and the figures,
-  `POST .../cache/keep` sets N and trims at once, `POST .../cache/delete-foreign`
+  changed since). Since 2.38 the owner may say it in GB instead (`cacheBudgetBytes`
+  in `state.json`, set from the machine's page): the cache keeps what starting and
+  running cells hold, then the models that ran, newest first, as many as fit in the
+  budget together with them — a model that does not fit makes room for an older
+  one that does; without a budget, the last N. `GET /api/llama-node/cache` says the
+  settings, the folder and the figures, `POST .../cache/keep` sets N and
+  `POST .../cache/budget` the budget (each trims at once), `POST .../cache/delete-foreign`
   deletes the files the scout did not download. This replaces `cleanOldModels`
   (2.33 and before, off by default and unused by the board): a `config.json` that
   still carries it is read and ignored.
 - **A command cell starts in the background (2.31)** and answers `starting` at
   once, as a llama cell does: its files arrive while the board shows the
-  `downloading` phase. A stop before or during the download cancels the start.
+  `downloading` phase. A stop before or during the download cancels the start. The copy itself goes on to the end of its file, and
+  what it says after the stop is dropped (2.35.2: a report makes no cell): a stopped port is not on the board and takes a new start at
+  once, which waits for the copy under way and finds the file whole (one copy of a file at a time).
   It reads the files the controller names (`modelFiles`); the first part of a
   split GGUF brings the other parts, and a running cell holds all of them.
   `CARAVAN_CELL_SCRATCH` names its scratch folder (`<cache>/.cells/<port>`):
@@ -307,7 +338,11 @@ Its messages are in the journal: `journalctl -t nvidia-kernel-guard`.
   `<folder>.part`; the folder takes its name when all of them are in, with
   `.caravan-folder.json` written last. A fetch cut short is resumed: a file
   already of its size is kept. A folder the scout did not download is never
-  replaced. No machine with a scout needs rights to the share the models live on.
+  replaced, and is refused before a file comes (2.35.3; it was refused after the
+  whole model had come down). A folder of files the scout fetched one by one, for
+  another cell of the same model, is its own: it is completed where it is — what
+  is there of its size stays — and written down whole. No machine with a scout
+  needs rights to the share the models live on.
 - **The scout deletes only what it downloaded.** Each download is written down
   in `.caravan-downloads.json` in the cache; the purge, the old-model cleanup
   and the corrupt-model retry delete only those files. A cache dir set to a

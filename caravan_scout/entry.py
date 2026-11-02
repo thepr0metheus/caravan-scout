@@ -2,9 +2,11 @@
 
 The owner, 2026-10-12 (visumap caravan-scout-openai, step 1): a model is called by its name, not by
 the port of its cell. `GET /v1/models` lists the models of this machine — every cell the scout runs,
-and every one it keeps a start request for (autostart) — and a request names one in `model`: the
+every one it keeps a start request for (autostart), and since 2.37 every cell the controller keeps
+for the machine (KnownCells), a stopped one as stopped — and a request names one in `model`: the
 scout hands it to a running cell of that model and passes the answer back as it comes, a stream as a
-stream. Two cells of one model are two copies of it, and a request goes to the less busy one.
+stream. Two cells of one model on one runner are two copies of it, and a request goes to the less busy
+one; cells of one name on two runners are two models (2.39, MachineModels.groups).
 
 The cells' own ports answer as before: the direct way stays as the spare one (the owner's decision 3).
 The entry is open like the cells — no fleet token: everything it reaches is reachable on the cells'
@@ -54,17 +56,26 @@ class ModelName:
         made = cls.from_path(str(config.get("MODEL_FILE") or "").strip() or str(model_path or "").strip())
         return made or (f"cell-{int(port)}" if port else "")
 
+    #: A folder of HF's cache: `models--<owner>--<repository>` is how HF lays its files out, not the model's name.
+    HF_CACHE = re.compile(r"^models--[^/]+?--(.+)$")
+
     @classmethod
     def from_path(cls, path: str) -> str:
-        """A model's name from where it lies: a GGUF file — its name without `.gguf`; a folder named under
-        the models' root (`seamless-m4t-v2-large/facebook/FP32`) — its first part; an absolute folder —
-        the part after `models`, else its last part."""
+        """A model's name from where it lies: a GGUF file — its name without `.gguf`; a folder of HF's cache
+        (`whisper/models--Systran--faster-whisper-large-v3-turbo`) — its repository's name (2.37: it was named
+        after the runner's folder, or after the cache's whole folder name); a folder named under the models'
+        root (`seamless-m4t-v2-large/facebook/FP32`) — its first part; an absolute folder — the part after
+        `models`, else its last part."""
         path = path.strip().rstrip("/")
         if not path:
             return ""
         parts = PurePosixPath(path).parts
         if path.lower().endswith(".gguf"):
             return cls.SPLIT.sub("", PurePosixPath(path).name[:-5])
+        for part in parts:
+            cached = cls.HF_CACHE.match(part)
+            if cached:
+                return cached.group(1)
         if not path.startswith("/"):
             return parts[0]
         if "models" in parts[:-1]:
@@ -72,13 +83,77 @@ class ModelName:
         return parts[-1]
 
 
+class KnownCells:
+    """The cells the controller keeps for this machine (2.37), as its answer to a heartbeat says them: each
+    configured cell's port, where its model lies, and the settings its model's name is made of — never the rest
+    of a cell's settings. A cell this scout has not started since its own start is then a model of its machine
+    too, stopped: on 2026-10-25 the entry named 8 of the 17 ports the controller's pools led to.
+
+    Kept in state.json (`knownCells`) from the last answer that said them: a beat that fails, or a restart, does
+    not make the machine's cells unknown, and an answer that does not say them (a controller older than 1.3.629)
+    leaves the list as it was. None until a controller has said them: the list of models is then what it was
+    before 2.37 — not knowing the cells is not "no cells". What the network says is checked: a port that is no
+    port, a field that is no text is left out. Unpairing forgets them with the controller."""
+
+    KEY = "knownCells"
+    MAX = 500
+    FIELDS = ModelName.KEYS + ("RUNNER", "WHISPER_MODEL", "MOONSHINE_MODEL", "MODEL_FILE")
+
+    def __init__(self, state):
+        self.state = state
+
+    @classmethod
+    def clean(cls, raw) -> dict[int, dict[str, Any]] | None:
+        """{port: {config, modelPath}} of what a controller said, or None when it said no list."""
+        if not isinstance(raw, list):
+            return None
+        out: dict[int, dict[str, Any]] = {}
+        for item in raw[:cls.MAX]:
+            port = item.get("port") if isinstance(item, dict) else None
+            if not (isinstance(port, int) and not isinstance(port, bool) and 0 < port < 65536):
+                continue
+            config = item.get("config") if isinstance(item.get("config"), dict) else {}
+            named = {key: str(value)[:400] for key, value in config.items()
+                     if key in cls.FIELDS and isinstance(value, (str, int)) and not isinstance(value, bool)}
+            path = item.get("modelPath")
+            out[port] = {"config": named, "modelPath": str(path)[:1000] if isinstance(path, str) else ""}
+        return out
+
+    def take(self, answer) -> None:
+        """Keep the cells a controller's answer to a heartbeat says; an answer that says none changes nothing."""
+        cells = self.clean(answer.get("cells") if isinstance(answer, dict) else None)
+        if cells is None:
+            return
+        with self.state.lock:
+            self.state[self.KEY] = [{"port": port, **cell} for port, cell in sorted(cells.items())]
+            self.state.save()
+
+    def forget(self) -> None:
+        with self.state.lock:
+            if self.state.pop(self.KEY, None) is not None:
+                self.state.save()
+
+    def ports(self) -> dict[int, dict[str, Any]] | None:
+        with self.state.lock:
+            raw = self.state.get(self.KEY)
+        return self.clean(raw)
+
+    def name(self, port: int) -> str:
+        """What the controller's settings call the cell's model now, "" when it does not keep the cell."""
+        cell = (self.ports() or {}).get(port)
+        return ModelName.of(cell["config"], cell["modelPath"], port) if cell else ""
+
+
 class MachineModels:
     """The models of this machine, as `GET /v1/models` lists them: each cell the scout runs, starts or
-    keeps a start request for, grouped by its model's name — two cells of one model are its copies.
+    keeps a start request for, and each one the controller keeps for the machine (2.37, KnownCells),
+    grouped by its model's name and its runner — two cells of one model on one runner are its copies
+    (`groups`, 2.39).
 
     A cell's state is its process's word and its start's phase: running, starting (being fetched or
     loaded), failed, stopped. A cell the table holds with nothing behind it — no process, no start, no
-    record, no kept request: a port only asked about — is no model, and is left out.
+    record, no kept request, not one the controller keeps: a port only asked about — is no model, and is
+    left out.
 
     A running copy also says its places (2.29): how many requests its server takes at once (`slots`,
     /props) and how many it works on now (`busy`, /metrics — the count Copies picks by). A copy whose
@@ -86,11 +161,20 @@ class MachineModels:
     The controller queues a model's requests by them, as it queues a cell's by its /slots."""
 
     STATES = ("running", "starting", "failed", "stopped")
+    #: The runner of a cell whose settings name none — the controller's default too (lama-caravan runner_id).
+    DEFAULT_RUNNER = "llama-server"
 
-    def __init__(self, cells, autostart, host_id: Callable[[], str]):
+    def __init__(self, cells, autostart, host_id: Callable[[], str], known: KnownCells | None = None):
         self.cells = cells
         self.autostart = autostart
         self.host_id = host_id
+        self.known = known
+
+    @classmethod
+    def runner(cls, config) -> str:
+        """The runner a cell's settings name (`RUNNER`), in lower case; settings that name none — the default."""
+        said = str(config.get("RUNNER") or "").strip().lower() if isinstance(config, dict) else ""
+        return said or cls.DEFAULT_RUNNER
 
     def state(self, cell) -> str:
         status = cell.process.status()
@@ -105,28 +189,50 @@ class MachineModels:
         return "stopped"
 
     def cells_now(self) -> list[dict[str, Any]]:
-        """Each cell: its port, its model's name, its state and when it started — sorted by port.
+        """Each cell: its port, its model's name, its runner, its state and when it started — sorted by port.
 
         The name, from the freshest word first: the start under way or last made here (Cell.name), the
         record of a cell running since before this scout started, the kept start request, and — for a
-        cell started before names were kept (2.26 and older) — its model's path in the record."""
+        cell started before names were kept (2.26 and older) — its model's path in the record. A stopped
+        cell the controller keeps (2.37) is called what its settings call it now: they are what its next
+        start runs, and an operator who renamed a stopped model finds it under the new name at once. A
+        running, starting or failed one keeps the name it was started under, the one its server answers to.
+
+        The runner (2.39): what the freshest settings the scout has say — the controller's, when it keeps the cell
+        (its next start runs them), else the kept start request's, else the record's (a prism start keeps its runner
+        there). Settings that name no runner say llama-server: an absent RUNNER of the controller's is its default,
+        not a word to look for elsewhere."""
         kept = self.autostart.requests()
+        known = (self.known.ports() if self.known else None) or {}
         found: dict[int, dict[str, Any]] = {}
         for port, cell in self.cells.all():
             record = self.cells.records.get(port)
             request = kept.get(str(port)) or {}
             state = self.state(cell)
-            if state == "stopped" and not record and not request:
+            told = known.get(port)
+            if state == "stopped" and not record and not request and not told:
                 continue
-            name = cell.name or str(record.get("name") or "") or ModelName.of(
-                request.get("config"), request.get("modelPath") or (record.get("cfg") or {}).get("modelPath") or "", port)
-            found[port] = {"port": port, "name": name, "state": state, "since": record.get("startedAt"),
+            if state == "stopped" and told:
+                name = ModelName.of(told["config"], told["modelPath"], port)
+            else:
+                name = cell.name or str(record.get("name") or "") or ModelName.of(
+                    request.get("config"), request.get("modelPath") or (record.get("cfg") or {}).get("modelPath") or "", port)
+            runner = self.runner(told["config"] if told else request.get("config") if request
+                                 else {"RUNNER": (record.get("cfg") or {}).get("runner")})
+            found[port] = {"port": port, "name": name, "runner": runner, "state": state, "since": record.get("startedAt"),
                            **self.places(port, state)}
         for key, request in kept.items():
             port = int(key)
             if port not in found:
-                found[port] = {"port": port, "name": ModelName.of(request.get("config"), request.get("modelPath"), port),
+                told = known.get(port)
+                name = (ModelName.of(told["config"], told["modelPath"], port) if told
+                        else ModelName.of(request.get("config"), request.get("modelPath"), port))
+                found[port] = {"port": port, "name": name, "runner": self.runner(told["config"] if told else request.get("config")),
                                "state": "stopped", "since": None, "slots": None, "busy": None}
+        for port, told in known.items():
+            if port not in found:
+                found[port] = {"port": port, "name": ModelName.of(told["config"], told["modelPath"], port),
+                               "runner": self.runner(told["config"]), "state": "stopped", "since": None, "slots": None, "busy": None}
         return [found[port] for port in sorted(found)]
 
     def places(self, port, state) -> dict[str, Any]:
@@ -144,16 +250,31 @@ class MachineModels:
         values = [c[key] for c in copies if c["state"] == "running"]
         return sum(values) if all(isinstance(v, int) for v in values) else None
 
+    def groups(self) -> dict[str, list[dict[str, Any]]]:
+        """The models by the id the entry lists them under, each with its copies, in the order of their first ports.
+
+        The id is the model's name. Cells of one name on two runners are two models (2.39), each called by the name and
+        its runner (`minicpm-o-4_5-q4_k_m@minicpm-omni`), as LM Studio tells a model's variants by `@`: a request for one
+        of them must not land on a server of another kind, and which of the two the bare name meant nobody said. Until
+        2.39 they were copies of one model (a llama.cpp chat on :22011 and MiniCPM-o's voice on :22024, 2026-10-26),
+        and a chat request could go to the voice. Which runner owns the bare name is not decided by the order of the
+        ports either: a cell moved to another port would have taken the name away."""
+        by_name: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        for cell in self.cells_now():
+            by_name.setdefault(cell["name"], {}).setdefault(cell["runner"], []).append(cell)
+        out: dict[str, list[dict[str, Any]]] = {}
+        for name, runners in by_name.items():
+            for runner, copies in runners.items():
+                out[name if len(runners) == 1 else f"{name}@{runner}"] = copies
+        return out
+
     def listing(self) -> list[dict[str, Any]]:
         """The models in OpenAI's shape, each with `caravan`: its state — the best of its copies' —, its
         places (`slots`, `busy`: the running copies' sums, 0 when none runs, None when one does not say),
         and each copy's port, state and places. `created` is when its first copy started; 0 for one
         never started."""
-        by_name: dict[str, list[dict[str, Any]]] = {}
-        for cell in self.cells_now():
-            by_name.setdefault(cell["name"], []).append(cell)
         out = []
-        for name, copies in by_name.items():
+        for name, copies in self.groups().items():
             best = min((c["state"] for c in copies), key=self.STATES.index)
             started = [int(c["since"]) for c in copies if isinstance(c.get("since"), (int, float)) and c["since"] > 0]
             out.append({"id": name, "object": "model", "created": min(started) if started else 0,
@@ -164,7 +285,8 @@ class MachineModels:
         return out
 
     def copies(self, name: str) -> list[dict[str, Any]]:
-        return [c for c in self.cells_now() if c["name"] == name]
+        """The copies of the model the entry lists as `name`; none for a name it does not list."""
+        return self.groups().get(name, [])
 
 
 class Copies:

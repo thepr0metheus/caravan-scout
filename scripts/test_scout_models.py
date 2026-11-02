@@ -319,6 +319,7 @@ def test_ensure_model_download():
     tmp = cache / "models" / "org" / "model-q4.tmp"
     during = []
     body = BODIES[MODEL]
+    s.cells.at(22001)       # a start's cell, made by the start (a report makes none)
     web = FakeUrlopen({"/api/models/download": served(body, on_read=lambda: during.append(
         (tmp.exists(), local.exists(), dict(s.cells.startup(22001)), written_down(s))))})
     with Rig(web=web) as rig:
@@ -331,11 +332,11 @@ def test_ensure_model_download():
           "качается во временный файл <имя>.tmp — готовый файл появляется только целиком")
     check(not tmp.exists(), "negative: после загрузки временного файла нет")
     check(during[:1] and during[0][2] == {"phase": "downloading", "downloadedBytes": 0, "totalBytes": len(body),
-                                          "downloadingFile": "model-q4.gguf"},
-          "прогресс: фаза downloading, размер из Content-Length, имя файла")
+                                          "downloadingFile": "model-q4.gguf", "downloadBytesPerSec": None},
+          "прогресс: фаза downloading, размер из Content-Length, имя файла; скорость ещё не измерена — None, а не 0")
     check(s.cells.startup(22001) == {"phase": "downloading", "downloadedBytes": len(body),
-                                          "totalBytes": len(body), "downloadingFile": "model-q4.gguf"},
-          "в конце — сколько скачано")
+                                          "totalBytes": len(body), "downloadingFile": "model-q4.gguf", "downloadBytesPerSec": None},
+          "в конце — сколько скачано; копия короче двух секунд скорости не мерит")
     check(f"[llama-node] download complete: model-q4.gguf — {len(body):,} bytes" in rig.journal,
           "журнал: загрузка завершена, байты")
     check(during[:1] and during[0][3] == ["models/org/model-q4.tmp"] and written_down(s) == [MODEL],
@@ -345,6 +346,7 @@ def test_ensure_model_download():
     with Rig(web=models_served()):
         attempt(lambda: s.models.ensure(MODEL, report=False, port=22002))
     check(22002 not in s.cells.by_port, "negative: report=False — запись старта не трогается, слот не создаётся")
+    s.cells.at(22003)
     with Rig(web=FakeUrlopen({"/api/models/download": served(BODIES[MODEL])})) as rig:
         attempt(lambda: s.models.ensure(MODEL, report=True, report_label="model-q4.gguf (1/2)", port=22003))
     check(s.cells.startup(22003).get("downloadingFile") == "model-q4.gguf (1/2)",
@@ -375,6 +377,7 @@ def test_ensure_model_progress_throttle():
     def progress(pieces):
         """downloadedBytes as the board sees it before every read, and at the end."""
         s = make_scout({"controllerUrl": CONTROLLER})
+        s.cells.at(22004)
         seen = []
         answer = served(b"", length=pieces * 8 * MIB, chunks=[chunk] * pieces,
                         on_read=lambda: seen.append(s.cells.startup(22004).get("downloadedBytes")))
@@ -390,6 +393,86 @@ def test_ensure_model_progress_throttle():
     err, seen, final = progress(3)
     check(err is None and seen == [0, 0, 0, 0] and final == 24 * MIB,
           "negative: меньше 32 МиБ — промежуточных отчётов нет, только итог")
+
+
+def test_copy_pace():
+    """How fast a copy goes (CopyPace, 2.42; the owner, 2026-10-26: "show at what speed it downloads")."""
+    from caravan_scout.models import CopyPace
+    now = [0.0]
+    pace = CopyPace(lambda: now[0])
+
+    def at(t, done):
+        now[0] = t
+        pace.add(done)
+        return pace.rate()
+
+    check([at(0, 0), at(0.5, 50 * MIB), at(1.5, 150 * MIB)] == [None, None, None],
+          "меньше двух секунд замера — скорости нет (None), а не 0 и не скорость одного шага")
+    check(at(2.0, 200 * MIB) == 100 * MIB, "две секунды — 100 МиБ/с: байты окна за его время")
+    check(at(2.1, 290 * MIB) == 100 * MIB, "negative: отсчёт через 0,1 с не пишется — окно не прыгает от двух шагов подряд")
+    for t in range(3, 21):
+        at(float(t), 200 * MIB + (t - 2) * 20 * MIB)
+    check(pace.rate() == 20 * MIB, "окно — последние 10 с: копия замедлилась до 20 МиБ/с, и старая скорость ушла из окна")
+    check(at(21.0, 5 * MIB) is None and at(23.5, 55 * MIB) == 20 * MIB,
+          "счёт пошёл назад (другой файл, повтор) — окно сначала: снова две секунды без скорости")
+
+    chunk = b"\0" * (8 * MIB)
+    s = make_scout({"controllerUrl": CONTROLLER})
+    s.cells.at(22005)
+    # The scout's clock at each sample: the start, four 8 MiB reads a half second apart, the last one a second and a half late.
+    times = iter([100.5, 101.0, 101.5, 102.0, 102.5, 104.0])
+    s.models.clock = lambda: next(times)
+    seen = []
+    answer = served(b"", length=5 * 8 * MIB, chunks=[chunk] * 5,
+                    on_read=lambda: seen.append(s.cells.startup(22005).get("downloadBytesPerSec")))
+    with Rig(web=FakeUrlopen({"/api/models/download": answer})):
+        _, err = attempt(lambda: s.models.ensure(MODEL, report=True, port=22005))
+    (s.models.cache_dir() / MODEL).unlink(missing_ok=True)
+    check(err is None and seen[-1] == 16 * MIB,
+          "копия по 8 МиБ за полсекунды: у отчёта на 32 МиБ — 16 МиБ/с, по часам самого скаута")
+    check(s.cells.startup(22005).get("downloadBytesPerSec") == int(40 * MIB / 3.5),
+          "последний кусок шёл полторы секунды: итог говорит скорость всей копии, а не ту, что была на 32 МиБ")
+
+
+def test_download_leaves_the_page_cache():
+    chunk = b"\x01" * (8 * MIB)
+    dontneed = 4
+
+    def fetch(pieces, can=True, refuse=None):
+        """A download of `pieces` 8-MiB reads: what it synced and dropped, in order, its journal and the file's size."""
+        s = make_scout({"controllerUrl": CONTROLLER})
+        calls = []
+
+        def fadvise(fd, offset, length, advice):
+            if refuse:
+                raise refuse
+            calls.append(("drop", offset, length, advice))
+
+        answer = served(b"", length=pieces * 8 * MIB, chunks=[chunk] * pieces)
+        with Rig(web=FakeUrlopen({"/api/models/download": answer})) as rig, \
+                patched(os, fdatasync=lambda fd: calls.append("sync"), posix_fadvise=fadvise if can else None,
+                        POSIX_FADV_DONTNEED=dontneed):
+            _, err = attempt(lambda: s.models.ensure(MODEL, report=False))
+        local = s.models.cache_dir() / MODEL
+        size = local.stat().st_size if local.exists() else None
+        local.unlink(missing_ok=True)
+        return err, calls, rig.journal, size
+
+    err, calls, _, size = fetch(40)
+    check(err is None and size == 320 * MIB, "файл скачан целиком")
+    check(calls == ["sync", ("drop", 0, 256 * MIB, dontneed), "sync", ("drop", 256 * MIB, 64 * MIB, dontneed)],
+          "каждые 256 МиБ записанное сбрасывается на диск и уходит из кэша страниц, хвост — в конце; "
+          "каждый раз только новый кусок, и сначала sync: из кэша уходят лишь чистые страницы")
+    err, calls, _, size = fetch(3)
+    check(err is None and size == 24 * MIB and calls == ["sync", ("drop", 0, 24 * MIB, dontneed)],
+          "маленький файл уходит из кэша один раз, в конце загрузки")
+    err, calls, journal, size = fetch(3, can=False)
+    check(err is None and size == 24 * MIB and calls == [] and "page cache" not in journal,
+          "negative: нет posix_fadvise (macOS) — ничего не сбрасывается и не пишется, загрузка цела")
+    err, calls, journal, size = fetch(40, refuse=OSError(22, "Invalid argument"))
+    check(err is None and size == 320 * MIB and calls == ["sync"]
+          and journal.count("model-q4.gguf: its pages stay in the page cache ([Errno 22] Invalid argument)") == 1,
+          "negative: ядро отказало — загрузка идёт дальше, журнал говорит об этом один раз, больше не пробуем")
 
 
 def test_ensure_model_truncation():
@@ -449,6 +532,7 @@ def test_ensure_model_retries():
     # cell's own port. It called without one and raised TypeError on the first
     # blip — the promised 5/15/30 s never came.
     s = make_scout({"controllerUrl": CONTROLLER})
+    s.cells.at(22005)
     with Rig(web=FakeUrlopen({"/api/models/download": REFUSED})) as rig:
         _, err = attempt(lambda: s.models.ensure(MODEL, report=True, port=22005))
     check(err_is(err, 500, "model download failed: <urlopen error [Errno 111] Connection refused>")
@@ -496,6 +580,38 @@ def test_purge_model_cache():
         res, _ = attempt(lambda: s.models.purge(keep=str(cache / MMPROJ)))
     check(res == {"removed": 3, "freedBytes": 20} and (cache / MMPROJ).exists(), "keep строкой — тоже работает")
     check(make_scout().models.purge() == {"removed": 0, "freedBytes": 0}, "boundary: папки кэша нет — нули")
+
+
+def test_release_a_stopped_cells_models():
+    def fresh():
+        s = make_scout()
+        cache = s.models.cache_dir()
+        lay(cache, {MODEL: 10, MMPROJ: 5, SPEC: 4, "models/other/stale.gguf": 7, "models/lib/library.gguf": 9})
+        fetched(s, MODEL, MMPROJ, SPEC, "models/other/stale.gguf")
+        return s, cache
+
+    s, cache = fresh()
+    with Rig() as rig:
+        res, _ = attempt(lambda: s.models.release([cache / MODEL, cache / MMPROJ]))
+    check(res == {"removed": 2, "freedBytes": 15} and not (cache / MODEL).exists() and not (cache / MMPROJ).exists(),
+          "остановленная ячейка без кэша отпускает свои модели: модель и проектор удалены")
+    check((cache / SPEC).exists() and (cache / "models/other/stale.gguf").exists() and (cache / "models/lib/library.gguf").exists(),
+          "defect-history (2026-10-26): чужие модели кэша и не скачанное скаутом целы — остановка чистила весь кэш, "
+          "и стоп ячейки Ollama стёр 92 ГБ чужих моделей")
+    check("[llama-node] a stopped cell's models: removed 2 file(s), freed 15 bytes" in rig.journal, "журнал: сколько и сколько байт")
+    s, cache = fresh()
+    with Rig():
+        res, _ = attempt(lambda: s.models.release([cache / MODEL], keep=[cache / MODEL]))
+    check(res == {"removed": 0, "freedBytes": 0} and (cache / MODEL).exists(),
+          "negative: файл, который держит работающая ячейка, остаётся")
+    with Rig():
+        res, _ = attempt(lambda: s.models.release([cache / "models/lib/library.gguf"]))
+    check(res == {"removed": 0, "freedBytes": 0} and (cache / "models/lib/library.gguf").exists(),
+          "negative: файл, который скаут не скачивал, не удаляется")
+    with Rig():
+        res, _ = attempt(lambda: s.models.release([]))
+    check(res == {"removed": 0, "freedBytes": 0} and (cache / SPEC).exists(),
+          "boundary: ячейке нечего отпускать (ячейка движка) — не удаляется ничего")
 
 
 def test_purge_models_safely():
@@ -549,6 +665,7 @@ def test_ensure_split_parts():
         return [urllib.parse.unquote(c["url"].split("path=", 1)[1]) for c in rig.web.calls]
 
     s = make_scout({"controllerUrl": CONTROLLER})
+    s.cells.at(22310)
     with Rig(web=models_served(SPLIT)) as rig:
         got, err = attempt(lambda: s.models.ensure(SPLIT_1, report=True, port=22310))
     cache = s.models.cache_dir()
@@ -618,6 +735,52 @@ def test_purge_folders_and_flight():
         res, _ = attempt(lambda: s.models.purge(keep=[cache / "whisper/x/blob"]))
     check((cache / "whisper/x/blob").exists() and not (cache / "seam").exists(),
           "negative: папка, внутри которой лежит удерживаемый файл, цела")
+
+
+def test_one_copy_of_a_file_at_a_time():
+    """A stop does not end the copy it interrupts: the copy goes on to the end of the file (2026-10-19: a checkpoint of twelve files,
+    stopped on its way, was still copied to the end). A start that follows the stop at once asks for the same file: it waits for
+    that copy and finds the file whole, as it waits for a folder's (ensure_folder) — not a second writer of the same ".tmp"."""
+    def two_starts(use_cache):
+        s = make_scout({"controllerUrl": CONTROLLER})
+        inside, gate, asked, results = threading.Event(), threading.Event(), [], {}
+
+        def on_request(raw):
+            asked.append(raw)
+            if len(asked) == 1:
+                inside.set()
+                gate.wait(5)        # the first copy stands in the middle of the file until it is let go
+
+        def ensure(name, rel):
+            results[name] = attempt(lambda: s.models.ensure(rel, report=False, use_cache=use_cache))
+        with Rig(web=models_served(on_request=on_request)):
+            first = threading.Thread(target=ensure, args=("first", MODEL))
+            first.start()
+            under_way = inside.wait(5)
+            second = threading.Thread(target=ensure, args=("second", MODEL))
+            second.start()
+            second.join(0.3)
+            waits = second.is_alive() and asked == [MODEL]
+            other = threading.Thread(target=ensure, args=("other", MMPROJ))
+            other.start()
+            other.join(2)
+            free = not other.is_alive() and results.get("other", (None,))[0] == s.models.cache_dir() / MMPROJ
+            gate.set()
+            first.join(5)
+            second.join(5)
+        return s, asked, results, under_way, waits, free, second.is_alive()
+
+    s, asked, results, under_way, waits, free, stuck = two_starts(use_cache=True)
+    here = s.models.cache_dir() / MODEL
+    check(under_way and waits,
+          "the second start asks for the file the first is copying: it waits, and asks the controller for nothing beside the first copy")
+    check(free, "negative: a start that wants ANOTHER file does not wait for the first copy")
+    check(not stuck and results["first"] == (here, None) and results["second"] == (here, None)
+          and asked.count(MODEL) == 1 and here.read_bytes() == BODIES[MODEL],
+          "the second finds the file whole when the first is done: one copy, both starts have the path")
+    s, asked, results, under_way, waits, free, stuck = two_starts(use_cache=False)
+    check(not stuck and results["second"][1] is None and asked.count(MODEL) == 2,
+          "negative: a start that keeps no cache copies the file again after it has waited: one copy at a time, not one copy for all")
 
 
 def test_in_place():
@@ -784,11 +947,61 @@ def test_folder_download():
 
     s = make_scout({"controllerUrl": CONTROLLER})
     lay(s.models.cache_dir(), {FOLDER + "/config.json": b"by hand"})
-    with Rig(web=folder_served()):
+    with Rig(web=folder_served()) as rig:
         _, err = attempt(lambda: s.models.ensure(FOLDER, report=False, use_cache=True, hint=hint))
     check(err_is(err, 409, f"{s.models.cache_dir() / FOLDER} is there and was not downloaded by this scout: not replaced")
           and peek(lambda: (s.models.cache_dir() / FOLDER / "config.json").read_bytes()) == b"by hand",
           "negative: чужая папка на том же месте не заменяется — 409, её файл цел")
+    check(rig.web.calls == [] and not (s.models.cache_dir() / "seam/facebook/FP32.part").exists(),
+          f"отказ чужой папке — до первого запроса: ни списка, ни файла, ни части (было: вся модель качалась и отказ в конце; "
+          f"{len(rig.web.calls)} запросов)")
+
+    # A folder of this scout's own files, fetched one by one for another cell of the same model (2026-10-24: :22011 on
+    # llama-server fetched MiniCPM-o's GGUF and a projector into the folder the omni cell :22024 needs whole).
+    s = make_scout({"controllerUrl": CONTROLLER})
+    lay(s.models.cache_dir(), {FOLDER + "/config.json": FOLDER_FILES["config.json"],
+                               FOLDER + "/model-00001.safetensors": FOLDER_FILES["model-00001.safetensors"]})
+    fetched(s, FOLDER + "/config.json", FOLDER + "/model-00001.safetensors")
+    asked = []
+    with Rig(web=folder_served(on_file=asked.append)) as rig:
+        got, err = attempt(lambda: s.models.ensure(FOLDER, report=False, use_cache=True, hint=hint))
+    own = s.models.cache_dir() / FOLDER
+    check(err is None and got == own and asked == ["sub/conf.yaml", "blobs/abc"],
+          f"папка из своих файлов дополнена на месте: файлы своего размера остались, скачано только остальное ({err}, {asked})")
+    check(all(peek(lambda k=k: (own / k).read_bytes()) == v for k, v in FOLDER_FILES.items())
+          and peek(lambda: os.readlink(own / "snap/h1/model.bin")) == "../../blobs/abc"
+          and peek(lambda: json.loads((own / s.models.FOLDER_MARK).read_text())) == FOLDER_LISTING
+          and not own.with_name("FP32.part").exists(),
+          "полная папка: все файлы, ссылки и знак полной папки, без части рядом")
+    check(written_down(s) == [FOLDER],
+          f"записана одна папка, её файлы по одному забыты — папка держит их сама ({written_down(s)})")
+
+    s = make_scout({"controllerUrl": CONTROLLER})
+    lay(s.models.cache_dir(), {FOLDER + "/config.json": FOLDER_FILES["config.json"], FOLDER + "/notes.txt": b"by hand"})
+    fetched(s, FOLDER + "/config.json")
+    with Rig(web=folder_served()) as rig:
+        _, err = attempt(lambda: s.models.ensure(FOLDER, report=False, use_cache=True, hint=hint))
+    check(err_is(err, 409, f"{s.models.cache_dir() / FOLDER} is there and was not downloaded by this scout: not replaced")
+          and rig.web.calls == [] and peek(lambda: (s.models.cache_dir() / FOLDER / "notes.txt").read_bytes()) == b"by hand"
+          and written_down(s) == [FOLDER + "/config.json"],
+          "negative: в папке свои файлы и один чужой — папка не своя: 409 до запросов, чужой файл цел, журнал прежний")
+
+    s = make_scout({"controllerUrl": CONTROLLER})
+    lay(s.models.cache_dir(), {FOLDER + "/config.json": FOLDER_FILES["config.json"], FOLDER + "/.hidden-note": b"by hand"})
+    fetched(s, FOLDER + "/config.json")
+    with Rig(web=folder_served()) as rig:
+        _, err = attempt(lambda: s.models.ensure(FOLDER, report=False, use_cache=True, hint=hint))
+    check(isinstance(err, AppError) and err.status == 409 and rig.web.calls == [],
+          "negative: чужой скрытый файл тоже делает папку чужой — в неё пишут, и каждый файл в ней на счету")
+
+    s = make_scout({"controllerUrl": CONTROLLER})
+    lay(s.models.cache_dir(), {"seam/facebook/FP3": b"a file of this scout", FOLDER + "/config.json": b"by hand"})
+    fetched(s, "seam/facebook/FP3")
+    with Rig(web=folder_served()) as rig:
+        _, err = attempt(lambda: s.models.ensure(FOLDER, report=False, use_cache=True, hint=hint))
+    check(isinstance(err, AppError) and err.status == 409 and rig.web.calls == []
+          and peek(lambda: (s.models.cache_dir() / FOLDER / "config.json").read_bytes()) == b"by hand",
+          "negative: записанный «seam/facebook/FP3» не делает своим соседа «FP32» — под папкой значит через «/», а не по началу имени")
 
     for listing, what in ((dict(FOLDER_LISTING, files=[{"path": "../../evil", "size": 1}]), "путь из папки наружу"),
                           (dict(FOLDER_LISTING, files=[{"path": "/etc/evil", "size": 1}]), "абсолютный путь"),
@@ -846,6 +1059,7 @@ def test_download_all_model_files():
             body = BODIES[raw]
             return FakeResponse(body, headers={"Content-Length": str(len(body))}, on_read=note)
         web = FakeUrlopen({"/api/models/download?path=": labelled})
+        s.cells.at(22007)
         with Rig(web=web):
             res, err = attempt(lambda: s.models.download_all(MODEL, mmproj, spec, use_cache=use_cache,
                                                                    port=22007))
@@ -1081,9 +1295,10 @@ def test_sync_malformed_manifest():
 
 TESTS = [
     test_model_cache_dir, test_is_corruption_error, test_ensure_model_local, test_ensure_model_download,
-    test_ensure_model_progress_throttle, test_ensure_model_truncation, test_ensure_model_retries,
-    test_purge_model_cache, test_purge_models_safely, test_split_gguf_parts,
-    test_ensure_split_parts, test_purge_folders_and_flight, test_in_place, test_folder_download,
+    test_ensure_model_progress_throttle, test_copy_pace, test_download_leaves_the_page_cache, test_ensure_model_truncation, test_ensure_model_retries,
+    test_purge_model_cache, test_release_a_stopped_cells_models, test_purge_models_safely, test_split_gguf_parts,
+    test_ensure_split_parts, test_purge_folders_and_flight, test_one_copy_of_a_file_at_a_time, test_in_place,
+    test_folder_download,
     test_list_cached_models,
     test_download_all_model_files,
     test_launcher_and_runner, test_sync_nothing_to_do, test_sync_runner_resolution, test_sync_files,

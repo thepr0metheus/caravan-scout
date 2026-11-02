@@ -316,7 +316,10 @@ def test_facts():
     CHECKS.section("the figures:")
     s, keeper, cache = shelf(setting=2)
     facts = keeper.facts()
-    check(sorted(facts) == ["disk", "foreign", "keep", "managedBytes"], "exactly these four: the setting, what this scout holds, what it did not download, the disk")
+    check(sorted(facts) == ["budgetBytes", "dir", "disk", "foreign", "keep", "managedBytes"],
+          "exactly these: the two settings (2.38: the budget beside the count), the folder, what this scout holds, what it did not "
+          "download, the disk")
+    check(facts["budgetBytes"] is None and facts["dir"] == str(cache), "no budget until set — null, not a size made up; the folder is the cache's")
     check(facts["keep"] == 2 and facts["managedBytes"] == 10 + 20 + 30 + 5 + 7 + 8 + 40 + 2, "managedBytes is what the ledger names and the disk still holds, a folder counted whole")
     disk = facts["disk"]
     check(isinstance(disk["totalBytes"], int) and isinstance(disk["freeBytes"], int) and 0 < disk["freeBytes"] <= disk["totalBytes"],
@@ -379,14 +382,136 @@ def test_routes():
         check(status == 409 and "nothing was deleted" in body["error"] and (cache / FOREIGN).is_file(), "a figure that is not the size now: 409, nothing deleted")
         check(srv.post("/api/llama-node/cache/delete-foreign", {"expectBytes": 9}) == (200, {"ok": True, "removed": 1, "freedBytes": 9})
               and not (cache / FOREIGN).exists(), "the figure he was shown: 200 and the files gone")
+    s, keeper, cache = shelf()
+    hdd = cache.parent / "hdd"
+    with Served(s) as srv:
+        check(srv.post("/api/llama-node/cache/budget", {"budgetBytes": 2 << 30}) == (200, {"ok": True, "budgetBytes": 2 << 30, "removed": 0,
+                                                                                         "freedBytes": 0, "waiting": True}),
+              "POST .../cache/budget (2.38): the size kept, the trim waiting while no model is known to have run")
+        status, body = srv.post("/api/llama-node/cache/budget", {"budgetBytes": "2"})
+        check(status == 400 and "budgetBytes must be a whole number of bytes" in body["error"], "negative: a size that is no whole number — 400")
+        status, body = srv.post("/api/llama-node/cache/dir", {"path": str(hdd)})
+        check(status == 200 and body["ok"] is True and body["dir"] == str(hdd.resolve()) and srv.get("/api/llama-node/cache")[1]["dir"] == str(hdd.resolve()),
+              "POST .../cache/dir (2.38): the cache moved, and GET .../cache says the new folder")
+        check(srv.post("/api/llama-node/cache/dir", {})[0] == 400, "negative: no path — 400")
     closed = make_scout({"controllerToken": "tok"})
     with Served(closed) as srv:
         check(srv.get("/api/llama-node/cache")[0] == 401 and srv.post("/api/llama-node/cache/keep", {"keep": 2})[0] == 401
-              and srv.post("/api/llama-node/cache/delete-foreign", {"expectBytes": 0})[0] == 401,
-              "negative: with a fleet token the three routes are closed like the rest")
+              and srv.post("/api/llama-node/cache/delete-foreign", {"expectBytes": 0})[0] == 401
+              and srv.post("/api/llama-node/cache/budget", {"budgetBytes": 2 << 30})[0] == 401
+              and srv.post("/api/llama-node/cache/dir", {"path": "/tmp/x"})[0] == 401,
+              "negative: with a fleet token the five routes are closed like the rest")
 
 
-TESTS = (test_setting, test_uses, test_trim, test_foreign, test_facts, test_routes)
+# ── the budget in bytes (2.38) ────────────────────────────────────────────────
+
+def test_budget():
+    CHECKS.section("the budget (2.38, the owner: in GB, not in models):")
+    s = make_scout()
+    budget = s.cells.keeper.budget
+    check(budget.value() is None, "until set there is no budget: the cache keeps the last `keep` models, as before")
+    five = 5 << 30
+    check(budget.set(five) == five and budget.value() == five
+          and json.loads(s.state.path.read_text(encoding="utf-8")).get("cacheBudgetBytes") == five,
+          "set(5 GiB): kept, in state.json beside the count")
+    for bad in (0, (1 << 30) - 1, (1 << 50) + 1, "5", 2.5, True, [], {}):
+        err = raises(lambda: budget.set(bad))
+        check(err is not None and err[0] == 400 and "budgetBytes must be a whole number of bytes" in err[1] and budget.value() == five,
+              f"negative: {bad!r} is refused with 400 and the budget stays 5 GiB — not rounded, not clamped")
+    check(budget.set(1 << 30) == 1 << 30 and budget.set(None) is None and budget.value() is None
+          and "cacheBudgetBytes" not in json.loads(s.state.path.read_text(encoding="utf-8")),
+          "boundary: 1 GiB is the least; None takes the budget off, and state.json no longer holds it")
+    with patched(cache_keeper.CacheBudget, MIN=1):
+        err = raises(lambda: budget.set(True))
+    check(err is not None and err[0] == 400, "negative: a flag is no size, even where 1 byte would be one (True is 1 to Python)")
+    for stored in ("5", True, 12, -1, 2.0):
+        check(make_scout(state={"cacheBudgetBytes": stored}).cells.keeper.budget.value() is None,
+              f"negative: {stored!r} in state.json is no budget — a hand-edited file does not trim the cache")
+
+    def budgeted(size, live=()):
+        s, keeper, cache = shelf()
+        ran(keeper, 22001, A)                 # 10 bytes, the oldest
+        ran(keeper, 22002, B)                 # 20
+        ran(keeper, 22003, C, C_MM)           # 35, the newest
+        keeper.live = lambda: set(live)
+        with patched(cache_keeper.CacheBudget, MIN=1):
+            result = keeper.set_budget(size)
+        return keeper, cache, result
+    keeper, cache, result = budgeted(60)
+    check(sorted(set(left(cache)) - {FOREIGN}) == sorted([B, C, C_MM]) and result == {"budgetBytes": 60, "removed": 4, "freedBytes": 10 + 7 + 8 + 42,
+                                                                                       "waiting": False},
+          "60 bytes: the newest that fit stay together — C with its projector (35) and B (20); A (10) would make 65, and goes")
+    keeper, cache, _result = budgeted(55)
+    check(sorted(set(left(cache)) - {FOREIGN}) == sorted([B, C, C_MM]),
+          "boundary: 55 bytes holds C and B exactly — a model that fits to the byte stays")
+    keeper, cache, _result = budgeted(50)
+    check(sorted(set(left(cache)) - {FOREIGN}) == sorted([A, C, C_MM]),
+          "50 bytes: B does not fit beside C, and makes room for the older A, which does")
+    keeper, cache, _result = budgeted(30)
+    check(sorted(set(left(cache)) - {FOREIGN}) == sorted([A, B]),
+          "30 bytes: the newest model alone is bigger than the budget and goes; the older ones that fit stay")
+    keeper, cache, _result = budgeted(40, live=(22002,))
+    check(sorted(set(left(cache)) - {FOREIGN}) == sorted([A, B]),
+          "a cell that runs keeps its files first and they count: B (20) runs, C (35) no longer fits beside it, A (10) does")
+    keeper, cache, _result = budgeted(5, live=(22003,))
+    check(sorted(set(left(cache)) - {FOREIGN}) == sorted([C, C_MM]),
+          "negative: a running cell's files stay even when they alone are past the budget — a trim never pulls a model from under a cell")
+    check((cache / FOREIGN).is_file(), "negative: the file this scout did not download stays, budget or not")
+    s, keeper, cache = shelf(setting=1)
+    ran(keeper, 22001, A)
+    ran(keeper, 22002, B)
+    with patched(cache_keeper.CacheBudget, MIN=1):
+        keeper.set_budget(100)
+        keeper.set_budget(None)
+    check(sorted(set(left(cache)) - {FOREIGN}) == [B], "the budget taken off: the count rules again (keep 1 — the newest stays)")
+
+
+# ── where the cache is (2.38) ─────────────────────────────────────────────────
+
+def test_move():
+    CHECKS.section("the cache's folder (2.38, the owner: an HDD instead of the SSD's writes):")
+    s, keeper, cache = shelf()
+    lay(cache, {"w/ggml-base.bin": 11})
+    s.models.downloaded.add(cache / "w/ggml-base.bin")
+    hdd = cache.parent / "hdd" / "models"
+    for path, words in (("", "path is required"), ("relative/dir", "must be an absolute path"),
+                        (str(cache), "is in"), (str(cache / "inside"), "may not lie inside the old one or hold it"),
+                        (str(cache.parent), "may not lie inside the old one or hold it")):
+        err = raises(lambda: keeper.move_to(path))
+        check(err is not None and err[0] == 400 and words in err[1] and keeper.models.cache_dir() == cache,
+              f"negative: {path or 'nothing'!r} is refused with 400 ({words}) and the cache stays where it is")
+    blocker = cache.parent / "a-file"
+    blocker.write_bytes(b"x")
+    err = raises(lambda: keeper.move_to(str(blocker / "sub")))
+    check(err is not None and err[0] == 400 and "the cache cannot be in" in err[1], "negative: a folder that cannot be made — 400 in the system's words")
+    keeper.loading = lambda: {22005, 22003}
+    err = raises(lambda: keeper.move_to(str(hdd)))
+    check(err == (409, "the cache does not move while a cell is bringing its model: :22003, :22005 — try again when it runs")
+          and keeper.models.cache_dir() == cache and (cache / A).is_file(),
+          "the owner's rule: not while a start brings its files — 409 names the cells, nothing deleted, the folder stays")
+    keeper.loading = lambda: set()
+    keeper.held = lambda: [str(cache / C)]
+    result = keeper.move_to(str(hdd))
+    check(result == {"dir": str(hdd.resolve()), "removed": 8, "freedBytes": 10 + 20 + 30 + 5 + 7 + 8 + 42 + 11},
+          "the move: what this scout downloaded into the old folder is deleted — every kind (a whisper .bin too) and the folder model whole")
+    check(left(cache) == [FOREIGN] and not (cache / ".caravan-downloads.json").exists(),
+          "negative: the file this scout did not download stays in the old folder; the ledger of the old folder goes with its files")
+    check(not (cache / C).exists(), "a running cell's model goes too: its weights are loaded, and its open file outlives its name")
+    check(keeper.models.cache_dir() == hdd.resolve() and hdd.is_dir() and list(hdd.iterdir()) == []
+          and json.loads(s.state.path.read_text(encoding="utf-8")).get("cacheDir") == str(hdd.resolve()),
+          "the cache is in the new folder now — made, empty (no probe left), and kept in state.json")
+    keeper.forget_figures()
+    facts = keeper.facts()
+    check(facts["dir"] == str(hdd.resolve()) and facts["managedBytes"] == 0 and facts["foreign"]["files"] == 0,
+          "the figures are the new folder's: nothing held yet, nothing foreign — the next start brings its model here")
+    fresh = make_scout(state={"cacheDir": str(hdd.resolve())})
+    check(fresh.models.cache_dir() == hdd.resolve(), "a scout that starts again reads the folder from state.json, before config.json's")
+    plain = make_scout(state={"cacheDir": "relative/path"})
+    check(plain.models.cache_dir() == Path(plain.config["modelsBasePath"]).expanduser(),
+          "negative: a folder in state.json that is no absolute path is no setting — config.json's modelsBasePath rules")
+
+
+TESTS = (test_setting, test_uses, test_trim, test_foreign, test_facts, test_budget, test_move, test_routes)
 
 for test in TESTS:
     try:

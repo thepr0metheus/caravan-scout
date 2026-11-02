@@ -239,6 +239,31 @@ To                         Action      From
 22002/tcp (v6)             ALLOW       Anywhere (v6)
 22012/tcp (v6)             ALLOW       fd00::20 (v6)
 """
+# Step 4 of the owner's plan, variant B (2026-10-26): the cells' range answers the controller alone — his two rules above
+# what was there, the per-port "ALLOW Anywhere" a scout's start added until 2.40 among it.
+UFW_VARIANT_B = """Status: active
+
+To                         Action      From
+--                         ------      ----
+8092/tcp                   ALLOW       10.0.0.20              # caravan scout: the controller
+22001:22999/tcp            ALLOW       10.0.0.20              # caravan cells: the controller
+8092/tcp                   DENY        Anywhere
+22001:22999/tcp            DENY        Anywhere                   # caravan cells: nobody else
+22/tcp                     ALLOW       Anywhere
+22001:22999/tcp            ALLOW       10.0.30.0/24
+22013                      ALLOW       Anywhere
+Anywhere                   ALLOW       10.0.88.5
+Anywhere on eth1           ALLOW IN    10.7.7.7
+25000:25999/udp            ALLOW       Anywhere
+10.0.30.20 23001:23999/tcp ALLOW    10.0.20.0/24
+23001:23999/tcp on eth0    ALLOW IN    10.0.30.0/24
+OpenSSH                    ALLOW       Anywhere
+24000                      LIMIT IN    Anywhere
+26000                      DENY        10.9.9.9
+26000                      ALLOW       10.9.9.9
+26000                      ALLOW       10.9.9.8
+22001:22999/tcp (v6)       DENY        Anywhere (v6)
+"""
 FW_22001 = {"state": "restricted", "allowedFrom": ["10.0.0.20", "10.0.0.21"]}
 FW_ALL = {"state": "all", "allowedFrom": ["Anywhere"]}
 FW_BLOCKED = {"state": "blocked", "allowedFrom": []}
@@ -471,10 +496,10 @@ def test_ufw_access():
     same(answers[2200], FW_BLOCKED, "negative: порт 2200 — не 22001: сравнение числом, не префиксом")
     same(answers[9999], FW_BLOCKED, "negative: ufw активен, правила на порт нет — blocked")
     same(answers["22001"], FW_22001, "порт строкой — то же, что числом")
-    same(answers[22007], FW_BLOCKED,
-         "as-is: диапазон «22005:22010/tcp ALLOW Anywhere» не понимается — порт внутри читается blocked")
-    same(answers[22011], {"state": "restricted", "allowedFrom": ["OUT   Anywhere"]},
-         "as-is: исходящее «ALLOW OUT» читается входящим источником «OUT   Anywhere»")
+    same(answers[22007], FW_ALL,
+         "2.40: диапазон «22005:22010/tcp ALLOW Anywhere» понимается — порт внутри открыт всем (до 2.40 — blocked)")
+    same(answers[22011], FW_BLOCKED,
+         "2.40: исходящее «ALLOW OUT» — не входящее правило (до 2.40 читалось источником «OUT   Anywhere»)")
     same(run.calls, [UFW_STATUS] * 11, "каждый вопрос — один `sudo -n ufw status` (без пароля; кэш — на скауте)")
     same({k.get("timeout") for k in run.kwargs}, {4}, "таймаут 4 с (по умолчанию run_text)")
 
@@ -492,6 +517,32 @@ def test_ufw_access():
     with patched(subprocess, run=run):
         got = [outcome(Machine.ufw_access, p) for p in ("abc", None)]
     same((got, run.calls), ([{"state": "unknown"}] * 2, []), "negative: порт не число — unknown, ufw не спрашивается")
+
+    CHECKS.section("правило владельца на диапазон ячеек (2.40, шаг 4, вариант Б):")
+    with patched(subprocess, run=KwRun({tuple(UFW_STATUS): (0, UFW_VARIANT_B)})):
+        b = {port: outcome(Machine.ufw_access, port) for port in (22001, 22013, 22999, 23000, 8092, 22, 23005, 24000, 25000, 26000)}
+    controller = {"state": "restricted", "allowedFrom": ["10.0.0.20"]}
+    same(b[22013], controller,
+         "defect-history: порт, который старт скаута открыл всем («22013 ALLOW Anywhere»), под запретом диапазона выше — "
+         "только контроллер; до 2.40 читалось «all», и доска рисовала ячейку открытой всем")
+    same((b[22001], b[22999], b[8092]), (controller, controller, controller),
+         "края диапазона и порт скаута — только контроллер: первое правило решает, «ALLOW 10.0.30.0/24» ниже запрета "
+         "не в счёт")
+    same(b[22], FW_ALL, "negative: порт вне диапазона — свои правила (22 открыт всем)")
+    every = ["10.0.88.5", "10.7.7.7"]
+    same(b[23005], {"state": "restricted", "allowedFrom": every + ["10.0.20.0/24", "10.0.30.0/24"]},
+         "правила без порта («Anywhere ALLOW 10.0.88.5» и то же на интерфейсе — все порты), правило с адресом машины и "
+         "с интерфейсом — держат порт; negative: профиль приложения (OpenSSH) — не держит")
+    same((b[24000], b[23000], b[25000]), (FW_ALL, {"state": "restricted", "allowedFrom": every},
+                                          {"state": "restricted", "allowedFrom": every}),
+         "LIMIT пускает; boundary: порт за диапазоном (23000) — только то, что держит все порты; без правила для всех ufw "
+         "по умолчанию не пускает; negative: «25000:25999/udp ALLOW Anywhere» TCP-порт 25000 не открывает")
+    same(b[26000], {"state": "restricted", "allowedFrom": every + ["10.9.9.8"]},
+         "источник, которому первое его правило запретило, — не пущен, хоть ниже и разрешён; negative: соседний пущен")
+    with patched(subprocess, run=KwRun({tuple(UFW_STATUS): (0, UFW_VARIANT_B.replace(
+            "22001:22999/tcp            DENY        Anywhere                   # caravan cells: nobody else\n", ""))})):
+        same(outcome(Machine.ufw_access, 22013), FW_ALL,
+             "negative: без запрета на диапазон тот же порт открыт всем — правилом «22013 ALLOW Anywhere»")
 
 
 # ── Machine: CPU and RAM ─────────────────────────────────────────────────────

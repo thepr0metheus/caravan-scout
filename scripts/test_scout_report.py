@@ -265,9 +265,12 @@ def test_public_state():
                                    "llamaNodes", "autostart", "autostartRequests", "entryModels", "modelCache", "time"]),
           "ровно эти поля — только машина: ни агентов, ни найденных VM, ни назначений")
     mc = state.get("modelCache") or {}
-    check(sorted(mc) == ["disk", "foreign", "keep", "managedBytes"] and mc["keep"] == 1 and mc["managedBytes"] == 0
+    check(sorted(mc) == ["budgetBytes", "dir", "disk", "foreign", "keep", "managedBytes"] and mc["keep"] == 1
+          and mc["budgetBytes"] is None and mc["dir"] == str(scout.models.cache_dir())
+          and mc["managedBytes"] == 0
           and mc["foreign"] == {"files": 0, "bytes": 0, "folders": []} and mc["disk"] == {"totalBytes": 1_000_000, "freeBytes": 400_000},
-          "кэш моделей (2.34): сколько последних моделей он держит (1 по умолчанию), сколько занимает скачанное скаутом, сколько лежит "
+          "кэш моделей (2.34): сколько последних моделей он держит (1 по умолчанию), предел в байтах и папка (2.38: предела до выбора "
+          "нет — null), сколько занимает скачанное скаутом, сколько лежит "
           "чужого и что на диске — тот же словарь, что у GET /api/llama-node/cache")
     check(state.get("entryModels") == [] and state["entryModels"] == scout.entry.listing()["data"],
           "модели машины (2.28) — ровно список входа GET /v1/models; ячеек нет — пустой список")

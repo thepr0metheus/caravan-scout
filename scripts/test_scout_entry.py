@@ -5,8 +5,12 @@ The owner, 2026-10-12 (visumap caravan-scout-openai, step 1): a model is called 
 the port of its cell. Pinned here, by value:
 
   * the name of a cell's model: the operator's (MODEL_NAME), the alias, one made of its model, or
-    `cell-<port>` — and that a start gives it at once and its record keeps it;
+    `cell-<port>` — and that a start gives it at once and its record keeps it; a folder of HF's cache by its
+    repository's name (2.37);
   * GET /v1/models: which cells are models, their states, two cells of one model as its copies;
+  * the cells the controller keeps for the machine (2.37, KnownCells): what its answer to a heartbeat says is
+    checked, kept across a failed beat and a restart, forgotten on unpairing; a stopped one is a model of the
+    machine, called what its settings call it now;
   * which copy takes a request: the less busy one, equal ones in turn;
   * the request read once: `model` of a JSON body or of a form, and the same request naming another;
   * the names a running cell answers to — asked of it once per start;
@@ -27,7 +31,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _scout_harness import Checks, Served, make_scout, patched  # noqa: E402
 
-from caravan_scout.entry import (Copies, EntryBody, EntryRequest, MachineEntry, MachineModels,  # noqa: E402
+from caravan_scout.entry import (Copies, EntryBody, EntryRequest, KnownCells, MachineEntry, MachineModels,  # noqa: E402
                                  ModelName, ServedNames)
 from caravan_scout.http import ScoutHandler  # noqa: E402
 
@@ -227,6 +231,13 @@ def test_model_name():
         ({}, "seamless-m4t-v2-large/facebook/FP32", 22003, "seamless-m4t-v2-large",
          "папка от корня моделей — её первая часть"),
         ({}, "/opt/weights/tts-ru/", 22009, "tts-ru", "папка вне models — её последняя часть"),
+        ({}, "whisper/models--Systran--faster-whisper-large-v3-turbo", 22005, "faster-whisper-large-v3-turbo",
+         "defect-history (2.37): папка кэша HF — по имени репозитория, а не по папке раннера «whisper»"),
+        ({}, "/home/u/.cache/huggingface/hub/models--facebook--nllb-200-distilled-600M/snapshots/abc1", 22006,
+         "nllb-200-distilled-600M", "кэш HF по абсолютному пути, со снимком — тоже репозиторий"),
+        ({"MODEL_FILE": "x/models--org--repo/snapshots/h/model-q4.gguf"}, "", 22001, "model-q4",
+         "GGUF внутри кэша HF — по имени файла: квант в нём важнее"),
+        ({}, "/srv/models--only/x", 22009, "x", "negative: «models--» без владельца и репозитория — не кэш HF"),
         ({"MODEL_FILE": "models/a.gguf"}, "/other/b.gguf", 22001, "a", "MODEL_FILE раньше пути из запроса"),
         ({}, "", 22003, "cell-22003", "не из чего — cell-<порт>: имя говорит, что его не дали"),
         (None, "", 0, "", "boundary: ни настроек, ни порта — пусто, не выдумано"),
@@ -281,9 +292,138 @@ def test_listing():
     put(s, 22001, state="stopped", phase="loading", record={"name": "gemma", "startedAt": 1000})
     check(s.entry.listing()["data"][0]["caravan"]["state"] == "starting",
           "состояние модели — лучшее из копий: запускается лучше, чем упала")
-    check(models.copies("gemma") == [{"port": 22001, "name": "gemma", "state": "starting", "since": 1000, "slots": None, "busy": None},
-                                     {"port": 22002, "name": "gemma", "state": "failed", "since": 900, "slots": None, "busy": None}]
+    check(models.copies("gemma") == [{"port": 22001, "name": "gemma", "runner": "llama-server", "state": "starting", "since": 1000,
+                                      "slots": None, "busy": None},
+                                     {"port": 22002, "name": "gemma", "runner": "llama-server", "state": "failed", "since": 900,
+                                      "slots": None, "busy": None}]
           and models.copies("nope") == [], "копии модели по имени; negative: чужое имя — ни одной")
+
+
+def test_runners():
+    CHECKS.section("копии — ячейки одного раннера (2.39):")
+    check([MachineModels.runner(config) for config in ({"RUNNER": " Minicpm-Omni "}, {"RUNNER": 5}, {}, {"RUNNER": " "}, None, "nope")]
+          == ["minicpm-omni", "5", "llama-server", "llama-server", "llama-server", "llama-server"],
+          "раннер — из настроек, в нижнем регистре; настройки без раннера — llama-server, как у контроллера; "
+          "negative: пустой, не словарь — тоже llama-server, не догадка")
+
+    s = make_scout()
+    s.known_cells.take({"cells": [
+        {"port": 22011, "modelPath": "minicpm/MiniCPM-o-4_5-Q4_K_M.gguf", "config": {"ALIAS": "minicpm-o-4_5-q4_k_m"}},
+        {"port": 22024, "modelPath": "minicpm/MiniCPM-o-4_5-Q4_K_M.gguf",
+         "config": {"ALIAS": "minicpm-o-4_5-q4_k_m", "RUNNER": "minicpm-omni"}},
+        {"port": 22003, "modelPath": "gigaam/v3.gguf", "config": {"ALIAS": "gigaam", "RUNNER": "transcribe"}},
+        {"port": 22004, "modelPath": "gigaam/v3.gguf", "config": {"ALIAS": "gigaam", "RUNNER": "Transcribe"}},
+        {"port": 22007, "modelPath": "g/g.gguf", "config": {"ALIAS": "gemma"}},
+        {"port": 22025, "modelPath": "g/g.gguf", "config": {"ALIAS": "gemma", "RUNNER": "llama-server"}},
+        {"port": 22040, "modelPath": "tts/a", "config": {"ALIAS": "tts", "RUNNER": "qwen3-tts"}},
+        {"port": 22041, "modelPath": "tts/a", "config": {"ALIAS": "tts", "RUNNER": "voice-clone"}}]})
+    put(s, 22024, name="minicpm-o-4_5-q4_k_m", record={"startedAt": 50})
+    data = {m["id"]: [c["port"] for c in m["caravan"]["copies"]] for m in s.entry.listing()["data"]}
+    check(data == {"gigaam": [22003, 22004], "gemma": [22007, 22025], "minicpm-o-4_5-q4_k_m@llama-server": [22011],
+                   "minicpm-o-4_5-q4_k_m@minicpm-omni": [22024], "tts@qwen3-tts": [22040], "tts@voice-clone": [22041]},
+          f"defect-history (2026-10-26): чат llama.cpp :22011 и голос MiniCPM-o :22024 с одним именем — две модели, "
+          f"каждая с именем и раннером через @, и так же у остановленных, о которых знает только контроллер (:22040, "
+          f":22041); negative: «llama-server» и раннер не названный, «Transcribe» и «transcribe» — один раннер, копии "
+          f"(got {data})")
+    check(list(data) == ["gigaam", "gemma", "minicpm-o-4_5-q4_k_m@llama-server", "minicpm-o-4_5-q4_k_m@minicpm-omni",
+                         "tts@qwen3-tts", "tts@voice-clone"],
+          "порядок — по первому порту модели")
+    check(s.entry.models.copies("minicpm-o-4_5-q4_k_m") == [] and [c["port"] for c in s.entry.models.copies(
+        "minicpm-o-4_5-q4_k_m@minicpm-omni")] == [22024],
+          "запрос по имени с раннером — к его копии; negative: голое имя двух раннеров не значит ни одну — догадки нет")
+    with Served(s) as srv:
+        status, payload = srv.post("/v1/chat/completions", {"model": "minicpm-o-4_5-q4_k_m"})
+    check(status == 404 and payload["error"]["code"] == "model_not_found",
+          "negative: голое имя двух раннеров — 404 model_not_found, а не запрос в голосовую модель")
+    s.autostart.set(22025, True, {"modelPath": "g/g.gguf", "config": {"PORT": 22025, "ALIAS": "gemma", "RUNNER": "vllm"}})
+    s.autostart.set(22007, True, {"modelPath": "g/g.gguf", "config": {"PORT": 22007, "ALIAS": "gemma", "RUNNER": "vllm"}})
+    s.autostart.set(22030, True, {"modelPath": "q/q.gguf", "config": {"PORT": 22030, "ALIAS": "qwen", "RUNNER": "vllm"}})
+    put(s, 22025, name="gemma", record={"startedAt": 60})
+    runners = {c["port"]: c["runner"] for c in s.entry.models.cells_now() if c["port"] in (22007, 22025, 22030)}
+    put(s, 22050, name="mini", record={"startedAt": 70, "cfg": {"runner": "prism"}})
+    put(s, 22051, name="mini", record={"startedAt": 71, "cfg": {}})
+    runners[22050] = next(c["runner"] for c in s.entry.models.cells_now() if c["port"] == 22050)
+    check([m["id"] for m in s.entry.listing()["data"] if m["id"].startswith("mini@")] == ["mini@prism", "mini@llama-server"],
+          "ячейка, о которой нет ни настроек контроллера, ни запроса, — раннер из записи старта (prism пишет его там); "
+          "negative: запись без раннера — llama-server")
+    check(runners == {22007: "llama-server", 22025: "llama-server", 22030: "vllm", 22050: "prism"},
+          f"раннер ячейки — из настроек контроллера раньше сохранённого запроса автозапуска, у работающей и у "
+          f"остановленной (старт запускает их), и раннер, не названный контроллером, — его llama-server, а не раннер "
+          f"запроса; ячейки без настроек контроллера — из запроса (got {runners})")
+
+    s.known_cells.take({"cells": [
+        {"port": 22011, "modelPath": "minicpm/MiniCPM-o-4_5-Q4_K_M.gguf", "config": {"ALIAS": "minicpm-o-4_5-q4_k_m"}},
+        {"port": 22024, "modelPath": "minicpm/MiniCPM-o-4_5-Q4_K_M.gguf",
+         "config": {"MODEL_NAME": "minicpm-o-4_5-voice", "ALIAS": "minicpm-o-4_5-q4_k_m", "RUNNER": "minicpm-omni"}}]})
+    put(s, 22024, state="stopped", name="minicpm-o-4_5-q4_k_m", record={"startedAt": 50})
+    ids = [m["id"] for m in s.entry.listing()["data"] if m["id"].startswith("minicpm")]
+    check(ids == ["minicpm-o-4_5-q4_k_m", "minicpm-o-4_5-voice"],
+          f"голосу дали своё имя — у чата снова голое имя, без раннера (got {ids})")
+
+
+def test_known_cells():
+    CHECKS.section("ячейки, которые держит контроллер (2.37, KnownCells):")
+    clean = KnownCells.clean([
+        {"port": 22007, "modelPath": "g/b/Q5/g-Q5.gguf", "config": {"ALIAS": "gemma", "API_KEY": "sk-x", "CTX_SIZE": 8192, "N": True}},
+        {"port": 0, "config": {}}, {"port": 70000}, {"port": "22001"}, {"port": True}, "nope",
+        {"port": 22005, "modelPath": 5, "config": "nope"}])
+    check(clean == {22007: {"config": {"ALIAS": "gemma"}, "modelPath": "g/b/Q5/g-Q5.gguf"}, 22005: {"config": {}, "modelPath": ""}},
+          "сказанное по сети проверено: порт — число 1–65535, поля имени — текст; negative: ключ ячейки, чужие поля, "
+          "флаг вместо порта и порт строкой — выкинуты")
+    check(KnownCells.clean(None) is None and KnownCells.clean({"port": 1}) is None and KnownCells.clean([]) == {},
+          "не список — «не сказано» (None), пустой список — «ячеек нет»: отсутствие не рисуется нормой")
+
+    s = make_scout({"controllerUrl": "http://10.0.0.1:7990"})
+    known = s.known_cells
+    check(known.ports() is None and s.entry.models.known is known and s.heartbeat.known is known,
+          "у скаута один список ячеек контроллера — у входа и у пульса; пока контроллер не сказал — None")
+    answers = []
+    s.heartbeat.post_json = lambda url, payload, timeout=5, headers=None: answers.pop(0)
+    s.report.heartbeat = lambda: {"p": 1}
+    answers.append({"ok": True, "host": {"id": "box-a"}, "cells": [
+        {"port": 22005, "modelPath": "large-v3-turbo", "config": {"RUNNER": "whisper", "WHISPER_MODEL": "large-v3-turbo"}},
+        {"port": 22007, "modelPath": "g/b/Q5/g-Q5.gguf", "config": {"ALIAS": "gemma-new"}},
+        {"port": 22010, "modelPath": "q/q/Q8/q-Q8.gguf", "config": {"MODEL_NAME": "vision"}},
+        {"port": 22011, "modelPath": "q/q/Q8/q-Q8.gguf", "config": {"MODEL_NAME": "vision"}}]})
+    s.heartbeat.once()
+    check(sorted(known.ports()) == [22005, 22007, 22010, 22011]
+          and [c["port"] for c in json.loads(s.state.path.read_text(encoding="utf-8"))["knownCells"]] == [22005, 22007, 22010, 22011],
+          "ответ на пульс назвал ячейки машины — они взяты и записаны в state.json: перезапуск их не теряет")
+    answers.append({"ok": True, "host": {"id": "box-a"}})
+    s.heartbeat.once()
+    check(sorted(known.ports()) == [22005, 22007, 22010, 22011],
+          "negative: ответ без списка (контроллер старше 1.3.629) — прежний список остаётся, а не «ячеек нет»")
+
+    put(s, 22007, state="stopped", record={"name": "gemma-old", "startedAt": 700})
+    put(s, 22001, name="embed", record={"startedAt": 900})
+    put(s, 22010, name="vision-was", record={"startedAt": 800})
+    s.autostart.set(22011, True, {"modelPath": "q/q/Q8/q-Q8.gguf", "config": {"PORT": 22011, "ALIAS": "kept-name"}})
+    got = {c["port"]: (c["name"], c["state"]) for c in s.entry.models.cells_now()}
+    check(got == {22001: ("embed", "running"), 22005: ("whisper-large-v3-turbo", "stopped"), 22007: ("gemma-new", "stopped"),
+                  22010: ("vision-was", "running"), 22011: ("vision", "stopped")},
+          f"ячейка, которую скаут не запускал, — модель машины, остановлена; остановленная называется, как её зовут "
+          f"настройки сейчас; работающая — как её запустили (got {got})")
+    check(got[22007][0] == "gemma-new" and got[22011][0] == "vision",
+          "defect-history: остановленная модель, которую переименовали, — под новым именем, и запись прошлого запуска "
+          "или сохранённый запрос автозапуска его не перебивают")
+    data = {m["id"]: m for m in s.entry.listing()["data"]}
+    check(sorted(data) == ["embed", "gemma-new", "vision", "vision-was", "whisper-large-v3-turbo"]
+          and data["whisper-large-v3-turbo"]["caravan"]["copies"] == [{"port": 22005, "state": "stopped", "slots": None, "busy": None}],
+          "GET /v1/models — все модели машины, как LM Studio перечисляет все, что может загрузить")
+    with Served(s) as srv:
+        status, payload = srv.post("/v1/audio/transcriptions", {"model": "whisper-large-v3-turbo"})
+    check(status == 503 and payload["error"]["code"] == "model_not_running"
+          and payload["error"]["message"] == "The model `whisper-large-v3-turbo` is not running on this machine (:22005 stopped)",
+          "запрос к остановленной модели — 503 model_not_running со словами; negative: не 404, модель на машине есть")
+
+    answers.append({"ok": True, "cells": []})
+    s.heartbeat.once()
+    got = {c["port"]: c["state"] for c in s.entry.models.cells_now()}
+    check(known.ports() == {} and got == {22001: "running", 22007: "stopped", 22010: "running", 22011: "stopped"},
+          "контроллер сказал «ячеек нет» — его список пуст; работающие, записанные и с автозапуском остаются, как до 2.37")
+    s.heartbeat.unpair()
+    check(known.ports() is None and "knownCells" not in json.loads(s.state.path.read_text(encoding="utf-8")),
+          "машину отпустили — список забыт вместе с контроллером")
 
 
 def test_places():
@@ -664,7 +804,7 @@ def test_wiring():
 
 
 if __name__ == "__main__":
-    for test in (test_model_name, test_listing, test_places, test_copies, test_request, test_body, test_served_names, test_refusals,
+    for test in (test_model_name, test_listing, test_runners, test_known_cells, test_places, test_copies, test_request, test_body, test_served_names, test_refusals,
                  test_through, test_stream, test_wiring):
         try:
             test()

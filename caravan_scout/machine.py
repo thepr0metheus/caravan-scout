@@ -536,10 +536,64 @@ class Machine:
             index += 1
         return gpus
 
+    #: What a rule of `ufw status` does to a connection coming in: lets it in, or keeps it out.
+    LETS_IN, KEEPS_OUT = ("ALLOW", "LIMIT"), ("DENY", "REJECT")
+    #: The ports of a rule's To: one, a range, a list (`80,443`, `22001:22999`), over TCP, UDP or both.
+    UFW_PORTS = re.compile(r"[0-9][0-9,:]*(?:/(tcp|udp))?")
+
+    @classmethod
+    def ufw_rules(cls, out: str) -> list[tuple[list[str], str, str]]:
+        """The IPv4 rules for connections coming in, as `ufw status` lists them, in its order: (the To column's words, the
+        action, the source). An outgoing or a forwarded rule is not one, nor an IPv6 one: the controller and the network
+        reach a cell over IPv4. A comment is cut off."""
+        rules = []
+        for line in out.splitlines():
+            text = line.split("#", 1)[0]
+            if "(v6)" in text:
+                continue
+            words = text.split()
+            at = next((i for i, w in enumerate(words) if w in cls.LETS_IN + cls.KEEPS_OUT), 0)
+            if not at:
+                continue
+            rest = words[at + 1:]
+            if rest and rest[0] in ("IN", "OUT", "FWD"):
+                if rest[0] != "IN":
+                    continue
+                rest = rest[1:]
+            rules.append((words[:at], words[at], " ".join(rest) or "Anywhere"))
+        return rules
+
+    @classmethod
+    def ufw_covers(cls, to: list[str], port: int) -> bool:
+        """Whether a rule's To holds TCP `port`: its ports name it (one, a range, a list; a UDP rule does not), or it names
+        no port — `Anywhere`, an address of this machine — and so holds every one. An application's profile (OpenSSH) is a
+        name whose ports `ufw status` does not say: not counted, rather than guessed."""
+        if "on" in to:
+            to = to[:to.index("on")]
+        spec = next((w for w in to if cls.UFW_PORTS.fullmatch(w)), None)
+        if spec is None:
+            return bool(to) and all(w == "Anywhere" or "." in w for w in to)
+        ports, _, proto = spec.partition("/")
+        if proto == "udp":
+            return False
+        for part in ports.split(","):
+            low, _, high = part.partition(":")
+            if low.isdigit() and (high or low).isdigit() and int(low) <= port <= int(high or low):
+                return True
+        return False
+
     @classmethod
     def ufw_access(cls, port) -> dict[str, Any]:
-        """Classify who may reach `port` per ufw. {state, allowedFrom[]}.
-        state: open (ufw off) | all | restricted | blocked | unknown."""
+        """Classify who may reach TCP `port` per ufw. {state, allowedFrom[]}.
+        state: open (ufw off) | all | restricted | blocked | unknown.
+
+        As ufw itself decides (2.40): the first rule that holds the port and the caller's address wins. A source named
+        before any rule for everyone is let in or kept out by its rule; the first rule for everyone (`Anywhere`) decides
+        the rest — letting in, it is "all"; keeping out, only the sources let in above it pass ("restricted", or "blocked"
+        when there are none). With no rule for everyone, ufw's own default keeps the rest out. Until 2.40 a rule was read
+        alone, for one port only: a range was not understood, a DENY above an ALLOW did not count, and an outgoing rule
+        read as a source — the owner's rule for the cells' range (step 4, variant B: the controller alone) would have been
+        drawn on the board as the old per-port "ALLOW Anywhere" the scout itself had added, "open to all"."""
         try:
             port = int(port)
         except (TypeError, ValueError):
@@ -549,33 +603,21 @@ class Machine:
             return {"state": "unknown"}
         if "status: inactive" in out.lower():
             return {"state": "open", "allowedFrom": []}
-        anywhere = False
         allowed: list[str] = []
-        for line in out.splitlines():
-            toks = line.split()
-            if not toks:
+        decided: set[str] = set()
+        for to, action, source in cls.ufw_rules(out):
+            if not cls.ufw_covers(to, port):
                 continue
-            to = toks[0].split("/")[0]
-            if not to.isdigit() or int(to) != port:
-                continue
-            up = line.upper()
-            if "ALLOW" not in up:
-                continue
-            frm = line.split("ALLOW", 1)[1].strip()
-            frm = frm.replace("IN", "", 1).split("#")[0].strip()
-            if not frm or frm.lower().startswith("anywhere"):
-                anywhere = True
-            elif "(v6)" not in frm.lower():
-                allowed.append(frm)
-        if anywhere:
-            return {"state": "all", "allowedFrom": ["Anywhere"]}
+            if source == "Anywhere":
+                if action in cls.LETS_IN:
+                    return {"state": "all", "allowedFrom": ["Anywhere"]}
+                break
+            if source not in decided:
+                decided.add(source)
+                if action in cls.LETS_IN:
+                    allowed.append(source)
         if allowed:
-            # dedup preserving order
-            seen, uniq = set(), []
-            for a in allowed:
-                if a not in seen:
-                    seen.add(a); uniq.append(a)
-            return {"state": "restricted", "allowedFrom": uniq}
+            return {"state": "restricted", "allowedFrom": allowed}
         return {"state": "blocked", "allowedFrom": []}
 
     @classmethod

@@ -304,7 +304,12 @@ class Ollama(EngineKind):
 
     #: What configures a server, by name: kept from the run it was learned from.
     ENV_KEPT = ("OLLAMA_", "CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")
-    #: Where Ollama's own archive puts it in a home, and pip-style installs.
+    #: Where Ollama's own installers put it: its archive unpacked in /usr/local (the manual install; install.sh puts the
+    #: binary there too), and /usr. The owner, 2026-10-24: Ollama belongs where it is installed as a rule, so that
+    #: `command -v ollama` finds it — an agent that looked there, in systemctl and in the usual paths, said it was not on
+    #: the machine while the scout ran it from the home.
+    SYSTEM_BINARIES = ("/usr/local/bin/ollama", "/usr/bin/ollama")
+    #: Where Ollama's own archive puts it in a home (how it is installed without root), and pip-style installs.
     HOME_BINARIES = ("ollama/bin/ollama", ".local/bin/ollama", "bin/ollama")
     #: How long a server told to stop gets before it is killed.
     STOP_GRACE = 10.0
@@ -320,8 +325,8 @@ class Ollama(EngineKind):
         return {"exe": exe, "args": ["serve"], "env": env}
 
     def installed(self, home):
-        for relative in self.HOME_BINARIES:
-            exe = Path(home) / relative
+        """How to start the Ollama installed here: the system's places first, then the home's; None when there is none."""
+        for exe in [Path(p) for p in self.SYSTEM_BINARIES] + [Path(home) / relative for relative in self.HOME_BINARIES]:
             if os.access(exe, os.X_OK):
                 return {"exe": str(exe), "args": ["serve"], "env": {}}
         return None

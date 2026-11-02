@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _scout_harness import ROOT, TMP, Checks, FakeRun, patched  # noqa: E402
 
 from caravan_scout import process as process_mod  # noqa: E402
+from caravan_scout.ledger import MemoryLedger  # noqa: E402
 from caravan_scout.process import CellProcess, MemoryScope  # noqa: E402
 
 CHECKS = Checks("scout memory limits")
@@ -163,8 +164,52 @@ def test_the_limits():
           "negative: юнита lama-cell@ у контроллера нет (ушёл в его шаге 6.9) — лимиты живут в одном месте, у скаута")
 
 
+def test_a_scope_covers_the_promise():
+    CHECKS.section("область — не меньше обещанного (2.38.2):")
+    total = 61952  # 60.5 GiB
+    check(MemoryScope.limits(0, total) == MemoryScope.LIMITS and MemoryScope.limits(30000, total) == MemoryScope.LIMITS
+          and MemoryScope.limits(41000, total) == MemoryScope.LIMITS,
+          "без обещания и с обещанием, что с запасом в 2 ГиБ ложится под 70 %, — пределы машины, 70 % и 80 %")
+    check(MemoryScope.limits(44954, total) == ("MemoryHigh=47002M", "MemoryMax=49561M", "MemorySwapMax=2G"),
+          "defect-history (2026-10-26): Strata IQ3_XXS обещала 43,9 ГиБ при MemoryHigh 70 % = 42,3 ГиБ — ядро тормозило её "
+          "загрузку, и oomd убил ячейку на 58 % давления; теперь мягкий предел — обещание + 2 ГиБ, жёсткий — 80 %")
+    check(MemoryScope.limits(52531, total) == ("MemoryHigh=54579M", "MemoryMax=56627M", "MemorySwapMax=2G"),
+          "обещание выше и жёсткого предела (IQ3_S, 51,3 ГиБ): жёсткий — мягкий + 2 ГиБ")
+    check(MemoryScope.limits(60000, total) == ("MemoryHigh=61952M", "MemoryMax=61952M", "MemorySwapMax=2G"),
+          "boundary: дальше памяти машины пределы не растут")
+    meminfo = TMP / "meminfo"
+    meminfo.write_text("MemTotal:       63438848 kB\nMemAvailable:   50000000 kB\n")
+    with patched(MemoryLedger, MEMINFO=meminfo):
+        read = MemoryScope.limits(44954)
+    with patched(MemoryLedger, MEMINFO=TMP / "no-meminfo"):
+        unknown = MemoryScope.limits(44954)
+    check(read == ("MemoryHigh=47002M", "MemoryMax=49561M", "MemorySwapMax=2G"), "память машины — из /proc/meminfo")
+    check(unknown == MemoryScope.LIMITS, "negative: память машины не известна — пределы по умолчанию, не догадка")
+
+    spawns = Spawns()
+    out = io.StringIO()
+    with patched(MemoryScope, _usable=True), patched(MemoryLedger, MEMINFO=meminfo), patched(subprocess, Popen=spawns), \
+            contextlib.redirect_stdout(out):
+        c = CellProcess()
+        c.start_command("exec bash ~/run_strata.sh $PORT m.gguf", {"port": 22028}, ram_mib=44954)
+        spec = c.launch_spec()
+        c._proc = None
+        c.relaunch()
+        CellProcess().start_command("exec bash ~/run_whisper.sh $PORT", {"port": 22024})
+    raised = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+              "-p", "MemoryHigh=47002M", "-p", "MemoryMax=49561M", "-p", "MemorySwapMax=2G", "--"]
+    check(spawns.argv[0] == [*raised, "bash", "-lc", "exec bash ~/run_strata.sh $PORT m.gguf"],
+          "ячейка, обещавшая 43,9 ГиБ, запускается в области, поднятой до обещания")
+    check(spec.get("ramMiB") == 44954 and spawns.argv[1] == spawns.argv[0],
+          "перезапуск после падения — с теми же пределами: обещание записано вместе с запуском")
+    check(spawns.argv[2] == [*SCOPE, "bash", "-lc", "exec bash ~/run_whisper.sh $PORT"],
+          "negative: ячейка без обещания — пределы машины")
+    check(out.getvalue().count("a cell that promised 43.9 GiB runs in a scope of MemoryHigh=47002M MemoryMax=49561M") == 2,
+          "журнал называет поднятую область при каждом запуске")
+
+
 for fn in (test_the_command, test_every_launch_goes_through_it, test_the_probe, test_asked_once,
-           test_the_limits):
+           test_the_limits, test_a_scope_covers_the_promise):
     fn()
 
 sys.exit(CHECKS.finish())

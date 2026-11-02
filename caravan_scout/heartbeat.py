@@ -15,14 +15,23 @@ class Heartbeat:
     pairing — which the CONTROLLER does, from its board — points the scout at
     it and beats once to show whether that works; unpairing lets go. Every
     outcome is written to state.json — the scout's page and /api/state read
-    it there.
+    it there. The controller's answer names the cells it keeps for this
+    machine (1.3.629): they are kept for the entry's list of models (2.37,
+    entry.KnownCells), and forgotten with the controller.
     """
 
-    def __init__(self, config, state, report, cells):
+    def __init__(self, config, state, report, cells, known=None):
         self.config = config
         self.state = state
         self.report = report
         self.cells = cells
+        self.known = known
+
+    def heard(self, answer: dict[str, Any]) -> dict[str, Any]:
+        """A controller's answer to a beat: the cells it keeps for this machine taken, the answer passed on."""
+        if self.known is not None:
+            self.known.take(answer)
+        return answer
 
     def record(self, status: dict[str, Any]) -> None:
         with self.state.lock:
@@ -51,7 +60,7 @@ class Heartbeat:
         if not controller:
             raise AppError("controllerUrl is required")
         url = f"{controller}/api/topology/client-heartbeat"
-        return self.post_json(url, self.report.heartbeat())
+        return self.heard(self.post_json(url, self.report.heartbeat()))
 
     def loop(self) -> None:
         """Beat forever, writing each outcome down. A scout nobody has paired
@@ -115,6 +124,8 @@ class Heartbeat:
         and token and stops beating. Its cells keep running — stopping them
         is a separate request, made before this one when wanted."""
         self.config.unpair()
+        if self.known is not None:
+            self.known.forget()
         self.record({"state": "unpaired"})
         print("[pairing] unpaired: the controller let go of this machine")
         return {"ok": True}

@@ -27,6 +27,11 @@ from caravan_scout.engine_servers import EngineProcs, EngineServers  # noqa: E40
 from caravan_scout.engines import ForeignEngines, LmsCli, LmStudio, Ollama  # noqa: E402
 from caravan_scout.errors import AppError  # noqa: E402
 
+#: Where Ollama is looked for in the system, as the scout has it — and then, for every test here, places under the test's own
+#: folder: an Ollama the machine that runs the tests has in /usr/local/bin is not the test's.
+SYSTEM_BINARIES = Ollama.SYSTEM_BINARIES
+Ollama.SYSTEM_BINARIES = (str(TMP / "no-system/usr/local/bin/ollama"), str(TMP / "no-system/usr/bin/ollama"))
+
 CHECKS = Checks("scout engine servers")
 check = CHECKS.check
 
@@ -147,6 +152,18 @@ def test_kind_recipes():
         executable(Path(home) / "ollama/bin/ollama")
         same(Ollama().installed(home), {"exe": f"{home}/ollama/bin/ollama", "args": ["serve"], "env": {}},
              "установлена в домашнюю папку — рецепт по её месту; архив Ollama (~/ollama) — первым")
+    same(SYSTEM_BINARIES, ("/usr/local/bin/ollama", "/usr/bin/ollama"),
+         "в системе Ollama ищется там, куда её кладут свои установщики: /usr/local/bin (архив в /usr/local, install.sh), /usr/bin")
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as home:
+        system = Ollama()
+        system.SYSTEM_BINARIES = (f"{root}/usr/local/bin/ollama", f"{root}/usr/bin/ollama")
+        executable(Path(home) / "ollama/bin/ollama")
+        executable(Path(root) / "usr/local/bin/ollama")
+        same(system.installed(home), {"exe": f"{root}/usr/local/bin/ollama", "args": ["serve"], "env": {}},
+             "в обычном месте (/usr/local/bin) — первой, даже если в домашней папке лежит своя: владелец, 2026-10-24, "
+             "Ollama — там, где её находит command -v")
+        os.remove(f"{root}/usr/local/bin/ollama")
+        same(system.installed(home)["exe"], f"{home}/ollama/bin/ollama", "negative: в системе её нет — домашняя папка, как раньше")
     lms = LmStudio(cli=Cli())
     same([lms.recipe(None, {"port": 1234, "listen": "loopback"}), lms.recipe(None, {"port": 1235, "listen": "network"}),
           lms.recipe(None, {"port": 1234, "listen": ""})],
@@ -415,6 +432,34 @@ def test_servers_start_stop():
          "negative: не запустился — ничего не запомнено как «поднимать с машиной»")
     same(EngineServers(State(), Procs(), home=TMP / "empty-home").start(Ollama(), 11434),
          "how to start Ollama here is not known", "negative: рецепта нет — так и сказано")
+
+    # The binary moved, as Ollama did from the home to /usr/local (2026-10-24): what was learned from its run stays.
+    home = Path(tempfile.mkdtemp(dir=TMP))
+    moved = executable(Path(tempfile.mkdtemp(dir=TMP)) / "usr/local/bin/ollama")
+    kind = Ollama()
+    kind.SYSTEM_BINARIES = (str(moved),)
+    learned = {"exe": str(home / "ollama/bin/ollama"), "args": ["serve"], "env": {"OLLAMA_HOST": "127.0.0.1:11434"}}
+    state = State({"engineServers": {"ollama": {"recipe": learned, "port": 11434, "autostart": True}}})
+    procs = Procs()
+    servers = EngineServers(state, procs, home=home)
+    same((servers.start(kind, 11434), procs.spawned, state["engineServers"]["ollama"]["recipe"]),
+         ("", [([str(moved), "serve"], {"OLLAMA_HOST": "127.0.0.1:11434"}, "ollama")], {**learned, "exe": str(moved)}),
+         "бинарник переехал (из домашней папки в /usr/local): сервер запускается с нового места с тем же окружением, "
+         "и рецепт запомнен с новым местом — а не «not there to run»")
+    same([v["controls"] for v in EngineServers(State({"engineServers": {"ollama": {"recipe": learned}}}), Procs(), home=home)
+          .annotate((kind,), [], [])], [["start"]], "и выключенный сервер с переехавшим бинарником можно запустить с доски")
+    executable(home / "ollama/bin/ollama")
+    procs = Procs()
+    same((EngineServers(State({"engineServers": {"ollama": {"recipe": learned}}}), procs, home=home).start(kind, 11434),
+          procs.spawned[0][0][0]), ("", str(home / "ollama/bin/ollama")),
+         "negative: выученный бинарник на месте — он и запускается, хоть в системе есть другой")
+    gone = Ollama()
+    gone.SYSTEM_BINARIES = ()
+    procs = Procs()
+    same((EngineServers(State({"engineServers": {"ollama": {"recipe": {**learned, "exe": "/nowhere/ollama"}}}}), procs,
+                        home=TMP / "empty-home").start(gone, 11434), procs.spawned),
+         ("/nowhere/ollama is not there to run", []),
+         "negative: бинарник пропал, а другого нет — так и сказано, ничего не запущено")
     state = State()
     servers = EngineServers(state, Procs(stop_says="process 5100 would not stop"), home=home)
     same((servers.stop(Ollama(), 5100), state.get("engineServers", {}).get("ollama", {}).get("autostart")),

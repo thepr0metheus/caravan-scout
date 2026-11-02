@@ -6,7 +6,8 @@ ran in a Strata cell. The scout read a cell's /metrics as Prometheus text, and S
 text/plain`) — asked without, it answers the JSON of its Monitor tab, where the reader found no sample at all. The cell said no speed, no queue, no
 context use. Pinned here, each with its negative: that the cell is asked the way Prometheus asks; the speeds at the first scrape (the accumulated
 average, the prompt tokens its cache already held left out); the running request's own speeds while it works; the last measured speed held while idle;
-the new work since the last scrape; the queue and the context use; no rate invented from a sample the server does not say; a restart; a JSON answer.
+the new work since the last scrape; the queue and the context use; no rate invented from a sample the server does not say; a restart; a JSON answer;
+a server that answers it keeps no metrics (404, 501 — llama.cpp started without --metrics) says so, and one loading or silent says nothing (2.41).
 """
 import json
 import sys
@@ -275,6 +276,38 @@ def test_strata_speed():
               f"a vLLM server (no `strata:` sample) is still read by the growth of its counters per second: {grown}")
 
 
-for test in (test_prism_idle_and_new_work, test_gauges_and_ports, test_restart_and_absence, test_labels_and_old_servers, test_strata_speed):
+def test_refused():
+    CHECKS.section("a server that keeps no metrics says so (2.41):")
+    import io
+    import urllib.error
+    clock = [1000.0]
+    status = [501]
+
+    def answer(url, **_kw):
+        url = where(url)
+        if url.endswith("/props"):
+            return Response(json.dumps({"n_ctx": 131072}))
+        if status[0] is None:
+            raise OSError("connection refused")
+        raise urllib.error.HTTPError(url, status[0], "no metrics", {}, io.BytesIO(b"Start it with --metrics"))
+
+    probe = ServerProbe(clock=lambda: clock[0])
+    with patched(urllib.request, urlopen=answer):
+        check(probe.metrics(22020) == {"noMetrics": True, "ctxMax": 131072},
+              "llama.cpp started without --metrics answers 501: the reading says the server keeps none, beside its window")
+        status[0] = 404
+        clock[0] += 3
+        check(probe.metrics(22020) == {"noMetrics": True, "ctxMax": 131072}, "a server without the path answers 404: the same")
+        status[0] = 503
+        clock[0] += 3
+        check(probe.metrics(22020) == {"ctxMax": 131072},
+              "negative: 503 (a model still loading) is not \"keeps none\" — it says nothing")
+        status[0] = None
+        clock[0] += 3
+        check(probe.metrics(22020) == {"ctxMax": 131072}, "negative: a server that does not answer says nothing either")
+
+
+for test in (test_prism_idle_and_new_work, test_gauges_and_ports, test_restart_and_absence, test_labels_and_old_servers, test_strata_speed,
+             test_refused):
     test()
 sys.exit(CHECKS.finish())

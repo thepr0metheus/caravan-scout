@@ -14,6 +14,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from caravan_scout.ledger import MemoryLedger
 from caravan_scout.models import SplitGguf
 
 
@@ -35,6 +36,15 @@ class CellLog:
     # own cells from their journal.
     TAIL_LINES = 8
     TAIL_CHARS = 1500
+    #: What the board's window reads of a run (2.36): as many of the last lines as it asks for — VIEW_LINES when it names
+    #: none, VIEW_MAX at most — from at most VIEW_BYTES at the end of the file: the log of a long run is not read whole to
+    #: show its end.
+    VIEW_LINES = 300
+    VIEW_MAX = 2000
+    VIEW_BYTES = 512 * 1024
+    #: The part of a kept run's name between the log's stem and its suffix: the moment rotate put it aside, and a number
+    #: when two runs were put aside in one second.
+    RUN_STAMP = re.compile(r"\d{8}-\d{6}(?:-\d+)?")
     #: What a debugger prints into a crashed server's log after the server's own message (llama.cpp's crash handler runs
     #: gdb): a frame ("#3  0x… in ggml_abort () from …"), a source file it cannot find ("warning: 360\t../csu/libc-start.c:
     #: No such file or directory."), the detach lines. None of it says why the server died, and its "abort", "error" and
@@ -96,6 +106,66 @@ class CellLog:
             return ""
         lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()][-self.TAIL_LINES:]
         return self.scrub("\n".join(lines))[-self.TAIL_CHARS:]
+
+    @classmethod
+    def view_count(cls, n: Any) -> int:
+        """How many lines a view asks for: `n` as a whole number between 1 and VIEW_MAX, VIEW_LINES for anything that is
+        not a number."""
+        try:
+            count = int(str(n).strip())
+        except (TypeError, ValueError):
+            return cls.VIEW_LINES
+        return min(max(count, 1), cls.VIEW_MAX)
+
+    def lines(self, n: Any = None) -> list[str]:
+        """The last `n` lines of the log (view_count), keys scrubbed and blank lines left out: what the board's window
+        shows of a run. [] when there is no log or nothing in it."""
+        if not self.path:
+            return []
+        try:
+            with open(self.path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - self.VIEW_BYTES))
+                text = fh.read().decode("utf-8", errors="replace")
+        except OSError:
+            return []
+        lines = text.splitlines()
+        # Read from the middle of a long file, the first line is the end of a line: it is left out, not shown cut.
+        if size > self.VIEW_BYTES:
+            lines = lines[1:]
+        kept = [ln.rstrip() for ln in lines if ln.strip()]
+        return [self.scrub(ln) for ln in kept[-self.view_count(n):]]
+
+    def runs(self) -> list[dict[str, Any]]:
+        """This log and the logs rotate kept of the runs before it, newest first: [{name, bytes, modifiedAt}]. [] for a
+        process with no log, or when none of them is there."""
+        if not self.path:
+            return []
+        p = Path(self.path)
+        found = [p] if p.is_file() else []
+        try:
+            found += [f for f in p.parent.glob(f"{p.stem}.*{p.suffix}") if f.is_file()
+                      and self.RUN_STAMP.fullmatch(f.name[len(p.stem) + 1:len(f.name) - len(p.suffix)])]
+        except OSError:
+            pass
+        rows = []
+        for f in found:
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            rows.append({"name": f.name, "bytes": int(st.st_size), "modifiedAt": int(st.st_mtime)})
+        return sorted(rows, key=lambda r: r["modifiedAt"], reverse=True)
+
+    def run(self, name: str) -> CellLog | None:
+        """The log of the run named `name`: this log's own file, or a file rotate kept of it (runs). None for any other
+        name — no other file of the folder is read."""
+        if not self.path or not name:
+            return None
+        if any(row["name"] == name for row in self.runs()):
+            return CellLog(Path(self.path).with_name(name))
+        return None
 
     def crash_reason(self) -> str:
         """The reason the process died, keys scrubbed (see _reason)."""
@@ -261,7 +331,11 @@ class MemoryScope:
     the cell.
     """
 
-    LIMITS = ("MemoryHigh=70%", "MemoryMax=80%", "MemorySwapMax=2G")
+    #: The parts of the machine's memory a cell's scope may hold before the kernel throttles it, and before it is killed.
+    HIGH, TOP = 0.70, 0.80
+    LIMITS = (f"MemoryHigh={HIGH:.0%}", f"MemoryMax={TOP:.0%}", "MemorySwapMax=2G")
+    #: Over a cell's promise (MemoryLedger): room for what its own figure leaves out, and again up to the hard limit.
+    MARGIN_MIB = 2048
     # Run inside the scope: the memory.max of the cgroup it runs in.
     READ_LIMIT = 'cat "/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)/memory.max"'
     _usable: bool | None = None
@@ -294,15 +368,43 @@ class MemoryScope:
         return True, f"cells run in their own scope: {' '.join(cls.LIMITS)} (MemoryMax {int(said) / 1e9:.1f} GB)"
 
     @classmethod
-    def command(cls, argv: list[str]) -> list[str]:
-        """`argv` in a transient user scope with the limits."""
-        limits = [arg for limit in cls.LIMITS for arg in ("-p", limit)]
-        return ["systemd-run", "--user", "--scope", "--quiet", "--collect", *limits, "--", *argv]
+    def limits(cls, ram_mib: float = 0, total_mib: float | None = None) -> tuple[str, ...]:
+        """The scope's limits for a cell that promised `ram_mib` MiB resident (MemoryLedger): the machine's HIGH and TOP,
+        raised for a promise above them to the promise and MARGIN, then MARGIN more — never past the machine's memory.
+
+        A promise above MemoryHigh was a cell throttled by its own scope from its first MiB over it: the kernel puts every
+        allocation over memory.high to sleep, and on an idle machine the loading cell is the only busy task of the user's
+        session, so its sleeps are the whole session's memory pressure. systemd-oomd killed it at 58 %: Strata's IQ3_XXS
+        promised 43.9 GiB and its scope had 42.3 GiB of MemoryHigh (memory.events: high 3469; 2026-10-26), and the
+        watchdog's retry got through at 49.97 % of oomd's 50 %. The start is allowed by the promise (MemoryLedger), so
+        the scope is sized by it too. The machine's memory not known: the defaults, not a guess."""
+        if ram_mib <= 0:
+            return cls.LIMITS
+        total = total_mib if total_mib is not None else MemoryLedger.meminfo().get("MemTotal", 0)
+        if not total:
+            return cls.LIMITS
+        high = max(total * cls.HIGH, ram_mib + cls.MARGIN_MIB)
+        top = min(total, max(total * cls.TOP, high + cls.MARGIN_MIB))
+        if high <= total * cls.HIGH:
+            return cls.LIMITS
+        return (f"MemoryHigh={int(min(high, top))}M", f"MemoryMax={int(top)}M", cls.LIMITS[2])
 
     @classmethod
-    def wrap(cls, argv: list[str]) -> list[str]:
-        """The command as it is launched: in a limited scope when one can be made."""
-        return cls.command(argv) if cls.usable() else list(argv)
+    def command(cls, argv: list[str], limits: tuple[str, ...] | None = None) -> list[str]:
+        """`argv` in a transient user scope with the limits (the machine's, when none are given)."""
+        props = [arg for limit in (limits or cls.LIMITS) for arg in ("-p", limit)]
+        return ["systemd-run", "--user", "--scope", "--quiet", "--collect", *props, "--", *argv]
+
+    @classmethod
+    def wrap(cls, argv: list[str], ram_mib: float = 0) -> list[str]:
+        """The command as it is launched: in a limited scope when one can be made, sized for the memory the cell
+        promised (limits); a scope raised over the machine's limits is said in the journal."""
+        if not cls.usable():
+            return list(argv)
+        limits = cls.limits(ram_mib)
+        if limits != cls.LIMITS:
+            print(f"[cells] a cell that promised {ram_mib / 1024:.1f} GiB runs in a scope of {' '.join(limits)}", flush=True)
+        return cls.command(argv, limits)
 
 
 class CellProcess:
@@ -364,12 +466,13 @@ class CellProcess:
 
     def start(self, bin_path: str, args: list[str], cfg: dict[str, Any],
               log_path: Path | None = None,
-              extra_env: dict[str, str] | None = None) -> dict[str, Any]:
+              extra_env: dict[str, str] | None = None, ram_mib: float = 0) -> dict[str, Any]:
         """Launch llama-server. `args` is the full token list after the binary
         (already includes --model/--host/--port). `cfg` is metadata surfaced by
         status() (modelPath, port, gpuLayers, ctxSize). `extra_env` is set on
         the process over the scout's own environment, and kept with the
-        launch, so a restart after a crash starts it the same way."""
+        launch, so a restart after a crash starts it the same way; so is
+        `ram_mib`, the memory the start promised (MemoryScope.limits)."""
         with self._lock:
             if self._running_locked():
                 return {"ok": False, "error": "llama-server is already running",
@@ -386,7 +489,7 @@ class CellProcess:
             try:
                 log_fh = CellLog(log_path).open_new()
                 self._proc = subprocess.Popen(
-                    MemoryScope.wrap(cmd),
+                    MemoryScope.wrap(cmd, ram_mib),
                     stdout=log_fh,
                     stderr=subprocess.STDOUT if log_path else subprocess.DEVNULL,
                     close_fds=True,
@@ -398,7 +501,7 @@ class CellProcess:
                 self._log = CellLog(log_path)
                 self._exit_info = None
                 self._launch = {"argv": [str(a) for a in cmd], "extraEnv": dict(extra_env or {}),
-                                "log": str(log_path or "")}
+                                "log": str(log_path or ""), **({"ramMiB": int(ram_mib)} if ram_mib else {})}
                 return {"ok": True, "pid": self._proc.pid, "port": cfg.get("port")}
             except Exception as exc:
                 self._last_error = str(exc)
@@ -407,7 +510,7 @@ class CellProcess:
 
     def start_command(self, shell_command: str, cfg: dict[str, Any],
                       log_path: Path | None = None,
-                      extra_env: dict[str, str] | None = None) -> dict[str, Any]:
+                      extra_env: dict[str, str] | None = None, ram_mib: float = 0) -> dict[str, Any]:
         """Launch a generic command cell via bash. `shell_command` is a full
         shell line that sets $PORT and `exec`s the real process, so the tracked
         PID is the server itself, not bash. Managed exactly like a llama-server
@@ -421,7 +524,7 @@ class CellProcess:
             try:
                 log_fh = CellLog(log_path).open_new()
                 self._proc = subprocess.Popen(
-                    MemoryScope.wrap(cmd),
+                    MemoryScope.wrap(cmd, ram_mib),
                     stdout=log_fh,
                     stderr=subprocess.STDOUT if log_path else subprocess.DEVNULL,
                     close_fds=True,
@@ -432,7 +535,8 @@ class CellProcess:
                 self._last_error = ""
                 self._log = CellLog(log_path)
                 self._exit_info = None
-                self._launch = {"argv": list(cmd), "extraEnv": dict(extra_env or {}), "log": str(log_path or "")}
+                self._launch = {"argv": list(cmd), "extraEnv": dict(extra_env or {}), "log": str(log_path or ""),
+                                **({"ramMiB": int(ram_mib)} if ram_mib else {})}
                 return {"ok": True, "pid": self._proc.pid, "port": cfg.get("port")}
             except Exception as exc:
                 self._last_error = str(exc)
@@ -457,7 +561,7 @@ class CellProcess:
             try:
                 log_fh = CellLog(log_path).open_new()
                 self._proc = subprocess.Popen(
-                    MemoryScope.wrap(list(spec["argv"])),
+                    MemoryScope.wrap(list(spec["argv"]), float(spec.get("ramMiB") or 0)),
                     stdout=log_fh,
                     stderr=subprocess.STDOUT if log_path else subprocess.DEVNULL,
                     close_fds=True,
@@ -515,6 +619,12 @@ class CellProcess:
             self._cfg = {}
             self._started_at = 0
             return {"ok": True}
+
+    @property
+    def log(self) -> CellLog:
+        """The log this process writes: a CellLog of nothing before its first start."""
+        with self._lock:
+            return self._log
 
     def log_tail(self) -> str:
         """The last lines of this cell's log (CellLog.tail)."""
@@ -792,6 +902,32 @@ class HostProcesses:
                         found.append(kid)
                         todo.append(kid)
         return found
+
+    @classmethod
+    def bytes_read(cls, pids: Any) -> int | None:
+        """What the processes `pids` have read so far, in bytes (2.43): for each, the larger of what it read by calls (rchar —
+        a model read into memory, from disk or from the page cache) and of what it fetched from storage (read_bytes — the pages
+        of a mapped model, llama.cpp's default, count only here). A loading cell's reading of its model, so the board can say
+        how far it is and how fast; its libraries and its /proc reads are megabytes against gigabytes. A mapped model already in
+        the page cache costs no read at all, and loads in seconds. None where /proc says nothing (macOS, processes gone)."""
+        total, told = 0, False
+        for pid in pids or ():
+            try:
+                lines = (cls.PROC / str(int(pid)) / "io").read_text(encoding="ascii").splitlines()
+            except (OSError, TypeError, ValueError):
+                continue
+            counts = {}
+            for line in lines:
+                key, _, value = line.partition(":")
+                if key in ("rchar", "read_bytes"):
+                    try:
+                        counts[key] = int(value)
+                    except ValueError:
+                        pass
+            if counts:
+                told = True
+                total += max(counts.values())
+        return total if told else None
 
     @classmethod
     def resident(cls, pid: Any, table: dict[int, dict[str, Any]] | None) -> int | None:

@@ -1,5 +1,9 @@
 # Caravan Scout
 
+> **This repository is archived.** The scout moved into the `lama-caravan` repository, folder
+> `rust/crates/scout`, and is written in Rust there. A controller hands it out: **＋ Add scout** on the
+> board gives one command. What stands here is the last Python scout, 2.43.0, kept for its history.
+
 The hardware sidecar of the [LAMA CARAVAN](https://github.com/thepr0metheus/lama-caravan)
 control plane: one small service on each machine that lends its GPU or CPU to
 the fleet. **Formerly known as `llm-easy-route-agent`** — if you see that
@@ -220,14 +224,14 @@ python3 -m caravan_scout.app --config config.json --state state.json
 | `displayName` | The name the board shows. Leave it out to follow the machine's hostname, live. |
 | `controllerUrl` | The LAMA CARAVAN admin URL the heartbeat posts to — written by the controller when it adds the scout. |
 | `llamaServerBin` | Path to the `llama-server` binary (set by `install.sh`). |
-| `modelsBasePath` | Local cache dir for downloaded models. The scout deletes only files it downloaded there, so it may point at a shared folder. |
+| `modelsBasePath` | Local cache dir for downloaded models. The scout deletes only files it downloaded there, so it may point at a shared folder. A folder chosen on the machine's page (2.38, an HDD say) comes before it. |
 | `controllerToken` | The fleet token, when the controller has sign-in enabled (the controller hands it over when it adds the scout). |
 
 ## API
 
 See [docs/http-api.md](docs/http-api.md). In one line each: GET
 `health · pairing · state · llama-node/status · monitor/nvidia-smi · host/listeners ·
-llama-node/configs · llama-node/list-cache · llama-node/update-status ·
+llama-node/configs · llama-node/list-cache · llama-node/log · llama-node/update-status ·
 llama-node/builds`; POST `controller-url · unpair · heartbeat · llama-node/start ·
 llama-node/stop · llama-node/update · llama-node/restore ·
 llama-node/purge-cache · llama-node/configs/delete · host/reboot ·

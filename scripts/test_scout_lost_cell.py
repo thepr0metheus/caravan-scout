@@ -479,6 +479,7 @@ def test_the_ledger():
     # A cell that promised 38000 and is still loading: its memory has not come, its promise has.
     first = s.cells.at(22010)
     first.ram_mib = 38000
+    s.cells.at(22010)
     s.cells.report(22010, phase="loading")
     with Rig(meminfo=meminfo("loading", 61952, 52000)):
         second = MemoryLedger(s.cells).short(PORT, want)
@@ -489,6 +490,7 @@ def test_the_ledger():
           "defect-history: a second cell that keeps its weights in RAM, started while the first still LOADS — the kernel "
           "still says 50 GiB are available, and the promise is what refuses it, naming the cell to stop")
     check(same_port is None, "negative: a cell's own promise does not count against itself (a start of the same port)")
+    s.cells.at(22010)
     s.cells.report(22010, phase="idle")
     with Rig(meminfo=meminfo("idle", 61952, 52000)):
         check(MemoryLedger(s.cells).short(PORT, want) is None, "negative: a cell that is not up and not starting promises nothing")
@@ -528,6 +530,17 @@ def test_a_start_that_promises_memory():
     with Rig(FakeHost({disk_cells(s)[str(PORT)]["pid"]: SERVER_ARGV}), proc=fake_proc("promise", {7070: {"mark": PORT, "ppid": 1}})):
         s2.cells.adopt_survivors()
     check(s2.cells.by_port[PORT].ram_mib == 38000, "an adopted cell is still known as the one that promised 37 GiB")
+    check(s.cells.by_port[PORT].process.launch_spec().get("ramMiB") == 38000
+          and s2.cells.by_port[PORT].process.launch_spec().get("ramMiB") == 38000,
+          "the launch carries the promise (2.38.2): its scope is sized by it, and a relaunch after a crash — after a restart "
+          "of the scout too — gets the same scope")
+    rec = disk_cells(s)[str(PORT)]
+    old = {**rec, "launch": {k: v for k, v in rec["launch"].items() if k != "ramMiB"}}
+    s3 = make_scout({}, {"cells": {str(PORT): old}})
+    with Rig(FakeHost({rec["pid"]: SERVER_ARGV}), proc=fake_proc("promise-old", {7070: {"mark": PORT, "ppid": 1}})):
+        s3.cells.adopt_survivors()
+    check(s3.cells.by_port[PORT].process.launch_spec().get("ramMiB") == 38000,
+          "a record written before 2.38.2 keeps the promise beside its launch: the adoption puts it into the launch")
     with Rig(FakeHost({7070: SERVER_ARGV}), meminfo=meminfo("two-strata", 61952, 52000)):
         second = s2.cells.start({**payload, "config": {"PORT": 22011}})
     check(second.get("ok") is False and "that is more than 90% of the machine's 60.5 GiB — stop :22009 first" in second.get("error", ""),

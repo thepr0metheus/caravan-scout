@@ -9,16 +9,36 @@ import signal
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
 from caravan_scout.cache_keeper import CacheKeeper
-from caravan_scout.models import ModelFetcher
-from caravan_scout.process import CellProcess, HostProcesses
+from caravan_scout.models import CacheFolder, CopyPace, ModelFetcher
+from caravan_scout.process import CellLog, CellProcess, HostProcesses
 from caravan_scout.prism import PrismRuntime
 from caravan_scout.starts import CellStart
 from caravan_scout.watchdog import Watchdog
+
+class RunPace:
+    """How fast a cell's run reads (2.43): the window of its bytes read (CopyPace), kept for one process — a new run of the cell
+    starts the window again, and a count that went back (a child that left) does too."""
+
+    def __init__(self, clock: Callable[[], float] | None = None):
+        self.clock = clock
+        self.pid = 0
+        self.pace = CopyPace(clock)
+
+    def read(self, pid: Any, done: int | None) -> int | None:
+        """The run's bytes read now; its pace over the last seconds, or None while not measured."""
+        if done is None:
+            return None
+        if pid != self.pid:
+            self.pid, self.pace = pid, CopyPace(self.clock)
+        self.pace.add(done)
+        return self.pace.rate()
+
 
 class Cell:
     """One cell on one port: its process, how its start is going, and whether
@@ -45,6 +65,12 @@ class Cell:
         # that made it — said from the start's first moment, so a model being loaded is found by its
         # name as "starting"; "" for a cell no start of this scout made (its record keeps the name).
         self.name = ""
+        # The files its present start asked the cache for, as the controller named them (Cells.asks): what its stop lets go of
+        # when it keeps no cache. [] for a start that asked for none — a cell in an engine — and for a cell no start of this
+        # scout made (one adopted after a restart): its stop lets go of nothing, and the keeper trims the cache in its time.
+        self.asked: list[str] = []
+        # How fast its run reads its model while it loads (2.43): the board's load line.
+        self.reading = RunPace()
 
 
 class ServerProbe:
@@ -70,7 +96,9 @@ class ServerProbe:
     rate. Lines with labels (vLLM's engine, model) are summed per name.
 
     A server that does not answer says nothing: no metrics, a window of 0 —
-    and that silence is kept as long as an answer would be.
+    and that silence is kept as long as an answer would be. A server that
+    answers it keeps none (404, 501 — llama.cpp started without --metrics)
+    says that: `noMetrics` (2.41).
     """
 
     #: Read as they are: Prometheus name -> the view's key.
@@ -115,7 +143,8 @@ class ServerProbe:
     def metrics(self, port) -> dict[str, Any]:
         """Scrape the cell's /metrics (Prometheus) for live token rates and
         its queue. Cached ~2s. Returns {promptTps, genTps, requestsProcessing,
-        requestsWaiting (vLLM)} — each only when the server says it."""
+        requestsWaiting (vLLM)} — each only when the server says it — or
+        {noMetrics: True} when it answers that it keeps none."""
         now = self.now()
         hit = self._metrics.get(port)
         if hit and now - hit[0] < 2:
@@ -149,6 +178,11 @@ class ServerProbe:
                         counted[name] = counted.get(name, 0.0) + num
                     elif any(name in pair for pair in self.TIMED_COUNTERS.values()):
                         timed[name] = timed.get(name, 0.0) + num
+        except urllib.error.HTTPError as refused:
+            # The server answered and keeps no metrics: llama.cpp started without --metrics says 501, a server without the path
+            # 404. Said out loud (2.41), so the board says the speed is not measured — not that no request came, which is what an
+            # empty reading drew on Hermes's window (2026-10-26). Any other refusal (503 while a model loads) says nothing.
+            out, counted, timed, strata = ({"noMetrics": True} if refused.code in (404, 501) else {}), {}, {}, {}
         except Exception:
             out, counted, timed, strata = {}, {}, {}, {}
         if any(name.startswith("strata:") for name in strata):
@@ -336,10 +370,10 @@ class CellRecords:
 class Cells:
     """The cells of this machine by port, and how each looks from outside.
 
-    A cell comes into being the first time anything starts, reports or asks
-    about its port, and goes when it is stopped (drop). Its identity is the
-    cancellation token of a start: a start that finds its Cell replaced knows
-    it was stopped while it worked.
+    A cell comes into being the first time anything starts or asks about its
+    port, and goes when it is stopped (drop). Its identity is the cancellation
+    token of a start: a start that finds its Cell replaced knows it was
+    stopped while it worked.
     """
 
     def __init__(self, machine, config, state):
@@ -353,9 +387,9 @@ class Cells:
         self.prism = PrismRuntime(config)
         # The model files are the cells': downloads report into a cell's
         # startup record, and a purge keeps what a running cell holds.
-        self.models = ModelFetcher(config, self.report)
-        # How many models the cache keeps, and the trim to it: asks the cells at the moment it deletes.
-        self.keeper = CacheKeeper(state, self.models, held=self.held_files, live=self.live_ports)
+        self.models = ModelFetcher(config, self.report, folder=CacheFolder(state))
+        # How much the cache keeps, the trim to it and the move of its folder: asks the cells at the moment it deletes.
+        self.keeper = CacheKeeper(state, self.models, held=self.held_files, live=self.live_ports, loading=self.loading_ports)
 
     def at(self, port) -> Cell:
         """The cell on `port`, made on first use."""
@@ -387,11 +421,67 @@ class Cells:
         with self._lock:
             return self.by_port.get(int(port)) is cell
 
-    def report(self, port, **fields: Any) -> None:
-        """A start says how it is going: fields merged into the cell's record."""
-        cell = self.at(port)
+    def report(self, port, **fields: Any) -> bool:
+        """A start says how it is going: fields merged into the record of the
+        cell that is there. True when they were kept.
+
+        A report never makes a cell. A start that was stopped goes on copying
+        its model to the end of the file, and each report of that copy used to
+        make the stopped port's cell again: "downloading", then "loading", a
+        start under way for good with nothing behind it. The board showed the
+        last file at 100 % with no way to start, and a new start was refused
+        "already in progress" until another stop came (2026-10-19: seamless on
+        :22008, a checkpoint of 12 files, stopped on its way). What reports is
+        the start that holds the cell (`holds`); the one that does not is
+        late, and its words are dropped.
+        """
+        with self._lock:
+            cell = self.by_port.get(int(port))
+        if cell is None:
+            return False
         with cell.lock:
             cell.startup.update(fields)
+        return True
+
+    #: The names of a cell's log in the model cache, by what it runs (starts.py names them so).
+    LOG_NAMES = ("llama-server.{port}.log", "command-cell.{port}.log")
+
+    def log_file(self, port: int) -> CellLog:
+        """Where the cell on `port` writes: its process's log while this scout holds the process, the log its record names
+        after a restart, else a log of its name in the model cache (the cell was started before this scout knew it). A
+        CellLog of nothing when none of them is there.
+
+        Asked WITHOUT at(), which would make an empty cell of a port nobody started."""
+        with self._lock:
+            cell = self.by_port.get(int(port))
+        if cell is not None and cell.process.log.path:
+            return cell.process.log
+        rec = self.records.get(int(port))
+        if rec.get("log"):
+            return CellLog(Path(rec["log"]))
+        for name in self.LOG_NAMES:
+            path = self.models.cache_dir() / name.format(port=int(port))
+            if path.is_file():
+                return CellLog(path)
+        return CellLog(None)
+
+    def log(self, port, lines=None, run="") -> dict[str, Any]:
+        """What the cell on `port` wrote (2.36, the board's window): the last lines of a run — the newest when `run`
+        names none — and the runs there are to read, newest first. {ok: false, error} for a port that is not a number or
+        has no log here, and for a name that is not one of its runs."""
+        try:
+            port = int(str(port).strip())
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "port must be a number"}
+        log = self.log_file(port)
+        runs = log.runs()
+        if not runs:
+            return {"ok": False, "error": f"no log of a cell on port {port} here"}
+        name = str(run or "") or runs[0]["name"]
+        chosen = log.run(name)
+        if chosen is None:
+            return {"ok": False, "error": f"{name!r} is not a log of the cell on port {port}"}
+        return {"ok": True, "port": port, "run": name, "lines": chosen.lines(lines), "runs": runs}
 
     def startup(self, port) -> dict[str, Any]:
         """A copy of the cell's startup record."""
@@ -416,10 +506,17 @@ class Cells:
         if st.get("running"):
             p = st.get("port") or port
             metrics = self.probe.metrics(p) if p else {}
+            pids = self.processes.descendants(st.get("pid"))
+            # What its processes have read, how fast, and of how much (2.43): a loading cell's progress. Said for every running
+            # cell; the board shows it while the cell loads.
+            read = self.processes.bytes_read([st.get("pid"), *pids])
+            with cell.lock:
+                pace = cell.reading.read(st.get("pid"), read)
             view = {**st, "port": p, "phase": "running", **metrics,
                     # The processes it started (2.31): the card's memory may be
                     # a child's — Strata's engine under its server.
-                    "pids": self.processes.descendants(st.get("pid")),
+                    "pids": pids,
+                    "readBytes": read, "readBytesPerSec": pace, "modelBytes": startup.get("modelBytes"),
                     # The memory its processes hold in RAM (2.35), their RSS in bytes: the card's row says it beside the video memory.
                     # None when ps did not answer — "not told", never a zero.
                     "ramBytes": self.processes.resident(st.get("pid"), (table or self.machine.processes)()),
@@ -458,6 +555,8 @@ class Cells:
                 "downloadedBytes": startup.get("downloadedBytes", 0),
                 "totalBytes": startup.get("totalBytes", 0),
                 "downloadingFile": startup.get("downloadingFile", ""),
+                # How fast the copy goes, bytes a second over its last seconds (CopyPace, 2.42); None while not measured.
+                "downloadBytesPerSec": startup.get("downloadBytesPerSec"),
                 "startedAt": startup.get("startedAt"),
             }
         if phase == "error":
@@ -489,6 +588,19 @@ class Cells:
 
     #: The phases of a start that has asked the cache for its files and not let go of them.
     STARTING = ("resolving", "downloading", "loading", "running")
+    #: The phases of a start whose files are still coming — found, copied, read: the cache's folder does not move under them.
+    LOADING = ("resolving", "downloading", "loading")
+
+    def loading_ports(self) -> set[int]:
+        """The ports whose start is still bringing its files (LOADING): a cell that runs has its weights loaded, and its open
+        files outlive their names."""
+        ports: set[int] = set()
+        for port, cell in self.all():
+            with cell.lock:
+                phase = str(cell.startup.get("phase") or "")
+            if phase in self.LOADING:
+                ports.add(int(port))
+        return ports
 
     def live_ports(self) -> set[int]:
         """The ports whose cell is starting or running: the files its start asked for are in use, though its process may not run
@@ -581,10 +693,14 @@ class Cells:
         its cell already running all end here."""
         cell = self.at(port)
         log = rec.get("log") or ""
+        launch = rec.get("launch")
+        # A record written before 2.38.2 keeps the promise beside its launch, not in it: the relaunch reads it there.
+        if launch and rec.get("ramMiB") and "ramMiB" not in launch:
+            launch = {**launch, "ramMiB": int(rec.get("ramMiB") or 0)}
         cell.process.adopt(pid, dict(rec.get("cfg") or {}),
                            log_path=Path(log) if log else None,
                            started_at=int(rec.get("startedAt") or 0),
-                           launch=rec.get("launch"))
+                           launch=launch)
         cell.cache_models = bool(rec.get("cacheModels"))
         cell.ram_mib = int(rec.get("ramMiB") or 0)
         self.report(port, phase="running", error="")
@@ -681,7 +797,7 @@ class Cells:
         process."""
         ports = [int(port)] if port else [p for p, _ in self.all()]
         results = []
-        purge_any = False
+        own: set[Path] = set()
         for p in ports:
             cell = self.at(p)
             res = cell.process.stop()
@@ -693,9 +809,14 @@ class Cells:
             if not res.get("ok"):
                 continue
             self.report(p, phase="idle", error="", downloadedBytes=0, totalBytes=0)
-            # Don't keep models on client disks (unless caching is on).
-            if not cell.cache_models:
-                purge_any = True
+            # A cell that keeps no cache lets go of its own models when a stop stopped it — the files its present start asked
+            # for (own_files) — and of nothing else: the rest of the cache is the keeper's. A stop of nothing ("not running", no
+            # listener reclaimed) lets go of nothing: the board removes a stopped cell with one more stop, `at` made the cell
+            # afresh with caching off, and the purge that followed deleted every cached model no running cell held — 116 GB at
+            # one "Remove cell"; a stop of an Ollama cell, whose model lives in the engine, deleted 92 GB more, and 101.5 GB
+            # again once its port's past starts counted as its own (2026-10-26).
+            if not cell.cache_models and res.get("detail") != "not running":
+                own |= self.own_files(cell)
             self.drop(p)   # a stopped cell disappears from the fleet view
             self.records.forget(p)
             # What it made from its model (CARAVAN_CELL_SCRATCH) goes the way
@@ -705,15 +826,29 @@ class Cells:
                     self.models.clear_scratch(p)
                 except OSError:
                     pass
-        # Purge once, after the stopped cells are dropped, via the SAFE variant
-        # so a model still served by another running cell isn't evicted
-        # (stopping whisper must not delete the translator gguf).
-        if purge_any:
+        # Once, after the stopped cells are dropped, keeping what a running cell holds: a model still served by another cell is
+        # not evicted (stopping whisper must not delete the translator gguf).
+        if own:
             try:
-                self.purge_models_safely()
+                self.models.release(own, keep=self.held_files())
             except Exception:
                 pass
         return results[0] if len(results) == 1 else {"ok": True, "results": results}
+
+    def asks(self, port, files) -> None:
+        """A start of `port` asks the cache for `files`: the keeper's log hears of it before the first byte is copied — a trim
+        that another start's end triggers must find them wanted, whole or half copied — and the cell keeps the list, what its
+        stop lets go of (own_files)."""
+        names = [str(f).strip() for f in files if str(f or "").strip()]
+        self.at(port).asked = names
+        self.keeper.begin(port, names)
+
+    def own_files(self, cell) -> set[Path]:
+        """The files `cell`'s present start asked the cache for, where they are on this machine — every part of a split GGUF, the
+        projector, the draft, a folder; none for a start that asked for none (a cell in an engine) or a cell no start of this
+        scout made. Not the keeper's log by port: a port outlives its cells, and an Ollama cell made on the port of deleted test
+        cells let go of their models — 101.5 GB of the library's copies on the controller's machine (2026-10-26)."""
+        return self.keeper.files_of({"files": cell.asked}) if cell.asked else set()
 
     def _reclaim(self, port: int, res: dict[str, Any]) -> dict[str, Any]:
         """"not running" from a process with no handles means it consulted

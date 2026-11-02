@@ -1,5 +1,248 @@
 # Changelog
 
+## 2.43.0 — 2026-10-26
+
+- **A loading cell says how far it has read its model, how fast, and of how much.** The owner, shown the copy of a model with
+  its speed: "and at what speed it loads into memory — do it, I want it to work". The controller measured that for its own
+  cells until they moved to their machines' scouts; now the scout does, for every runner. The kernel counts a process's
+  reading: /proc/<pid>/io says what it read by calls (rchar — a model read into memory, from disk or from the page cache) and
+  what it fetched from storage (read_bytes — the pages of a mapped model, llama.cpp's default, count only there). A running
+  cell's view says `readBytes` — the larger of the two for each of its processes, summed — `readBytesPerSec` over the run's
+  last seconds (CopyPace, kept per run: a new process starts again) and `modelBytes`, what its files weigh here, measured by
+  its start (every part of a split GGUF, everything in a folder). A mapped model already in the page cache costs no read and
+  loads in seconds; a cell adopted after a restart says no weight. Checked: `test_scout_load.py` (new: the counts, the weight,
+  the pace of a run), `test_scout_cells.py` (the view carries the three; an adopted cell no weight; a start measures its
+  files), the report sample, whose llama.cpp cell now says a measured reading pace (a field null everywhere in it could not be shown to reach the controller's record); 8 mutants, 8 red.
+
+## 2.42.0 — 2026-10-26
+
+- **A copy of a model says how fast it goes.** The owner, shown a cell's window that read "Downloading the model …
+  4.6/87.2 GB · 5%": "show at what speed it downloads". The scout copies the file and knows its bytes and its time:
+  `CopyPace` keeps a sample of the bytes copied every quarter second over the copy's last ten seconds, and the cell's start
+  record says `downloadBytesPerSec` beside `downloadedBytes`; the cell's view carries it while it copies. Not measured — the
+  first two seconds of a file, a copy shorter than that — is `null`, never a 0; a count that went back (another file, a
+  retry) starts the window again. Checked: `test_scout_models.py` (no rate before two seconds; the window's bytes over its
+  time; a step a moment after another not kept; the old speed leaves the window; a count that went back; a copy of 8 MiB a
+  half second says 16 MiB/s by the scout's own clock, and the end says the whole copy's), `test_scout_cells.py` (the view carries it, null while not measured); 7 mutants, 7 red.
+
+## 2.41.0 — 2026-10-26
+
+- **A cell whose server keeps no metrics says so.** Hermes answered, and its window on the board said no request had been
+  measured: the cell was started without `--metrics`, its server answered `/metrics` with 501, and the scout read that as
+  an empty reading — the same as a cell nobody asked yet. Now a server that answers it keeps none (404, 501) gives the cell
+  `noMetrics: true` in `llamaNodes`, and the board says the speed is not measured; a server still loading (503) or not
+  answering says nothing, as before. The controller starts llama.cpp cells with `--metrics` by default since 1.3.658.
+  Checked: `test_scout_metrics.py` (501 and 404 — `noMetrics` beside the window from /props; 503 and no answer — nothing).
+
+## 2.40.0 — 2026-10-26
+
+- **The cells' ports are the owner's firewall rule; the scout reads ufw as ufw decides.** Step 4 of the owner's plan
+  (Papyrus `caravan-scout-openai`), variant B, chosen on 2026-10-26: the ports stay, and the firewall lets only the
+  controller reach them — one rule of the owner's for the whole range, the one install.sh has always named. Two things
+  of the scout's undid it. Every cell start ran `sudo -n ufw allow <port>`, opening that port to the whole network; now no
+  start touches ufw. And `Machine.ufw_access` read each rule alone, for one port only: a range was not understood, a
+  DENY above an ALLOW did not count, an outgoing rule read as a source — the owner's range rule would have been drawn on
+  the board as the per-port "ALLOW Anywhere" an older start left under it, "open to all". Now the first rule that holds
+  the port and the caller decides, as in ufw: ranges and lists of ports, rules for every port (`Anywhere`, an address,
+  on an interface), LIMIT as letting in; an outgoing, a forwarded, a UDP or an IPv6 rule, and an application's profile
+  whose ports `ufw status` does not say, are not counted; with no rule for everyone ufw's default keeps the rest out.
+  Checked: `test_scout_hw.py` (the owner's two rules over a per-port "ALLOW Anywhere" — only the controller; the range's
+  edges and the scout's port; a port outside it; rules for every port, with a destination address and on an interface;
+  UDP, an application's profile, LIMIT; a source denied by its first rule; the same port without the deny — open to all;
+  the old as-is pins of a range and of an outgoing rule now read right), `test_scout_cells.py` (a start asks the host
+  for its port and runs no ufw); 10 mutants, 10 red.
+
+## 2.39.0 — 2026-10-26
+
+- **A model's copies are cells of one runner.** The machine's entry grouped its cells by the model's name alone, so the
+  llama.cpp chat on :22011 and MiniCPM-o's voice on :22024 — one GGUF, one name, `minicpm-o-4_5-q4_k_m` — were listed as
+  two copies of one model, and a chat request could be handed to the voice server. Step 3 of the owner's plan (Papyrus
+  `caravan-scout-openai`) points the pools' rows at the machine's models by name, so the owner decided on 2026-10-26:
+  copies are cells of one runner. Now cells of one name on two runners are two models, each called by the name and its
+  runner — `minicpm-o-4_5-q4_k_m@llama-server`, `minicpm-o-4_5-q4_k_m@minicpm-omni` — as LM Studio tells a model's
+  variants by `@`; the bare name is none of them (404), since which one it meant nobody said, and the order of the
+  ports does not decide it either — a cell moved to another port would have taken the name away. A model with one
+  runner keeps its bare name. The runner is what the controller's settings name (`RUNNER`; settings that name none
+  say llama-server), else the kept start request's, else the record's (a prism start keeps it there)
+  (`MachineModels.groups`, `MachineModels.runner`).
+  Checked: `test_scout_entry.py` (the 2026-10-26 pair, two stopped cells only the controller knows, `Transcribe` and
+  `transcribe`, an unnamed runner and `llama-server`, the controller's word before a stale autostart request, a prism
+  record; a request by the bare name — 404; the voice given its own name — the chat's bare name back); 9 mutants, 9 red.
+
+## 2.38.2 — 2026-10-26
+
+- **A cell's scope is no smaller than the memory it promised.** Every cell ran in a scope of MemoryHigh 70 % and MemoryMax
+  80 % of the machine, and a start was allowed by its promise (`ram`, MemoryLedger) — two rules that disagreed for a model
+  whose experts take more than 70 %. Strata's Swift IQ3_XXS promised 43.9 GiB on a machine of 60.5 GiB, its scope had
+  42.3 GiB of MemoryHigh: the kernel put every allocation over that to sleep (memory.events: high 3469), and on an idle
+  machine the loading cell is the only busy task of the user's session, so its sleeps were the whole session's memory
+  pressure — systemd-oomd killed the cell at 58 % (2026-10-26); the watchdog's retry got through at 49.97 % of oomd's 50 %.
+  Now a cell that promised more gets a scope of its promise and 2 GiB, MemoryMax 2 GiB over that and no less than 80 %,
+  never past the machine's memory (`MemoryScope.limits`); the journal names the raised scope at every launch. The launch
+  keeps the promise (`ramMiB`), so a relaunch after a crash — after a restart of the scout too — gets the same scope; a
+  record written before 2.38.2 keeps it beside the launch, and the adoption puts it in.
+  Checked: `test_scout_memory.py` (the limits for no promise, 30 000, 41 000, 44 954, 52 531 and 60 000 MiB, the machine's
+  memory unknown; a launch, its relaunch and a cell without a promise), `test_scout_lost_cell.py` (the launch carries the
+  promise; an old record's adoption); 11 mutants, 11 red.
+
+## 2.38.1 — 2026-10-26
+
+- **A download leaves the page cache as it is written.** The first start of a Strata cell right after its download was killed
+  by systemd-oomd, with the scout and GNOME Shell before it, on 2026-10-23 and again on 2026-10-26 (:22009, IQ2_XS, 68 GB
+  downloaded, then 33 GiB of experts read into RAM): the memory pressure of the user's session stayed at 61–66 %, above oomd's
+  50 % for 20 s. The download's pages were the youngest memory of the machine, charged to the scout's cgroup, and the kernel
+  evicted the working set of everything else to make room for the cell; the watchdog's second start, with that pile gone,
+  loaded in 97 s. Now every 256 MiB of a download is synced and dropped from the page cache, and the rest at its end
+  (`WrittenPages`, `posix_fadvise` `DONTNEED` after `fdatasync`): a model is written once by the scout and read by its cell,
+  never by the scout again. Where there is no `posix_fadvise` (macOS) nothing changes; a kernel that refuses is said once in
+  the journal and the download goes on.
+  Checked: `test_scout_models.py` (320 MiB: dropped at 256 MiB and the tail at the end, each time only the new part and synced
+  first; 24 MiB: once at the end; no `posix_fadvise`: nothing; a refusal: the download whole, one line, no second try);
+  7 mutants, 7 red.
+
+## 2.38.0 — 2026-10-26
+
+- **The cache's limit in GB, and its folder of the owner's choosing.** The owner, 2026-10-26: "let me choose how many GB the models
+  in the cache may take, not how many models", and "let me choose the folder the cached models lie in — an HDD, so as not to spend
+  the SSD's writes".
+  The budget (`CacheBudget`, `cacheBudgetBytes` in `state.json`, `POST /api/llama-node/cache/budget`): the cache keeps the files of
+  every cell that is starting or running, then the models that ran, newest first, as many as fit in the budget together with them —
+  a model that does not fit makes room for an older one that does. Until the owner sets one, the last `keep` models, as before: a
+  size nobody chose is not made up; `null` takes it off again.
+  The folder (`CacheFolder`, `cacheDir` in `state.json`, before `modelsBasePath`; `POST /api/llama-node/cache/dir`): what this
+  scout downloaded into the folder it leaves is deleted — every kind, a whisper `.bin` and a model folder too (`ModelFetcher.clear`)
+  — then the cache is in the new folder, made when it is not; every model of it is the controller's copy, and a start brings its
+  model there by itself. The owner's rules: not while a cell is bringing its model (409, the cells named:
+  `Cells.loading_ports`), and a cell that runs keeps running — its weights are loaded, and its open files outlive their names.
+  Refused: no absolute path, the folder it is in now, a folder inside the old one or holding it, one that cannot be made or written.
+  `GET /api/llama-node/cache` says both (`budgetBytes`, `dir`).
+  Checked: `test_scout_cache_keeper.py` (the budget: kept, refused, taken off; what stays at 60, 55, 50, 30 bytes; a running
+  cell's files first and past the budget; the move: each refusal, 409 while loading, every kind of download deleted, the foreign
+  file kept, the folder in `state.json` and read back; both routes), `test_scout_cells.py` (which cells are loading); 10 mutants,
+  10 red.
+
+## 2.37.3 — 2026-10-26
+
+- **A stop lets go of the files of the cell's present start, not of its port's past.** Found in the controller's live check of
+  the Talk tab of an Ollama cell: the test cell was made on :22030, where the night's test cells had run, and its stop printed
+  "a stopped cell's models: removed 5 file(s), freed 101544085600 bytes" — Hermes-4-70B, Qwen3-Coder-Next, Nemotron-3.5-Bolt
+  and gemma-4-12B with their projectors. 2.37.2 took a cell's own files from the keeper's log of starts by port, and a port
+  outlives its cells: an Ollama cell, whose start asks the cache for nothing, inherited the deleted cells' starts. The library
+  on the NAS holds every one of those files: the next start of a cell that needs one downloads it again.
+  Now a start's request to the cache goes through `Cells.asks`, which tells the keeper's log as before and keeps the list on
+  the `Cell` (`asked`); a stop without `cacheModels` lets go of exactly that list (`own_files`). A cell in an engine asks for
+  nothing and lets go of nothing; so does a cell adopted after a scout restart, whose start this scout did not see — the
+  keeper's count of the last models trims the cache in its time. The keeper's log stays as it was: it counts the last models.
+  Checked: `test_scout_http.py` (a cell on a port whose log holds a deleted cell's start lets go of nothing; the cell's own
+  start's files still go), `test_scout_cells.py` (a llama start and a command start keep what they asked; a cell in an engine
+  keeps nothing and writes no entry); 5 mutants, 5 red.
+
+## 2.37.2 — 2026-10-26
+
+- **A stop lets go of the stopped cell's own models, and of nothing else.** The same night as 2.37.1: a stop of an Ollama cell on
+  the controller's machine deleted 92 GB of other cells' models — Hermes-4-70B and Qwen3-Coder-Next, both in the cache by the
+  keeper's count of the last models that ran. A cell without `cacheModels` is let go of its models when it stops, as the docs
+  say; the code purged every model no running cell held, and a cell in an engine, which has no file in the cache at all, keeps no
+  cache. Now a stop of such a cell deletes the files its own starts asked for — as the keeper's log of starts holds them, every
+  part of a split GGUF, the projector, the draft, a folder — that no running cell holds (`ModelFetcher.release`); the rest of
+  the cache is the keeper's. The on-demand purge of the whole cache (`POST /api/llama-node/purge-cache`) is unchanged.
+  Checked: `test_scout_models.py` (release: its files go, other models and files this scout did not download stay, a held file
+  stays, nothing to release deletes nothing), `test_scout_http.py` (a stop releases the cell's own files once, another cell's
+  model stays, a stop of nothing releases nothing), the whole suite; 5 mutants, 5 red.
+
+## 2.37.1 — 2026-10-26
+
+- **A stop that stopped nothing keeps the model cache.** Seen on the controller's machine on 2026-10-26: a cell stopped from the
+  board and then removed from it lost the whole machine's cache — Hermes-4-70B, Qwen3-Coder-Next, Nemotron and the rest, 116 GB
+  that no running cell held. The board removes a cell with one more stop of its port; the first stop had already dropped the
+  cell from the table, so `at` made it afresh with caching off, the stop answered "not running", and the purge that follows a
+  stop of a cell without `cacheModels` deleted every cached model but the running cells'. A stop now purges only when it stopped
+  something: a process of this scout, or a listener it reclaimed. The models of a stopped cell without caching still go when it is
+  stopped, as before.
+  Checked: `test_scout_http.py` (the stop of a port nobody serves answers "not running" and leaves the cache alone — red without
+  the fix), the whole suite.
+
+## 2.37.0 — 2026-10-25
+
+- **The machine's entry lists every model of the machine, not only the ones this scout started.** Step 3 of the owner's plan of 2026-10-12 (Papyrus caravan-scout-openai): a pool's row names "machine + model", not a port. `GET /v1/models` listed the cells this scout ran since its start or kept a start for, so on 2026-10-25 it named 8 of the 17 ports the controller's pools led to. The controller (1.3.629) now says the cells it keeps for the machine in its answer to every heartbeat — each configured cell's port, where its model lies and the settings its name is made of, never the rest — and the entry lists them all, a stopped one as stopped, as LM Studio lists every model it can load. A request for a stopped model is `503 model_not_running`, not 404. A stopped cell is called what its settings call it now, so a renamed model is found under its new name at once; a running one keeps the name it was started under. The list is kept in `state.json` (`knownCells`): a failed beat or a restart does not lose it, an answer from an older controller leaves it as it was, and unpairing forgets it.
+  A model named after a folder of HF's cache is named after its repository: `whisper/models--Systran--faster-whisper-large-v3-turbo` was `whisper`, it is `faster-whisper-large-v3-turbo`; a GGUF inside the cache keeps its file's name.
+  Checked: `test_scout_entry.py` (123: what a controller says is checked — a port that is no port, a key, a field that is no text left out; kept across an answer that says nothing, written to state.json, forgotten on unpairing; a stopped cell named by the settings and a running one by its start; the list and a stopped model's 503; the HF cache's folders).
+
+## 2.36.0 — 2026-10-25
+
+- **A cell's log, for the board's window.** The owner's cell window (the controller's 1.3.621, variant Г) shows what went
+  wrong; the scout said only a reason and eight lines of a crash. `GET /api/llama-node/log?port=&lines=&run=` answers the
+  last lines of a cell's run — 300 when not said, 2000 at most, read from the last 512 KB of the file — and the runs there
+  are to read: the present log and the ones rotate kept, newest first, each `{name, bytes, modifiedAt}`. `run` reads an
+  earlier run by a name the list gave; another file of the folder is not read, whatever its name. Keys are scrubbed out of
+  the lines as out of a crash's tail, blank lines are left out, and the first line read in the middle of a long file — the
+  end of a line — is left out rather than shown cut. The log is the process's while this scout holds it, the one its record
+  names after a restart, else the log of its name in the model cache; a port with none is `{ok: false, error}`, and asking
+  makes no cell. Behind the fleet token, like every read of a cell.
+  Checked: `test_scout_cell_log.py` (new, 25: the count of lines, the lines, the runs and a run by its name, where a port's
+  log is found, the answers for a port with no log and a name that is not a run, the route and its token), the pins of
+  `test_scout_openapi.py` for the second route that reads a query. 8 mutants in tree copies, each caught by its own check.
+
+## 2.35.4 — 2026-10-24
+
+- **Ollama is found where its installers put it, and a server whose binary moved still starts.** The owner, 2026-10-24: Ollama
+  on the machine with the cards lived in the home (`~/ollama/bin/ollama`, unpacked there without root on 2026-09-25), and an
+  agent that looked for it as one does — `command -v ollama`, the usual paths, `systemctl` — said it was not installed while the
+  scout ran it. The owner chose the usual place for its files, with the board still starting and stopping the server.
+  (1) `Ollama.installed` looks in the system first, where Ollama's own archive and install.sh put the binary —
+  `/usr/local/bin/ollama`, `/usr/bin/ollama` — then in the home, as before.
+  (2) A recipe learned from a run whose binary is gone keeps its arguments and environment and takes the binary from where
+  Ollama is installed now (`EngineServers.recipe_for`); the next run is learned with the new place. It said "… is not there
+  to run" before, and the board's switch could not start the moved server.
+  Checked: `test_scout_engine_servers.py` (81: the system place before the home, the home when the system has none, a moved
+  binary started from its new place with the learned environment and remembered there, a binary still in place kept, a binary
+  gone with no other said); the tests no longer see an Ollama the machine running them has in /usr/local/bin. 4 mutants in
+  tree copies, each caught by its own check.
+
+## 2.35.3 — 2026-10-24
+
+- **A model folder made of this scout's own files is completed, not refused.** The owner, 2026-10-24: "some models are red — look
+  why". The omni cell :22024 (MiniCPM-o, a folder model) was refused three times: `…/MiniCPM-o-4_5-gguf/openbmb is there and was
+  not downloaded by this scout: not replaced`. The folder was there because the llama-server cell :22011 had started on the same
+  model at 11:48 and the scout had fetched its GGUF and a projector into it, one file at a time; the ledger held those two files,
+  not the folder, and the rule asked for the folder. And it asked at the very end: every refused start had first fetched the whole
+  model into `openbmb.part`.
+  (1) Whose the folder is, is asked before a byte is fetched. A folder written down whole is replaced, as before; one that is not
+  this scout's is refused at once, with the same words.
+  (2) A folder whose every file is this scout's — written down itself or under a folder that is — is completed where it is: a file
+  already of its size stays, the rest comes, the links are made, `.caravan-folder.json` is written last, and the folder is written
+  down whole, its files forgotten one by one. A hidden file not in the ledger makes the folder foreign too: the scout writes into it.
+  (3) The one rule of ownership — the file itself, or a folder above it, in the ledger — lives in `DownloadedFiles.covers`; the
+  cache keeper's foreign files read it there (it had its own copy).
+  Checked: `test_scout_models.py` (163: a folder of own files completed with only the missing files asked; a foreign folder, one with
+  one foreign file, one with a foreign hidden file and a sibling with the same beginning refused before any request; the ledger after),
+  the whole suite; 7 mutants in tree copies, all caught. Not checked yet: on a live scout (next — start :22024 from the board).
+
+## 2.35.2 — 2026-10-19
+
+- **A cell stopped in the middle of its download stays stopped.** The owner, 2026-10-19, about the seamless cell on :22008: "look why it
+  does not start". The board showed the cell's last file at 100 % ("tokenizer_config.json (12/12)"), its switch off, STOP lit and START gone;
+  the scout's journal said `start cancelled — the cell was stopped mid-download`, and its registry had no such cell. A stop (the
+  owner's, during the 80 s the checkpoint took) drops the cell of the port, but the copy it interrupts goes on to the end of its file, and
+  each report of that copy made the port's cell again: `Cells.report` made a cell for any port it was told of. The new cell stood in the
+  phase of the last report ("downloading", or "loading" for a llama cell) with nothing behind it, for good: the board drew a start under way,
+  the controller offered no START, and the scout refused a new start ("startup already in progress on port 22008") until another stop
+  came. The llama path's test had held the defect as-is since the rewrite, in three lines; the command path's test never looked at the
+  board after the stop.
+  (1) A report makes no cell: it is dropped when the port has none (`Cells.report` answers whether it was kept). A start that was stopped
+  says its words into nothing.
+  (2) A llama start that no longer holds its port ends right after its files, before it says "loading" into the cell a new start may have
+  made there, and before it writes its artifacts (they were written over those of the run before, for a cell that never ran).
+  (3) One copy of a file at a time (`ModelFetcher`, as of a folder since 2.31). The copy a stop left running goes on, and a start that
+  follows the stop at once — it was refused before, it is accepted now — waits for that copy and finds the file whole, instead of writing
+  the same `.tmp` beside it. A start that keeps no cache copies the file again after the wait.
+  Checked: `test_scout_cells.py` (409 checks: the three as-is pins turned into the behaviour, two new for a command cell stopped on its
+  way, five for the report; the pins that reported into a port with no cell make the cell first, as a start does), `test_scout_models.py`
+  (156: the new pin, with real threads — the second start waits and asks the controller for nothing, a start of another file does not wait,
+  a start with no cache copies again), the whole suite on 3.12 and the touched tests on 3.9; 10 mutants in tree copies, all caught.
+  Not checked: on a live scout. Not changed: a stop does not end the copy it interrupts — a stopped download of 9 GB is still written to the
+  end of the file; the controller (it showed what the scout said).
+
 ## 2.35.1 — 2026-10-18
 
 - **A Strata cell says its token speed, its queue and its context use.** The owner, 2026-10-18, after talking to a local model through a

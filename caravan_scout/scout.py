@@ -15,7 +15,7 @@ from caravan_scout.job import BackgroundJob
 from caravan_scout.reconcile import Reconcile
 from caravan_scout.driver import DriverFacts
 from caravan_scout.driver_packages import DriverPackages
-from caravan_scout.entry import Copies, MachineEntry, MachineModels
+from caravan_scout.entry import Copies, KnownCells, MachineEntry, MachineModels
 from caravan_scout.machine import Machine
 from caravan_scout.report import Report
 from caravan_scout.saved_configs import SavedConfigs
@@ -74,11 +74,15 @@ class Scout:
         self.driver_install = BackgroundJob("driver-install", "a driver install is already running")
         # The machine's models by name (2.27): what its entry lists and serves, and what both
         # reports carry (2.28) — one list for the entry and the controller.
-        self.machine_models = MachineModels(self.cells, self.autostart, lambda: str(self.config.get("hostId") or ""))
+        # The cells the controller keeps for this machine (2.37): its answer to a heartbeat says them, so a stopped
+        # cell this scout has not started is a model of the machine too.
+        self.known_cells = KnownCells(self.state)
+        self.machine_models = MachineModels(self.cells, self.autostart, lambda: str(self.config.get("hostId") or ""),
+                                            known=self.known_cells)
         self.report = Report(self.config, self.state, self.machine, self.cells, self.builds, self.autostart,
                              self.suspect, self.telemetry, identity=self.identity, engines=self.engines,
                              driver=self.driver, entry_models=self.machine_models)
-        self.heartbeat = Heartbeat(self.config, self.state, self.report, self.cells)
+        self.heartbeat = Heartbeat(self.config, self.state, self.report, self.cells, known=self.known_cells)
         # The machine's entry by OpenAI's API (2.27): its models by name, a request to a running copy.
         self.entry = MachineEntry(self.machine_models,
                                   Copies(lambda port: self.cells.probe.metrics(port).get("requestsProcessing")))
